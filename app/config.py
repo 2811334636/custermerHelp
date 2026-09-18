@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = 1024
     llm_temperature: float = 0.3
     history_token_budget: int = 4096
+    token_chars_per_token: float = 1.5
     session_max_sessions: int = 200
     session_max_messages: int = 100
 
