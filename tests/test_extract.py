@@ -58,3 +58,10 @@ async def test_extract_raises_extraction_failed_when_model_returns_nothing():
     model = FakeModel(FakeStructured(raises=ValueError("no tool call")))
     with pytest.raises(ExtractionFailed):
         await extract_ticket("随便", model=model)
+
+
+async def test_extract_raises_extraction_failed_when_model_returns_none():
+    """模型不抛错但返回 None：同样归为抽取失败，而不是把 None 漏给调用方。"""
+    model = FakeModel(FakeStructured(result=None))
+    with pytest.raises(ExtractionFailed):
+        await extract_ticket("随便", model=model)

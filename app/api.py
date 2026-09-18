@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 
@@ -14,9 +16,11 @@ from app.chat import (
 )
 from app.config import get_settings
 from app.extract import ExtractionFailed, extract_ticket
-from app.providers import get_chat_model
+from app.providers import get_default_chat_model
 from app.schemas import AfterSalesTicket, ChatRequest, ExtractRequest
 from app.sessions import InMemorySessionStore, SessionStore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
@@ -40,10 +44,13 @@ def sse_frame(name: str, data: dict) -> str:
 async def chat(
     req: ChatRequest,
     store: SessionStore = Depends(get_store),
-    model=Depends(get_chat_model),
+    model=Depends(get_default_chat_model),
 ) -> StreamingResponse:
-    is_new_session = req.session_id is None
+    # is_new_session 必须和 session_id 同源，否则空串 "" 会走到
+    # "服务端生成了 id 却不发 meta" 的岔路：客户端永远学不到 id，
+    # 会话被静默孤立（spec §5.1）。这里以最终 id 为准，一个表达式派生两者。
     session_id = req.session_id or str(uuid.uuid4())
+    is_new_session = req.session_id != session_id
     settings = get_settings()
 
     # 先读出历史（不含当前消息），剪裁由 stream_reply 内部完成
@@ -73,6 +80,19 @@ async def chat(
                     )
                 elif isinstance(event, ErrorEvent):
                     yield sse_frame("error", {"code": event.code, "message": event.message})
+        except (GeneratorExit, asyncio.CancelledError):
+            # 客户端中途断开（spec §9）：半截回复不写入历史，但要留痕，
+            # 否则"回复莫名少了半截"在服务端完全不可见。
+            #
+            # 这里必须同时捕获 CancelledError：实测（真实 uvicorn + 客户端提前
+            # 关流）starlette 的 StreamingResponse 是靠取消 task 来中断的，
+            # 抛进生成器的是 CancelledError 而非 GeneratorExit；只捕获后者
+            # 在真实断线下什么都不会记。GeneratorExit 是 asyncio 关闭生成器
+            # 时的另一条路径，一并兜住。
+            logger.info(
+                "chat client disconnected mid-stream: session_id=%s", session_id
+            )
+            raise
         finally:
             # 只在整轮正常结束时写入历史。客户端断开或上游出错时整轮丢弃，
             # 否则会留下"两个 human 连排"的畸形历史（spec §7.2.1）。
@@ -97,11 +117,12 @@ async def chat(
 @router.post("/extract", response_model=AfterSalesTicket)
 async def extract(
     req: ExtractRequest,
-    model=Depends(get_chat_model),
+    model=Depends(get_default_chat_model),
 ) -> AfterSalesTicket:
     try:
         return await extract_ticket(req.text, model=model)
     except ExtractionFailed as exc:
+        logger.warning("extraction failed: %s", exc)
         raise HTTPException(
             status_code=502,
             detail={"code": "extraction_failed", "message": str(exc)},

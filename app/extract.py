@@ -1,6 +1,10 @@
+import logging
+
 from app.prompts import build_extract_prompt
 from app.providers import get_chat_model
 from app.schemas import AfterSalesTicket
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractionFailed(Exception):
@@ -25,8 +29,10 @@ async def extract_ticket(text: str, *, model=None) -> AfterSalesTicket:
         )
         result = await structured.ainvoke(messages)
     except Exception as exc:  # noqa: BLE001 — 上游任意异常统一归为抽取失败
+        logger.warning("extraction failed: exc=%s", type(exc).__name__)
         raise ExtractionFailed(str(exc)[:500]) from exc
 
     if result is None:
+        logger.warning("extraction failed: model returned no structured result")
         raise ExtractionFailed("模型未返回结构化结果")
     return result

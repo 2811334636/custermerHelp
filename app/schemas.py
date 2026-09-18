@@ -3,7 +3,9 @@ from pydantic import BaseModel, Field
 
 class ChatRequest(BaseModel):
     session_id: str | None = Field(
-        default=None, description="会话 id；省略则服务端生成并经由 meta 事件返回"
+        default=None,
+        min_length=1,
+        description="会话 id；省略则服务端生成并经由 meta 事件返回",
     )
     message: str = Field(..., min_length=1, max_length=4000)
 
