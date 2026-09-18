@@ -5,13 +5,14 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.53.0",
-    "langchain>=1.4.1",
+    # 不依赖 `langchain`（编排层）：项目没用 LCEL / agent，spec §2 明确
+    # 把 langgraph* 编排栈列为非目标。langchain-core（接口）与
+    # langchain-openai（provider 实现）已足够，且是分开发布的固定版本。
     "langchain-core>=1.6.3",
     "langchain-openai>=1.6.2",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "openai>=3.15.0",
-    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -19,6 +20,8 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
     "httpx>=0.28.1",
+    # 只有 evals/ 读 yaml，运行时不依赖
+    "pyyaml>=6.0",
 ]
 
 [tool.pytest.ini_options]
