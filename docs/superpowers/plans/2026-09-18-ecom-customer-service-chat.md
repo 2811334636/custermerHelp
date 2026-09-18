@@ -1988,7 +1988,7 @@ import yaml
 from langchain_core.messages import HumanMessage
 
 from app.extract import extract_ticket
-from app.prompts import SYSTEM_PROMPT
+from app.prompts import SYSTEM_PROMPT, build_chat_prompt
 from app.providers import get_chat_model
 
 ROOT = Path(__file__).parent
@@ -2007,7 +2007,12 @@ JUDGE_TEMPLATE = """你在给一个电商客服机器人的回复打分。
 
 
 async def run_prompt_case(case: dict, model) -> dict:
-    reply = (await model.ainvoke([HumanMessage(case["input"])])).text
+    # 必须走生产路径的 build_chat_prompt()。被测对象是「SYSTEM_PROMPT + 用户输入」
+    # 这个整体；只发一个裸 HumanMessage 会完全绕过 SYSTEM_PROMPT，那测的就不是
+    # 这个产品了。逐字照抄本计划初稿时实测只有 3/15，outofscope-1 直接吐出了
+    # 一份完整的淘宝爬虫脚本 —— 因为在测「客服 Prompt」却压根没把它发出去。
+    messages = build_chat_prompt().format_messages(history=[HumanMessage(case["input"])])
+    reply = (await model.ainvoke(messages)).text
 
     # 确定性断言：禁用词
     violations = []
