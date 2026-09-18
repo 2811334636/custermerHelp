@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# ch01 三条验收标准的一键复现。用法：bash scripts/smoke.sh
+set -uo pipefail
+
+BASE="${BASE:-http://127.0.0.1:8000}"
+
+echo "======================================================================"
+echo "验收 1：curl 对话看到流式输出（观察 delta 是否逐条到达）"
+echo "======================================================================"
+curl -sN -X POST "$BASE/api/chat" \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"我买的鞋子有点大，想换一双，怎么操作？"}'
+echo
+
+echo
+echo "======================================================================"
+echo "验收 2：连续两轮，第二轮必须能看到第一轮的上下文"
+echo "======================================================================"
+R1=$(curl -sN -X POST "$BASE/api/chat" -H 'Content-Type: application/json' \
+  -d '{"message":"我叫张三，我的订单号是 A12345"}')
+SID=$(printf '%s' "$R1" | grep -m1 '^data: ' | sed 's/^data: //' | python3 -c 'import json,sys;print(json.load(sys.stdin)["session_id"])')
+echo "第一轮 session_id = $SID"
+
+R2=$(curl -sN -X POST "$BASE/api/chat" -H 'Content-Type: application/json' \
+  -d "{\"session_id\":\"$SID\",\"message\":\"我的订单号是多少？\"}")
+echo "第二轮回复："
+# 断言对象是「拼回来的回复正文」，不是原始 SSE 流。上游按 token 切分 delta，
+# 实测订单号被切成 " A" / "123" / "45" 三个独立帧，在原始流上直接 grep 必然误判为失败。
+REPLY=$(printf '%s' "$R2" | grep '^data: ' | sed 's/^data: //' \
+  | python3 -c '
+import json,sys
+out=[]
+for line in sys.stdin:
+    d=json.loads(line)
+    if "text" in d: out.append(d["text"])
+print("".join(out))
+')
+printf '%s\n' "$REPLY"
+if printf '%s' "$REPLY" | grep -q 'A12345'; then
+  echo "✅ 验收 2 通过：第二轮回复中出现了第一轮给出的订单号 A12345"
+else
+  echo "❌ 验收 2 失败：第二轮回复中未出现 A12345，上下文没有生效"
+fi
+
+echo
+echo "======================================================================"
+echo "验收 3：发一段售后描述，看到结构化 json"
+echo "======================================================================"
+curl -s -X POST "$BASE/api/extract" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"订单 A123 我要退款，希望原路退回"}' | python3 -m json.tool
