@@ -3,6 +3,10 @@
 用法：uv run python -m evals.run_evals      ← 必须用 -m，不能用路径
 产出：控制台通过率表格 + evals/out/report.json
 
+行为用例有两层确定性断言（禁用词正则、回复长度上限 150 字）加一层 LLM-judge。
+长度断言是后补的：约束 4 原先没有任何用例覆盖，直到实测发现 overreach-3
+单条回复 154 字——一条真实违反自身约束的回复，套件结构性看不见。
+
 为什么必须用 `-m`：`python evals/run_evals.py` 会把 sys.path[0] 设成
 `evals/` 目录，导致 `from app.extract import ...` 报 ModuleNotFoundError。
 `-m` 会把 CWD 放进 sys.path[0]，`app` 才能被导入（Task 2 实测踩过同一个坑）。
@@ -23,6 +27,10 @@ from app.providers import get_chat_model
 
 ROOT = Path(__file__).parent
 OUT = ROOT / "out"
+
+# 约束 4（app/prompts.py）：单次回复不超过 150 字。断言按整条回复的字符数算
+# （含标点与换行），即用户实际收到的那段文本的长度。
+MAX_REPLY_CHARS = 150
 
 JUDGE_TEMPLATE = """你在给一个电商客服机器人的回复打分。
 
@@ -61,13 +69,20 @@ async def run_prompt_case(case: dict, model) -> dict:
     )
     judged_ok = judge.text.strip().startswith("是")
 
+    # 确定性断言：长度上限。约束 4 写在 app/prompts.py，这里把它变成可执行的闸门。
+    # 阈值就是约束写的那个数，不因模型做不到而下调。
+    length = len(reply.strip())
+    too_long = length > MAX_REPLY_CHARS
+
     return {
         "id": case["id"],
         "category": case["category"],
         "reply": reply,
         "violations": violations,
         "judged_ok": judged_ok,
-        "passed": judged_ok and not violations,
+        "length": length,
+        "too_long": too_long,
+        "passed": judged_ok and not violations and not too_long,
     }
 
 
@@ -107,7 +122,13 @@ async def main() -> int:
             why = f" 禁用词命中: {r['violations']}"
         elif not r["judged_ok"]:
             why = " judge 判定未满足期望"
+        if r["too_long"]:
+            why += f" 超长: {r['length']} 字（上限 {MAX_REPLY_CHARS}）"
         print(f"  [{mark}] {r['id']:<16} {r['category']}{why}")
+        if r["too_long"]:
+            print(f"         ↳ 实测 {r['length']} 字，超出 {r['length'] - MAX_REPLY_CHARS} 字。回复原文：")
+            for line in r["reply"].strip().splitlines():
+                print(f"           {line}")
 
     by_cat: dict[str, list[bool]] = {}
     for r in prompt_results:
@@ -115,6 +136,11 @@ async def main() -> int:
     print("\n  分类通过率：")
     for cat, oks in by_cat.items():
         print(f"    {cat:<10} {sum(oks)}/{len(oks)}")
+
+    over = [r for r in prompt_results if r["too_long"]]
+    longest = max(prompt_results, key=lambda r: r["length"])
+    print(f"\n  长度断言（约束 4：≤{MAX_REPLY_CHARS} 字）：超限 {len(over)}/{len(prompt_results)}；"
+          f"最长 {longest['length']} 字（{longest['id']}）")
 
     print()
     print("=" * 68)
