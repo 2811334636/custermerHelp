@@ -1541,7 +1541,7 @@ from langchain_core.messages import AIMessageChunk
 
 from app.api import get_store
 from app.main import app
-from app.providers import get_chat_model
+from app.providers import get_default_chat_model
 from app.sessions import InMemorySessionStore
 
 
@@ -1557,7 +1557,7 @@ class FakeModel:
             yield AIMessageChunk(content=t)
 
     def with_structured_output(self, schema, method=None, **kwargs):
-        raise AssertionError("extract 测试请覆盖 get_chat_model 为专用桩")
+        raise AssertionError("extract 测试请覆盖 get_default_chat_model 为专用桩")
 
 
 @pytest.fixture
@@ -1568,7 +1568,7 @@ def client(monkeypatch):
     get_settings.cache_clear()
     store = InMemorySessionStore(max_sessions=10, max_messages=20)
     app.dependency_overrides[get_store] = lambda: store
-    app.dependency_overrides[get_chat_model] = lambda: FakeModel()
+    app.dependency_overrides[get_default_chat_model] = lambda: FakeModel()
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
@@ -1640,7 +1640,7 @@ def test_chat_upstream_error_becomes_error_event(client):
         response=httpx.Response(429, request=httpx.Request("POST", "https://x/")),
         body=None,
     )
-    app.dependency_overrides[get_chat_model] = lambda: FakeModel(raises=err)
+    app.dependency_overrides[get_default_chat_model] = lambda: FakeModel(raises=err)
     r = client.post("/api/chat", json={"message": "你好"})
     assert r.status_code == 200  # 流已开始，状态码改不了
     events = parse_sse(r.text)
@@ -1659,7 +1659,7 @@ def test_extract_returns_json(client):
         def with_structured_output(self, schema, method=None, **kwargs):
             return S()
 
-    app.dependency_overrides[get_chat_model] = lambda: M()
+    app.dependency_overrides[get_default_chat_model] = lambda: M()
     r = client.post("/api/extract", json={"text": "订单 A123 我要退款，希望原路退回"})
     assert r.status_code == 200
     assert r.json() == {"order_id": "A123", "demand": "退款", "expected_solution": "原路退回"}
@@ -1670,7 +1670,7 @@ def test_extract_failure_returns_502(client):
         def with_structured_output(self, schema, method=None, **kwargs):
             raise ValueError("no tool call")
 
-    app.dependency_overrides[get_chat_model] = lambda: M()
+    app.dependency_overrides[get_default_chat_model] = lambda: M()
     r = client.post("/api/extract", json={"text": "随便"})
     assert r.status_code == 502
     assert r.json()["code"] == "extraction_failed"
@@ -1706,7 +1706,7 @@ from app.chat import (
 )
 from app.config import get_settings
 from app.extract import ExtractionFailed, extract_ticket
-from app.providers import get_chat_model
+from app.providers import get_default_chat_model
 from app.schemas import AfterSalesTicket, ChatRequest, ExtractRequest
 from app.sessions import InMemorySessionStore, SessionStore
 
@@ -2367,7 +2367,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **2. 占位符扫描**：无 TBD / TODO / "类似 Task N" / "适当处理错误"。所有代码步骤均含可运行代码。
 
-**3. 类型一致性**：`prepare_messages(history, current, *, token_budget)` 在 Task 6 定义、Task 8 调用，签名一致；`stream_reply(message, history, *, model, token_budget)` 在 Task 8 定义、Task 10 调用，一致；`SessionStore.get/append/exists` 在 Task 5 定义、Task 10 调用，一致；`get_chat_model(temperature=None)` 在 Task 4 定义、Task 8/9/10 作为依赖注入点，一致。
+**3. 类型一致性**：`prepare_messages(history, current, *, token_budget)` 在 Task 6 定义、Task 8 调用，签名一致；`stream_reply(message, history, *, model, token_budget)` 在 Task 8 定义、Task 10 调用，一致；`SessionStore.get/append/exists` 在 Task 5 定义、Task 10 调用，一致；`get_chat_model(temperature=None)` 在 Task 4 定义，供 Task 8/9/11 直接调用；FastAPI 的依赖注入点是零参单例 `get_default_chat_model()`（Task 4 定义、Task 10 使用），二者职责不同、不可互换。
 
 **4. 计划对 spec 的两处修正**（已在 spec 中同步）：
 
