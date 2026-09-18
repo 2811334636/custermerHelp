@@ -87,7 +87,9 @@
 
 以下三条在**真实 LangChain 链路上**实测得出（非裸 HTTP），推翻了 §12 原有的两项风险假设，并发现了一条新故障。
 
-**① `extra_body` 透传 thinking：✅ 成立。** 首个 text chunk 延迟 1.00s / 1.01s / 0.85s（阈值 2.0s），20~22 个 text chunk。传输层日志确认控制组 body 无 `thinking` 键，而 `extra_body` 组 body 顶层带 `"thinking":{"type":"disabled"}`。全程无 `reasoning_content` 泄漏。
+**① `extra_body` 透传 thinking：✅ 成立。** 首个 text chunk 延迟 1.00s / 1.01s / 0.85s（阈值 2.0s），20~22 个 text chunk。传输层日志确认控制组 body 无 `thinking` 键，而 `extra_body` 组 body 顶层带 `"thinking":{"type":"disabled"}`。
+
+⚠️ **证据强度边界**：本项✅**仅由出站 body「送了什么」直证**——即我们确实把 `thinking: disabled` 送到了上游。响应侧**未观察到** `reasoning_content`，但这一观察**不具区分力**（对照组 thinking 未关闭时呈现完全相同的空 content 模式），因此**不能**作为"思考确实被关闭"的证据。要验证后者需要一次**正面对照**（同 prompt 下 thinking 开/关的响应行为差异），本项未做，阶段 1 的原始探测做过。
 
 **② 中文 token 计数：❌ `count_tokens_approximately` 严重低估，已换计数器。** 估算 **25** / 实测 **59**，比值 **0.42**（低估 **58%**），三次运行完全一致。根因量化：该函数 `chars_per_token` 默认 **4.0**（英文调优），中文实测密度 **1.47 字/token**，另有 4 token 模板开销。改用 `token_chars_per_token = 1.5` 后估算 60 / 实测 59，**比值 1.02**。
 
@@ -147,7 +149,9 @@ custermerHelp/
 - 以后换 WebSocket / gRPC 只动 `api.py`
 - SSE 帧格式变更不影响领域逻辑，领域事件格式变更不影响传输层
 
-**`providers.py` 是全项目唯一知道"上游是 DeepSeek"的地方。** 其余模块只依赖 `BaseChatModel` 接口。换 provider 时理论上只改 `.env`，极端情况下才需要动这一个文件。
+**`providers.py` 是全项目唯一处理"上游怪癖"的地方。** 其余模块只依赖 `BaseChatModel` 接口。换 provider 时理论上只改 `.env`，极端情况下才需要动这一个文件。
+
+> **精确边界**（避免过度声称）：`config.py` 里确实存在两处 DeepSeek 字面量——`llm_base_url` 与 `llm_model` 的**默认值**。这不违反上面的原则：默认值由 `.env` 覆盖即可，换 provider 无需改代码；而**行为怪癖**（thinking 必须关、输出上限必须走 `extra_body`）是无论怎么配都不会自动消失的，必须由代码处理，因此只在 `providers.py` 出现。
 
 ### 4.3 为什么不使用 LCEL 管道（用户已确认方案 A）
 
