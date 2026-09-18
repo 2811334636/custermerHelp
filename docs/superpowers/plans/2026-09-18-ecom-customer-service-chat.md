@@ -1132,6 +1132,21 @@ from app.chat import DeltaEvent, DoneEvent, ErrorEvent, classify_exception, stre
 from app.prompts import SYSTEM_PROMPT
 
 
+def _resp(status):
+    """构造 openai 异常所需的 httpx.Response。
+
+    注意：`@pytest.mark.parametrize` 会**立即求值**它的参数列表，所以本函数
+    必须定义在该装饰器**之前**，否则 import 时就报 NameError。
+    """
+    import httpx
+
+    return httpx.Response(status, request=httpx.Request("POST", "https://x/"))
+
+
+def _boom():
+    return ValueError("boom")
+
+
 class FakeModel:
     """打桩模型：按预设脚本吐 chunk，或按预设抛异常。"""
 
@@ -1218,17 +1233,9 @@ async def test_error_event_is_terminal():
 )
 def test_classify_exception(exc, expected):
     assert classify_exception(exc) == expected
-
-
-def _resp(status):
-    import httpx
-
-    return httpx.Response(status, request=httpx.Request("POST", "https://x/"))
-
-
-def _boom():
-    return ValueError("boom")
 ```
+
+> ⚠️ `_resp` 与 `_boom` 定义在文件**上方**（见 `FakeModel` 之前），不要在文件末尾再定义一份 —— 重复定义会让 parametrize 引用到后一份，且两个定义容易漂移。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -1241,7 +1248,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'app.chat'`
 
 ```python
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import openai
 from langchain_core.messages import BaseMessage, HumanMessage
