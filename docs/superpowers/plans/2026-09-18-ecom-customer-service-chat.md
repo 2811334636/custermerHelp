@@ -2178,8 +2178,12 @@ echo "第一轮 session_id = $SID"
 
 R2=$(curl -sN -X POST "$BASE/api/chat" -H 'Content-Type: application/json' \
   -d "{\"session_id\":\"$SID\",\"message\":\"我的订单号是多少？\"}")
-echo "第二轮回复："
-printf '%s' "$R2" | grep '^data: ' | sed 's/^data: //' \
+# 必须先拼出回复文本再断言，不能直接 grep 原始 SSE 流：
+# 逐 token 流式会把订单号切成多个独立 delta 帧（实测上游把 A12345 拆成
+# " A" / "123" / "45" 三帧），连续字节在原始流里从不出现 —— 直接 grep 原始流
+# 会产生**假失败**（回复内容明明是对的），而且这个假失败还是非确定性的
+# （取决于分词恰好是否跨帧）。
+REPLY2=$(printf '%s' "$R2" | grep '^data: ' | sed 's/^data: //' \
   | python3 -c '
 import json,sys
 out=[]
@@ -2187,12 +2191,15 @@ for line in sys.stdin:
     d=json.loads(line)
     if "text" in d: out.append(d["text"])
 print("".join(out))
-'
-if printf '%s' "$R2" | grep -q 'A12345'; then
+')
+echo "第二轮回复：$REPLY2"
+if printf '%s' "$REPLY2" | grep -q 'A12345'; then
   echo "✅ 验收 2 通过：第二轮回复中出现了第一轮给出的订单号 A12345"
 else
   echo "❌ 验收 2 失败：第二轮回复中未出现 A12345，上下文没有生效"
 fi
+# 验证这个断言不是空过的：新开一个会话问同样的问题，模型不知道单号，
+# 上面那条检查必须打印 ❌。这一步是这条验收标准的"负对照"。
 
 echo
 echo "======================================================================"
