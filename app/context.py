@@ -41,8 +41,11 @@ def prepare_messages(
             start_on="human",
         )
     except ValueError:
-        # 极端小的预算下 trim_messages 可能无解而抛错。
-        # "当前消息永不被剪裁"这个不变量优先于复用库函数。
+        # 实测（langchain-core 1.6.3）：极小预算下 trim_messages 并**不抛错**，
+        # 而是静默返回 []，不变量由下面的 [*trimmed, current] 保住。
+        # 本分支是防御性的，覆盖"某版本/某输入确实抛 ValueError"的情况，
+        # 在当前版本下**不可达**。保留是因为它兜住的不变量（当前消息永不
+        # 被剪裁）一旦破坏，模型会收到空提问；优雅降级优于整个请求 500。
         return [current]
 
     return [*trimmed, current]
