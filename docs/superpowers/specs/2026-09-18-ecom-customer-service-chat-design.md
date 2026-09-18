@@ -83,6 +83,26 @@
 - `ChatPromptTemplate.from_messages([("system", ...), MessagesPlaceholder("history")])` 形态成立 ✅
 - 1.x 流式取文本用 **`chunk.text`**，不是 0.x 的 `chunk.content` ⚠️
 
+### 3.6 实施阶段 Task 2 探测的补充结论（2026-09-18）
+
+以下三条在**真实 LangChain 链路上**实测得出（非裸 HTTP），推翻了 §12 原有的两项风险假设，并发现了一条新故障。
+
+**① `extra_body` 透传 thinking：✅ 成立。** 首个 text chunk 延迟 1.00s / 1.01s / 0.85s（阈值 2.0s），20~22 个 text chunk。传输层日志确认控制组 body 无 `thinking` 键，而 `extra_body` 组 body 顶层带 `"thinking":{"type":"disabled"}`。全程无 `reasoning_content` 泄漏。
+
+**② 中文 token 计数：❌ `count_tokens_approximately` 严重低估，已换计数器。** 估算 **25** / 实测 **59**，比值 **0.42**（低估 **58%**），三次运行完全一致。根因量化：该函数 `chars_per_token` 默认 **4.0**（英文调优），中文实测密度 **1.47 字/token**，另有 4 token 模板开销。改用 `token_chars_per_token = 1.5` 后估算 60 / 实测 59，**比值 1.02**。
+
+**③ 新发现（计划未预见）：`ChatOpenAI(max_tokens=N)` 的输出上限静默失效。**
+`langchain-openai` 在 `chat_models/base.py:3703`（`_default_params`）和 `:3715-3718`（`_get_request_payload`）**无条件**把 `max_tokens` 改名为 `max_completion_tokens`，而 DeepSeek 不认这个字段。
+
+| 传参方式 | 实测输出 | `finish_reason` |
+|---|---|---|
+| `ChatOpenAI(max_tokens=1024)` | **1470** token | `stop` ← 上限没生效 |
+| `extra_body={"max_tokens": 1024}` | **1024** token | `length` ← 上限生效 |
+
+**处置：输出上限一律走 `extra_body`。** 这只影响 `providers.py` 一个文件，符合 §4.2 把上游差异收口在该文件的既有设计。
+
+**④ 脚本调用方式：必须用 `uv run python -m 包.模块`。** `uv run python 路径/脚本.py` 会把 `sys.path[0]` 设成脚本所在目录，`import app` 直接 `ModuleNotFoundError`。命名空间包使 `-m` 无需 `__init__.py` 即可工作（已实测）。
+
 ## 4. 架构
 
 ### 4.1 仓库布局
@@ -113,7 +133,9 @@ custermerHelp/
 └── README.md         启动与演示命令
 ```
 
-依赖管理用 **uv**（环境已有，无 `pip3`）。`pyproject.toml` 声明依赖，`uv sync` 创建 `.venv`。Python 版本已实测 **3.14.4 下全部依赖解析通过**（版本组合见 §3.5）。
+依赖管理用 **uv**（环境已有，无 `pip3`）。`pyproject.toml` 声明依赖，`uv sync` 创建 `.venv`。
+
+**Python 版本**：`pyproject.toml` 声明 `requires-python = ">=3.12"`，`uv sync` 实际解析出 **uv 托管的 3.12.14** 并由 `uv.lock` 锁定。设计阶段已另在机器自带的 **3.14.4** 上实测过全部依赖解析通过（版本组合见 §3.5），但那只是解析层面的验证，不是 LangChain 全链路的运行验证——因此实际运行环境取更保守的 3.12.14。
 
 ### 4.2 关键边界
 
@@ -325,10 +347,15 @@ APP_SESSION_MAX_MESSAGES=100
 
 ## 12. 未决项与风险
 
-| 项 | 性质 | 处置 |
+| 项 | 性质 | 状态 |
 |---|---|---|
-| `count_tokens_approximately` 对中文的估算偏差 | **阻塞性** | Task 0 标定；偏差 > 20% 换可配计数器 |
-| `extra_body` 透传 `thinking` 参数能否穿透 langchain-openai | **阻塞性** | Task 0 实测；失败则回退 `model_kwargs` 或 `default_headers` |
-| `reasoning_content` 字段是否干扰 langchain-openai 的消息解析 | 非阻塞 | thinking 关闭后该字段不出现，风险自动消解 |
-| deepseek 上游策略变动（§3 结论全部基于单次实测） | 非阻塞 | 结论集中于 §3，变动时只改 `providers.py` |
+| `count_tokens_approximately` 对中文的估算偏差 | 阻塞性 | ✅ **已结**（§3.6②）：低估 58%，改用 `token_chars_per_token=1.5`，比值 1.02 |
+| `extra_body` 透传 `thinking` 参数能否穿透 langchain-openai | 阻塞性 | ✅ **已结**（§3.6①）：成立，首字 0.85~1.01s |
+| `ChatOpenAI(max_tokens=)` 输出上限静默失效 | **新增，阻塞性** | ✅ **已结**（§3.6③）：改走 `extra_body`，影响 `providers.py` 一个文件 |
+| `uv run python 路径/脚本.py` 无法导入 `app` | **新增，非阻塞** | ✅ **已结**（§3.6④）：一律改用 `-m` |
+| `reasoning_content` 字段是否干扰 langchain-openai 的消息解析 | 非阻塞 | ✅ 风险自动消解：thinking 关闭后该字段不出现 |
+| `env_file=".env"` 是 CWD 相对路径，从非仓库根启动会静默读不到配置 | 非阻塞 | 已知，暂不处理：README 与 smoke.sh 均在仓库根执行。生产化时锚定到仓库根 |
+| deepseek 上游策略变动（§3 结论全部基于实测） | 非阻塞 | 结论集中于 §3，变动时只改 `providers.py` |
 | 无鉴权、无速率限制 | 已知 | 本章为纯对话跑通，生产化留后续章节 |
+
+**本章所有阻塞性未决项均已结清。**

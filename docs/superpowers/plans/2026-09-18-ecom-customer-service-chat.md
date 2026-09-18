@@ -18,6 +18,9 @@
 - **上游**：`base_url=https://api.deepseek.com/`，`model=deepseek-flash`。key 从环境变量 `ANTHROPIC_AUTH_TOKEN` 取（该 key 即 DeepSeek key），写入 `.env` 的 `APP_LLM_API_KEY`。**`.env` 绝不进 git。**
 - **必须关闭 thinking**：`APP_LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}`。理由见 spec §3.2——开着 thinking 会把 token 预算烧光，正文零输出。
 - **结构化输出只能用 `with_structured_output(..., method="function_calling")`**。`response_format: json_schema` 上游完全不可用（spec §3.4）。
+- **输出上限 `max_tokens` 必须走 `extra_body`，绝不能走 `ChatOpenAI(max_tokens=...)`**。langchain-openai 会无条件把它改名成 `max_completion_tokens`（`chat_models/base.py:3703`、`:3715-3718`），DeepSeek 不认该字段，上限会**静默失效**——Task 2 实测：设 1024 却输出 1470 token，`finish_reason='stop'`。走 `extra_body={"max_tokens": N}` 才真正生效（实测输出 1024，`finish_reason='length'`）。
+- **脚本一律用 `uv run python -m 包.模块` 调用，不要用 `uv run python 路径/文件.py`**。后者把 `sys.path[0]` 设成脚本所在目录，`import app` 会报 `ModuleNotFoundError`（Task 2 实测踩到）。命名空间包使 `-m` 无需 `__init__.py` 即可工作。
+- **中文 token 计数不能用 `count_tokens_approximately`**。它按英文 4 字符/token 估算，对中文**低估 58%**（Task 2 实测：估算 25 / 实测 59，三次一致）。中文实测密度 1.47 字/token，用 `token_chars_per_token = 1.5` 后比值 1.02。
 - **LangChain 1.x API 事实**（spec §3.5，勿凭 0.x 记忆写）：
   - `trim_messages` / `count_tokens_approximately` 在 `langchain_core.messages.utils`
   - 流式取文本用 `chunk.text`，**不是** `chunk.content`
@@ -308,7 +311,7 @@ if __name__ == "__main__":
 - [ ] **Step 2: 运行探针**
 
 ```bash
-uv run python scripts/spike.py
+uv run python -m scripts.spike      # 必须用 -m，不能用路径（见 Task 11 的说明）
 ```
 Expected: 两组结论，均以 ✅ / ⚠️ 开头
 
@@ -521,6 +524,32 @@ def test_temperature_override(monkeypatch):
     assert get_chat_model(temperature=0.0).temperature == 0.0
     assert get_chat_model().temperature == get_settings().llm_temperature
     get_settings.cache_clear()
+
+
+def test_max_tokens_goes_through_extra_body_not_constructor(monkeypatch):
+    """Ruling 11：输出上限走构造参数会被 langchain-openai 改名成
+    max_completion_tokens，DeepSeek 不认，上限静默失效（实测设 1024 输出 1470）。
+    必须走 extra_body。"""
+    monkeypatch.setenv("APP_LLM_MAX_OUTPUT_TOKENS", "1024")
+    monkeypatch.setenv("APP_LLM_EXTRA_BODY", '{"thinking":{"type":"disabled"}}')
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    m = get_chat_model()
+    assert m.extra_body["max_tokens"] == 1024
+    assert m.extra_body["thinking"] == {"type": "disabled"}
+    assert m.max_tokens is None  # 绝不能同时走构造参数
+    get_settings.cache_clear()
+
+
+def test_config_extra_body_can_override_max_tokens(monkeypatch):
+    """配置里显式给了 max_tokens 时，以配置为准，不被默认值覆盖。"""
+    monkeypatch.setenv("APP_LLM_EXTRA_BODY", '{"max_tokens": 256}')
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    assert get_chat_model().extra_body["max_tokens"] == 256
+    get_settings.cache_clear()
 ```
 
 - [ ] **Step 3: 跑测试确认失败**
@@ -531,6 +560,11 @@ uv run pytest tests/test_providers.py -v
 Expected: FAIL — `ModuleNotFoundError: No module named 'app.providers'`
 
 - [ ] **Step 4: 写 `app/providers.py`**
+
+> **⚠️ 本步骤的代码已被 Task 2 的探测结果修正（Ruling 11）。** 原写法把输出上限走
+> `ChatOpenAI(max_tokens=...)`，实测**静默失效**——langchain-openai 会无条件把它改名成
+> `max_completion_tokens`（`chat_models/base.py:3703`、`:3715-3718`），而 DeepSeek 不认这个字段。
+> 实测：设 1024 却输出 1470 token。**输出上限必须走 `extra_body`。**
 
 ```python
 from langchain_openai import ChatOpenAI
@@ -545,13 +579,20 @@ def get_chat_model(temperature: float | None = None) -> ChatOpenAI:
     正常情况下不需要动这个文件。
     """
     s = get_settings()
+
+    # 输出上限必须走 extra_body，不能走 ChatOpenAI(max_tokens=...)：
+    # langchain-openai 会无条件把它改名成 max_completion_tokens
+    # （chat_models/base.py:3703、:3715-3718），DeepSeek 不认该字段，
+    # 上限会静默失效（实测设 1024 却输出 1470 token）。
+    extra_body = dict(s.extra_body)
+    extra_body.setdefault("max_tokens", s.llm_max_output_tokens)
+
     return ChatOpenAI(
         model=s.llm_model,
         base_url=s.llm_base_url,
         api_key=s.llm_api_key or "MISSING",
         temperature=s.llm_temperature if temperature is None else temperature,
-        max_tokens=s.llm_max_output_tokens,
-        extra_body=s.extra_body,
+        extra_body=extra_body,
         max_retries=2,
     )
 ```
@@ -561,7 +602,9 @@ def get_chat_model(temperature: float | None = None) -> ChatOpenAI:
 ```bash
 uv run pytest tests/test_providers.py -v
 ```
-Expected: 3 passed。若 `m.extra_body` 属性名不存在，改为断言 `m.model_kwargs`，并把实际属性名回填进本任务与 spec §3.5。
+Expected: 5 passed。
+
+Ruling 3（承接 preflight）：若 `m.openai_api_base` 属性名在 langchain-openai 1.6.2 中不存在，**改测试断言，不改生产代码**——该断言的目的是验证 base_url 被正确传入，属性名只是手段。优先尝试 `m.openai_api_base` / `m.base_url` / `m.root_client.base_url` 中真实存在的那个，而不是删掉断言。同理若 `m.extra_body` 属性名不存在，改为断言实际承载它的属性（如 `m.model_kwargs`），并把真实属性名回填进 spec §3.5。
 
 - [ ] **Step 6: 提交**
 
@@ -728,6 +771,7 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Files:**
 - Create: `app/context.py`
+- Modify: `app/config.py`（加 `token_chars_per_token` 字段）
 - Test: `tests/test_context.py`
 
 **Interfaces:**
@@ -782,6 +826,23 @@ def test_trimmed_result_starts_with_human():
         history.append(AIMessage(f"回答{i}" + "啰嗦" * 30))
     got = prepare_messages(history, HumanMessage("最新提问"), token_budget=200)
     assert got[0].type == "human"
+
+
+def test_trimming_respects_chinese_budget():
+    """用中文文本验证预算真的被遵守。
+
+    旧的 count_tokens_approximately 对中文低估 58%，会放进约 2.4 倍的消息，
+    这条测试在那时是过不了的。
+    """
+    from app.context import _count_tokens
+
+    history = [
+        HumanMessage("这是一句中文提问" * 20),
+        AIMessage("这是一句中文回答" * 20),
+    ] * 50
+    got = prepare_messages(history, HumanMessage("最新"), token_budget=500)
+    assert _count_tokens(got[:-1]) <= 600
+    assert len(got) < len(history) + 1
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -795,7 +856,20 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'app.context'`
 
 ```python
 from langchain_core.messages import BaseMessage, HumanMessage
-from langchain_core.messages.utils import count_tokens_approximately, trim_messages
+from langchain_core.messages.utils import trim_messages
+
+from app.config import get_settings
+
+
+def _count_tokens(messages: list[BaseMessage]) -> int:
+    """按中文字符密度估算 token。
+
+    不用 langchain_core 的 count_tokens_approximately：它按英文的 4 字符/token
+    估算，对中文低估 58%（Task 2 实测 估算 25 / 实测 59）。中文实测密度
+    1.47 字/token，取 1.5 后估算与实测比值 1.02。
+    """
+    chars = sum(len(str(m.content)) for m in messages)
+    return int(chars / get_settings().token_chars_per_token)
 
 
 def prepare_messages(
@@ -815,13 +889,19 @@ def prepare_messages(
     if not history:
         return [current]
 
-    trimmed = trim_messages(
-        history,
-        strategy="last",
-        token_counter=count_tokens_approximately,
-        max_tokens=token_budget,
-        start_on="human",
-    )
+    try:
+        trimmed = trim_messages(
+            history,
+            strategy="last",
+            token_counter=_count_tokens,
+            max_tokens=token_budget,
+            start_on="human",
+        )
+    except ValueError:
+        # 极端小的预算下 trim_messages 可能无解而抛错。
+        # "当前消息永不被剪裁"这个不变量优先于复用库函数。
+        return [current]
+
     return [*trimmed, current]
 ```
 
@@ -830,19 +910,42 @@ def prepare_messages(
 ```bash
 uv run pytest tests/test_context.py -v
 ```
-Expected: 5 passed
+Expected: 6 passed
 
-- [ ] **Step 5: 若 Task 2 探测 2 判定为"低估超 20%"则改用它**
+> 注意：Step 3 的实现已经直接是**替换后的**版本（用 `_count_tokens` 而非
+> `count_tokens_approximately`），因此 Step 5 不是"再改一次代码"，而是**核对 Step 3 确实
+> 用了新计数器、并在 `app/config.py` 里确实加了 `token_chars_per_token` 字段**。
 
-把 `count_tokens_approximately` 替换为显式计数器，并在 `Settings` 加 `token_chars_per_token: float = 1.5`：
+- [ ] **Step 5: 确认中文标定计数器已就位（已被 Task 2 探测判定为必需）**
+
+> **Task 2 实测结论：`count_tokens_approximately` 对中文低估 58%（估算 25 / 实测 59，比值 0.42，三次运行一致）。**
+> 根因已量化：该函数的 `chars_per_token` 默认 **4.0**（英文调优），而中文实测密度是 **1.47 字/token**。
+> 换用 `chars_per_token=1.5` 后估算 60 / 实测 59，比值 **1.02** —— 因此 `token_chars_per_token` 默认值就用 1.5。
+> **这一步是必做的，不是可选的。** 沿用原函数会让 4096 的预算实际只装得下约 1700 token 的历史。
+
+先在 `app/config.py` 的 `Settings` 加一个字段（Task 1 创建了该文件，此处是修改）：
+
+```python
+    token_chars_per_token: float = 1.5
+```
+
+再在 `app/context.py` 加计数器并替换 `token_counter`：
 
 ```python
 def _count_tokens(messages: list[BaseMessage]) -> int:
+    """按中文字符密度估算 token。
+
+    不用 langchain_core 的 count_tokens_approximately：它按英文的 4 字符/token
+    估算，对中文低估 58%（Task 2 实测 估算 25 / 实测 59）。中文实测密度
+    1.47 字/token，取 1.5 后估算与实测比值 1.02。
+    """
     chars = sum(len(str(m.content)) for m in messages)
     return int(chars / get_settings().token_chars_per_token)
 ```
 
-传给 `trim_messages(token_counter=_count_tokens, ...)`。**若探测结论是 ✅，跳过本步。**
+`trim_messages(..., token_counter=_count_tokens, ...)`。
+
+**并且**按 preflight Ruling 5：若 `trim_messages` 在极小 `token_budget` 下抛 `ValueError`，用 try/except 包裹并回退到 `[current]` —— 不变量"当前消息永不被剪裁"优先于"复用库函数"。
 
 - [ ] **Step 6: 提交**
 
@@ -1848,8 +1951,12 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```python
 """ch01 评估集：Prompt 行为 + 抽取准确率。
 
-用法：uv run python evals/run_evals.py
+用法：uv run python -m evals.run_evals      ← 必须用 -m，不能用路径
 产出：控制台通过率表格 + evals/out/report.json
+
+为什么必须用 `-m`：`python evals/run_evals.py` 会把 sys.path[0] 设成
+`evals/` 目录，导致 `from app.extract import ...` 报 ModuleNotFoundError。
+`-m` 会把 CWD 放进 sys.path[0]，`app` 才能被导入（Task 2 实测踩过同一个坑）。
 """
 
 import asyncio
@@ -1985,7 +2092,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 跑评估集**
 
 ```bash
-uv run python evals/run_evals.py
+uv run python -m evals.run_evals
 ```
 Expected: 两张通过率表格。**允许首次不 100% 通过** —— 这是 Prompt 调优的起点，不是 bug。
 
@@ -2112,8 +2219,11 @@ bash scripts/smoke.sh     # 三条验收标准一键复现
 
 ```bash
 uv run pytest -v                       # 单元测试
-uv run python evals/run_evals.py       # 评估集（Prompt 行为 + 抽取准确率）
+uv run python -m evals.run_evals       # 评估集（Prompt 行为 + 抽取准确率）
 ```
+
+脚本一律用 `python -m 包.模块` 调用，**不要**用 `python 路径/文件.py`。后者会把
+`sys.path[0]` 设成脚本所在目录，导致 `import app` 报 `ModuleNotFoundError`。
 
 ## 接口
 
