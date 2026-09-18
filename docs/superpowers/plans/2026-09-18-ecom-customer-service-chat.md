@@ -318,7 +318,7 @@ Expected: 两组结论，均以 ✅ / ⚠️ 开头
 - [ ] **Step 3: 按结论处置**
 
 - 探测 1 为 ❌ → **停止，回报用户**。备选（需用户拍板）：改用 `model_kwargs={"extra_body": ...}` 或 `default_headers`，或直接对 `openai` SDK 打补丁。
-- 探测 2 为 ❌ → 在 Task 7 把 `count_tokens_approximately` 换成显式 `chars_per_token` 计数器（`estimate = sum(len(m.text) / chars_per_token)`），默认 `chars_per_token=1.5`，并把该值加入 `Settings` 作为 `token_chars_per_token`。
+- 探测 2 为 ❌ → 在 **Task 6**（`app/context.py` 的归属任务，**不是 Task 7**）把 `count_tokens_approximately` 换成显式中文计数器，`Settings` 加 `token_chars_per_token`，默认 1.5。
 - 全 ✅ → 按原计划继续。
 
 - [ ] **Step 4: 把结论写进 `dev-notes/ch01.md`**
@@ -507,13 +507,18 @@ def test_model_uses_configured_endpoint(monkeypatch):
 
 
 def test_extra_body_carries_thinking_disabled(monkeypatch):
-    """这是本项目的命门：thinking 没关掉，对话会一个字都吐不出来（spec §3.2）。"""
+    """这是本项目的命门：thinking 没关掉，对话会一个字都吐不出来（spec §3.2）。
+
+    注意断言的是 extra_body["thinking"] 而不是整个 extra_body 字典：
+    get_chat_model() 还会往 extra_body 里注入 max_tokens（Ruling 11），
+    整字典相等断言在此必然失败。
+    """
     monkeypatch.setenv("APP_LLM_EXTRA_BODY", '{"thinking":{"type":"disabled"}}')
     from app.config import get_settings
 
     get_settings.cache_clear()
     m = get_chat_model()
-    assert m.extra_body == {"thinking": {"type": "disabled"}}
+    assert m.extra_body["thinking"] == {"type": "disabled"}
     get_settings.cache_clear()
 
 
