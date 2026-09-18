@@ -1457,9 +1457,15 @@ async def extract_ticket(text: str, *, model=None) -> AfterSalesTicket:
     显式写出也能防止 langchain-openai 默认值变动时静默漂移。
     """
     model = model or get_chat_model()
-    structured = model.with_structured_output(AfterSalesTicket, method="function_calling")
     messages = build_extract_prompt().format_messages(text=text)
     try:
+        # with_structured_output 必须在 try 内：它与上游能力绑定，schema/method
+        # 不被接受时会抛错。放在 try 外，这类失败会漏成 HTTP 500 而非 §9 规定的
+        # 502 extraction_failed —— 这一点由 Task 10 的集成测试实测暴露，Task 9
+        # 的评审当时只判为"实际风险可忽略"。
+        structured = model.with_structured_output(
+            AfterSalesTicket, method="function_calling"
+        )
         result = await structured.ainvoke(messages)
     except Exception as exc:  # noqa: BLE001 — 上游任意异常统一归为抽取失败
         raise ExtractionFailed(str(exc)[:500]) from exc
