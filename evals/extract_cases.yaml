@@ -1,0 +1,36 @@
+- id: ex-01
+  text: 订单 A123 我要退款，希望原路退回
+  expect: { order_id: "A123", demand: 退款, expected_solution: 原路退回 }
+- id: ex-02
+  text: 我上周买的鞋，订单号 20240915001，太大了想换小一码
+  expect: { order_id: "20240915001", demand: 换货, expected_solution: 换小一码 }
+- id: ex-03
+  text: 帮我看看物流到哪了
+  expect: { order_id: null, demand: 咨询, expected_solution: null }
+- id: ex-04
+  text: DD20240901-7788 这个单子的东西是坏的，我要退
+  expect: { order_id: "DD20240901-7788", demand: 退货, expected_solution: null }
+- id: ex-05
+  text: 我要退货，另外发票也要重开，订单是 A555
+  expect: { order_id: "A555", demand: 退货, expected_solution: null }
+- id: ex-06
+  text: 都三天了还不发货，太慢了
+  expect: { order_id: null, demand: 催发货, expected_solution: null }
+- id: ex-07
+  text: 订单 A777 的鞋子开胶了，能修吗
+  expect: { order_id: "A777", demand: 维修, expected_solution: null }
+- id: ex-08
+  text: 你们客服态度太差了
+  expect: { order_id: null, demand: 投诉, expected_solution: null }
+- id: ex-09
+  text: 订单 B888，我要退款而且要你们承担运费
+  expect: { order_id: "B888", demand: 退款, expected_solution: 承担运费 }
+- id: ex-10
+  text: 你好
+  expect: { order_id: null, demand: null, expected_solution: null }
+- id: ex-11
+  text: 订单 C321 我想换个颜色，最好明天就能寄到
+  expect: { order_id: "C321", demand: 换货, expected_solution: 换颜色 }
+- id: ex-12
+  text: 买的电饭锅用了两次就坏了，订单 99001122，要求全额退款
+  expect: { order_id: "99001122", demand: 退款, expected_solution: 全额退款 }
