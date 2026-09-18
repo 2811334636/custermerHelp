@@ -225,7 +225,21 @@ trim_messages(
 
 - 重启即丢历史；不支持多 worker（uvicorn 单 worker 运行）
 - 接口抽象的意义：以后换 SQLite/Redis 不动任何业务代码
-- `SESSION_MAX_TURNS` 上限淘汰旧会话，防内存无界增长
+
+内存上界由**两个** knob 共同保证（单一 `MAX_TURNS` 无法阻止单个会话无限增长）：
+
+- `SESSION_MAX_SESSIONS`（默认 200）：会话总数上限，超出按 LRU 淘汰整个旧会话
+- `SESSION_MAX_MESSAGES`（默认 100）：单会话消息数上限，超出丢弃最旧消息
+
+### 7.2.1 一轮对话的原子性
+
+写入历史以**整轮**为单位：
+
+1. 读出历史 → 剪裁 → 追加当前 user 消息 → 请求上游 → 流式返回
+2. **仅在正常结束时**才把 `[HumanMessage(本轮), AIMessage(完整回复)]` 一并写入
+3. 客户端中途断开或上游出错时，**整轮丢弃**，只写 user 不写 assistant 会造成"两个 human 连排"的畸形历史
+
+因此 `prepare_messages()` 的输入**不含**当前消息，当前消息由函数内部无条件追加——保证它永远不会被剪裁掉。
 
 ### 7.3 已知风险：中文 token 估算偏差
 
@@ -243,7 +257,8 @@ APP_LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}
 APP_LLM_MAX_OUTPUT_TOKENS=1024
 APP_LLM_TEMPERATURE=0.3
 APP_HISTORY_TOKEN_BUDGET=4096
-APP_SESSION_MAX_TURNS=50
+APP_SESSION_MAX_SESSIONS=200
+APP_SESSION_MAX_MESSAGES=100
 ```
 
 **`APP_LLM_EXTRA_BODY` 是一个 JSON 字符串，原样透传给 `ChatOpenAI(extra_body=...)`。**
