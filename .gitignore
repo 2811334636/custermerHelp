@@ -1,0 +1,22 @@
+# 密钥 —— 绝不能进仓库
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 评估产物
+evals/out/
+*.eval-report.json
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
