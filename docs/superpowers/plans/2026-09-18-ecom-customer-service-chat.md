@@ -51,13 +51,13 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
     "uvicorn[standard]>=0.53.0",
-    "langchain>=1.4.1",
+    # 不依赖 `langchain`（编排层）：项目没用 LCEL/agent，spec §2 把 langgraph*
+    # 编排栈列为非目标。langchain-core + langchain-openai 已足够。
     "langchain-core>=1.6.3",
     "langchain-openai>=1.6.2",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "openai>=3.15.0",
-    "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -65,6 +65,8 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.0",
     "httpx>=0.28.1",
+    # 只有 evals/ 读 yaml
+    "pyyaml>=6.0",
 ]
 
 [tool.pytest.ini_options]
@@ -412,7 +414,9 @@ from pydantic import BaseModel, Field
 
 class ChatRequest(BaseModel):
     session_id: str | None = Field(
-        default=None, description="会话 id；省略则服务端生成并经由 meta 事件返回"
+        default=None,
+        min_length=1,  # 空串视为非法：曾导致服务端生成 id 却不发 meta（spec §5.1）
+        description="会话 id；省略则服务端生成并经由 meta 事件返回",
     )
     message: str = Field(..., min_length=1, max_length=4000)
 
@@ -466,7 +470,9 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `app.config.get_settings()`
-- Produces: `app.providers.get_chat_model(temperature: float | None = None) -> ChatOpenAI`。**这是 FastAPI 的依赖注入点**，Task 9/10 会通过 `Depends(get_chat_model)` 使用它，测试用 `app.dependency_overrides` 替换。
+- Produces: `app.providers.get_chat_model(temperature: float | None = None) -> ChatOpenAI`，以及零参、`lru_cache` 单例的 `get_default_chat_model() -> ChatOpenAI`。
+  **FastAPI 的依赖注入点是 `get_default_chat_model`**，Task 9/10 通过 `Depends(get_default_chat_model)` 使用它，测试用 `app.dependency_overrides` 替换。
+  ⚠️ **绝不能 `Depends(get_chat_model)`**：FastAPI 会按签名把 `temperature` 变成 `/api/chat`、`/api/extract` 上的 query 参数（未鉴权调用者可改采样），且每次请求都重建 ChatOpenAI（新 httpx client + 新 TLS 握手）。带 `temperature` 签名的版本仅供 `evals/` 与测试直接调用。
 
 - [ ] **Step 1: 建 `tests/conftest.py`**
 
@@ -572,6 +578,8 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'app.providers'`
 > 实测：设 1024 却输出 1470 token。**输出上限必须走 `extra_body`。**
 
 ```python
+from functools import lru_cache
+
 from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
@@ -582,6 +590,9 @@ def get_chat_model(temperature: float | None = None) -> ChatOpenAI:
 
     换 provider = 改 .env 的 base_url / api_key / model / extra_body 四行，
     正常情况下不需要动这个文件。
+
+    `temperature` 参数仅供 evals/ 与测试按需覆盖；HTTP 依赖注入**必须**走下面
+    的 get_default_chat_model()，绝不能在 Depends() 里直接用它（原因见该函数）。
     """
     s = get_settings()
 
@@ -600,6 +611,19 @@ def get_chat_model(temperature: float | None = None) -> ChatOpenAI:
         extra_body=extra_body,
         max_retries=2,
     )
+
+
+@lru_cache(maxsize=1)
+def get_default_chat_model() -> ChatOpenAI:
+    """HTTP 端点的模型依赖：零参 + 进程内单例。
+
+    1. 安全：FastAPI 按签名做请求参数分析，直接 Depends(get_chat_model) 会让
+       temperature 变成两条路由的 query 参数，未鉴权调用者可改采样。
+    2. 性能：每请求重建 ChatOpenAI = 新 httpx client + 新 TLS 握手；lru_cache 只建一次。
+
+    带 temperature 签名的 get_chat_model 保留给 evals/ 与测试。
+    """
+    return get_chat_model()
 ```
 
 - [ ] **Step 5: 跑测试确认通过**
@@ -1708,10 +1732,13 @@ def sse_frame(name: str, data: dict) -> str:
 async def chat(
     req: ChatRequest,
     store: SessionStore = Depends(get_store),
-    model=Depends(get_chat_model),
+    model=Depends(get_default_chat_model),  # 零参单例；绝不能用 Depends(get_chat_model)
 ) -> StreamingResponse:
-    is_new_session = req.session_id is None
+    # is_new_session 必须和 session_id 同源，否则空串 "" 会走到
+    # "服务端生成了 id 却不发 meta" 的岔路：客户端永远学不到 id，
+    # 会话被静默孤立（spec §5.1）。一个表达式派生两者。
     session_id = req.session_id or str(uuid.uuid4())
+    is_new_session = req.session_id != session_id
     settings = get_settings()
 
     # 先读出历史（不含当前消息），剪裁由 stream_reply 内部完成
@@ -1765,7 +1792,7 @@ async def chat(
 @router.post("/extract", response_model=AfterSalesTicket)
 async def extract(
     req: ExtractRequest,
-    model=Depends(get_chat_model),
+    model=Depends(get_default_chat_model),  # 零参单例；绝不能用 Depends(get_chat_model)
 ) -> AfterSalesTicket:
     try:
         return await extract_ticket(req.text, model=model)
@@ -2103,10 +2130,16 @@ async def main() -> int:
     )
     print(f"\n  明细已写入 {OUT / 'report.json'}")
 
+    accuracy = (total - wrong) / total
     prompt_pass = sum(r["passed"] for r in prompt_results)
     print(f"\n总计：Prompt {prompt_pass}/{len(prompt_cases)}  "
-          f"Extract 字段级 {total - wrong}/{total}")
-    return 0 if prompt_pass == len(prompt_cases) and wrong == 0 else 1
+          f"Extract 字段级 {total - wrong}/{total} = {accuracy:.1%}"
+          f"（下限 {MIN_EXTRACT_ACCURACY:.0%}）")
+    # 退出码口径：Prompt 必须 15/15；抽取字段级准确率 ≥ 90% 即可（见 Step 5）。
+    # 不要写成 `wrong == 0`（100%）——那会把 35/36 这种 Step 5 判为「通过」的
+    # 跑分报成失败。MIN_EXTRACT_ACCURACY = 0.9 定义在脚本顶部。
+    extract_ok = accuracy >= MIN_EXTRACT_ACCURACY
+    return 0 if prompt_pass == len(prompt_cases) and extract_ok else 1
 
 
 if __name__ == "__main__":
@@ -2159,6 +2192,19 @@ set -uo pipefail
 
 BASE="${BASE:-http://127.0.0.1:8000}"
 
+# 把一次 /api/chat 响应的 delta 帧拼成回复正文。验收 2 与负对照共用。
+sse_reply() {
+  printf '%s' "$1" | grep '^data: ' | sed 's/^data: //' \
+    | python3 -c '
+import json,sys
+out=[]
+for line in sys.stdin:
+    d=json.loads(line)
+    if "text" in d: out.append(d["text"])
+print("".join(out))
+'
+}
+
 echo "======================================================================"
 echo "验收 1：curl 对话看到流式输出（观察 delta 是否逐条到达）"
 echo "======================================================================"
@@ -2178,28 +2224,26 @@ echo "第一轮 session_id = $SID"
 
 R2=$(curl -sN -X POST "$BASE/api/chat" -H 'Content-Type: application/json' \
   -d "{\"session_id\":\"$SID\",\"message\":\"我的订单号是多少？\"}")
-# 必须先拼出回复文本再断言，不能直接 grep 原始 SSE 流：
-# 逐 token 流式会把订单号切成多个独立 delta 帧（实测上游把 A12345 拆成
-# " A" / "123" / "45" 三帧），连续字节在原始流里从不出现 —— 直接 grep 原始流
-# 会产生**假失败**（回复内容明明是对的），而且这个假失败还是非确定性的
-# （取决于分词恰好是否跨帧）。
-REPLY2=$(printf '%s' "$R2" | grep '^data: ' | sed 's/^data: //' \
-  | python3 -c '
-import json,sys
-out=[]
-for line in sys.stdin:
-    d=json.loads(line)
-    if "text" in d: out.append(d["text"])
-print("".join(out))
-')
-echo "第二轮回复：$REPLY2"
+echo "第二轮回复："
+REPLY2=$(sse_reply "$R2")
+printf '%s\n' "$REPLY2"
 if printf '%s' "$REPLY2" | grep -q 'A12345'; then
   echo "✅ 验收 2 通过：第二轮回复中出现了第一轮给出的订单号 A12345"
 else
   echo "❌ 验收 2 失败：第二轮回复中未出现 A12345，上下文没有生效"
 fi
-# 验证这个断言不是空过的：新开一个会话问同样的问题，模型不知道单号，
-# 上面那条检查必须打印 ❌。这一步是这条验收标准的"负对照"。
+
+echo
+echo "负对照（spec §11）：新会话问同样的问题，断言必须失败"
+echo "如果新会话也出现 A12345，说明上面的检查是空过的，不能证明上下文起了作用"
+R3=$(curl -sN -X POST "$BASE/api/chat" -H 'Content-Type: application/json' \
+  -d '{"message":"我的订单号是多少？"}')
+REPLY3=$(sse_reply "$R3")
+if printf '%s' "$REPLY3" | grep -q 'A12345'; then
+  echo "❌ 负对照失败：新会话回复中出现了 A12345 —— 验收 2 的检查无区分力"
+else
+  echo "✅ 负对照通过：新会话回复中没有 A12345，验收 2 的检查确有区分力"
+fi
 
 echo
 echo "======================================================================"

@@ -186,12 +186,18 @@ event: delta
 data: {"text":"您好"}
 
 event: done
-data: {"finish_reason":"stop","usage":{"prompt_tokens":43,"completion_tokens":87}}
+data: {"finish_reason":"stop","usage":{"input_tokens":43,"output_tokens":87,"total_tokens":130}}
 ```
 
 - `meta` 仅在服务端**新生成** session_id 时发送；客户端自带 session_id 时不发
 - `event: error` 与 `done` **互斥**，出错时不发 `done`
 - 选择用 `meta` 事件而非 `X-Session-Id` 响应头承载 session_id：curl 无需 `-i` 即可看见
+- `usage` 的键是 LangChain 归一化后的 `input_tokens` / `output_tokens` / `total_tokens`
+  （来自 `AIMessageChunk.usage_metadata`），**不是**上游原始的 `prompt_tokens` /
+  `completion_tokens`。实现见 `app/chat.py::stream_reply`
+- `session_id` 为 `None` **或空串**都视为新会话：`chat()` 用一个表达式同时派生
+  最终 id 和 `is_new_session`，保证「服务端生成了 id ⇒ 一定发 meta」。空串另由
+  `ChatRequest.session_id` 的 `min_length=1` 在入参处挡掉（曾是孤儿会话 bug）
 
 ### 5.2 `POST /api/extract`
 
@@ -238,11 +244,17 @@ build_chat_prompt() -> ChatPromptTemplate.from_messages([
 
 ### 7.1 剪裁策略
 
+> ⚠️ 本节的 `token_counter` 已被 **§3.6②** 取代。`count_tokens_approximately`
+> 对中文低估 58%，**实际实现不再使用它**，改用 `app/context.py::_count_tokens`
+> （按 `APP_TOKEN_CHARS_PER_TOKEN`，默认 1.5 字符/token）。下面代码块已同步为
+> 实际实现；§3.6② 是权威。
+
 ```python
+# 实际实现：app/context.py::prepare_messages
 trim_messages(
     history,
     strategy="last",
-    token_counter=count_tokens_approximately,
+    token_counter=_count_tokens,               # app/context.py，中文密度计数器
     max_tokens=settings.history_token_budget,  # 默认 4096
     start_on="human",
 )
@@ -289,6 +301,7 @@ APP_LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}
 APP_LLM_MAX_OUTPUT_TOKENS=1024
 APP_LLM_TEMPERATURE=0.3
 APP_HISTORY_TOKEN_BUDGET=4096
+APP_TOKEN_CHARS_PER_TOKEN=1.5
 APP_SESSION_MAX_SESSIONS=200
 APP_SESSION_MAX_MESSAGES=100
 ```

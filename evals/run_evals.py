@@ -32,6 +32,11 @@ OUT = ROOT / "out"
 # （含标点与换行），即用户实际收到的那段文本的长度。
 MAX_REPLY_CHARS = 150
 
+# 抽取字段级准确率的退出码下限，对齐 plan Step 5 的目标「≥ 90%」。
+# 不写成 100%：36 个字段里错 1~3 个（即 35/36、33/36）在计划口径下是「通过」，
+# 脚本若要求 wrong == 0 就会把「计划说 pass」的跑分报成失败。
+MIN_EXTRACT_ACCURACY = 0.9
+
 JUDGE_TEMPLATE = """你在给一个电商客服机器人的回复打分。
 
 客服的行为约束：
@@ -162,10 +167,14 @@ async def main() -> int:
     )
     print(f"\n  明细已写入 {OUT / 'report.json'}")
 
+    accuracy = (total - wrong) / total
     prompt_pass = sum(r["passed"] for r in prompt_results)
     print(f"\n总计：Prompt {prompt_pass}/{len(prompt_cases)}  "
-          f"Extract 字段级 {total - wrong}/{total}")
-    return 0 if prompt_pass == len(prompt_cases) and wrong == 0 else 1
+          f"Extract 字段级 {total - wrong}/{total} = {accuracy:.1%}"
+          f"（下限 {MIN_EXTRACT_ACCURACY:.0%}）")
+    # 退出码口径：Prompt 必须 15/15；抽取字段级准确率 ≥ 90% 即可（plan Step 5）。
+    extract_ok = accuracy >= MIN_EXTRACT_ACCURACY
+    return 0 if prompt_pass == len(prompt_cases) and extract_ok else 1
 
 
 if __name__ == "__main__":

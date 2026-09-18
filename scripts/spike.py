@@ -10,6 +10,11 @@ from app.config import get_settings
 
 
 def build() -> ChatOpenAI:
+    # ⚠️ 保留的历史探测代码，**不要照抄这个构造方式**。
+    # 这里的 `ChatOpenAI(max_tokens=...)` 正是 spec §3.6③ 实测为「静默失效」的
+    # 写法：langchain-openai 会把它改名成 max_completion_tokens，DeepSeek 不认。
+    # 生产路径（app/providers.py::get_chat_model）已改为走 extra_body。
+    # 本文件是一次性探测脚本，保留原样是为了忠实记录当时的探测条件，勿模仿。
     s = get_settings()
     return ChatOpenAI(
         model=s.llm_model,
