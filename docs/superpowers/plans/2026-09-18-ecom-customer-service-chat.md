@@ -17,7 +17,7 @@
 - **Python 3.14.4**，依赖管理用 `uv`（本机无 `pip3`）。所有命令在仓库根 `/home/zzx/custermerHelp` 执行。
 - **上游**：`base_url=https://api.deepseek.com/`，`model=deepseek-flash`。key 从环境变量 `ANTHROPIC_AUTH_TOKEN` 取（该 key 即 DeepSeek key），写入 `.env` 的 `APP_LLM_API_KEY`。**`.env` 绝不进 git。**
 - **必须关闭 thinking**：`APP_LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}`。理由见 spec §3.2——开着 thinking 会把 token 预算烧光，正文零输出。
-- **结构化输出只能用 `with_structured_output(..., method="function_calling")`**。`response_format: json_schema` 上游完全不可用（spec §3.4）。
+- **结构化输出只能用 `with_structured_output(..., method="function_calling")`，且该参数必须显式写出。** `response_format: json_schema` 上游完全不可用（spec §3.4）。**注意：`ChatOpenAI.with_structured_output` 的默认 method 是 `"json_schema"` 而非 `"function_calling"`**（`chat_models/base.py:3748` 重写了 `BaseChatOpenAI` 的 `:2528`），且 `:2677-2690` 的自动兜底**只对 Pydantic V1 schema 与 `gpt-3*`/`gpt-4-*`/`gpt-4` 型号触发**，`deepseek-flash` 两者都不匹配 ⇒ **没有自动回退**。省掉该参数会让 `/api/extract` 100% 被上游拒绝。为什么这段要写这么细：一个"顺手简化掉冗余参数"的未来改动会让抽取功能整体失效，而这个失效只会在运行时暴露。
 - **输出上限 `max_tokens` 必须走 `extra_body`，绝不能走 `ChatOpenAI(max_tokens=...)`**。langchain-openai 会无条件把它改名成 `max_completion_tokens`（`chat_models/base.py:3703`、`:3715-3718`），DeepSeek 不认该字段，上限会**静默失效**——Task 2 实测：设 1024 却输出 1470 token，`finish_reason='stop'`。走 `extra_body={"max_tokens": N}` 才真正生效（实测输出 1024，`finish_reason='length'`）。
 - **脚本一律用 `uv run python -m 包.模块` 调用，不要用 `uv run python 路径/文件.py`**。后者把 `sys.path[0]` 设成脚本所在目录，`import app` 会报 `ModuleNotFoundError`（Task 2 实测踩到）。命名空间包使 `-m` 无需 `__init__.py` 即可工作。
 - **中文 token 计数不能用 `count_tokens_approximately`**。它按英文 4 字符/token 估算，对中文**低估 58%**（Task 2 实测：估算 25 / 实测 59，三次一致）。中文实测密度 1.47 字/token，用 `token_chars_per_token = 1.5` 后比值 1.02。

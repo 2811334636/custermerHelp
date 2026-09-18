@@ -78,7 +78,13 @@
 依赖解析结果（Python 3.14.4 下全部通过）：langchain 1.4.1 / langchain-core 1.6.3 / langchain-openai 1.6.2 / fastapi 0.141.1 / pydantic 2.13.5。
 
 - `ChatOpenAI(base_url=, api_key=, model=)` 支持自定义端点 ✅
-- `with_structured_output` 默认 method 为 `function_calling` ✅
+- `with_structured_output` 的默认 method **不是** `function_calling` ⚠️ **（本节原结论有误，2026-09-18 由 Task 9 实现者发现并实测更正）**
+
+  `langchain-openai` 1.6.2 里有两处定义：`BaseChatOpenAI`（`chat_models/base.py:715`）的默认是 `"function_calling"`（`:2526-2528`），但 **`ChatOpenAI`（`:2823`）重写了它，默认是 `"json_schema"`**（`:3748`）。
+
+  而 `:2677-2690` 的自动兜底**只对 Pydantic V1 schema 和型号匹配 `gpt-3*` / `gpt-4-*` / `gpt-4` 的模型触发**——`deepseek-flash` **两者都不匹配**，因此**没有任何自动回退**。
+
+  **结论：`method="function_calling"` 是严格必需的，不是防御性写法。** 省掉它，请求会带 `response_format: {"type": "json_schema"}` 发往上游，被 §3.4 的 `This response_format type is unavailable now` 100% 拒绝，`/api/extract` 完全不可用。`app/extract.py` 显式写出该参数，并有测试锁住它。
 - `trim_messages` / `count_tokens_approximately` 位于 **`langchain_core.messages.utils`**，不是 `langchain_core.messages` ⚠️
 - `ChatPromptTemplate.from_messages([("system", ...), MessagesPlaceholder("history")])` 形态成立 ✅
 - 1.x 流式取文本用 **`chunk.text`**，不是 0.x 的 `chunk.content` ⚠️
