@@ -903,8 +903,11 @@ def prepare_messages(
             start_on="human",
         )
     except ValueError:
-        # 极端小的预算下 trim_messages 可能无解而抛错。
-        # "当前消息永不被剪裁"这个不变量优先于复用库函数。
+        # 实测（langchain-core 1.6.3）：极小预算下 trim_messages 并**不抛错**，
+        # 而是静默返回 []，不变量由下面的 [*trimmed, current] 保住。
+        # 本分支是防御性的，覆盖"某版本/某输入确实抛 ValueError"的情况，
+        # 在当前版本下**不可达**。保留是因为它兜住的不变量（当前消息永不
+        # 被剪裁）一旦破坏，模型会收到空提问；优雅降级优于整个请求 500。
         return [current]
 
     return [*trimmed, current]
@@ -1106,7 +1109,13 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: `app.context.prepare_messages`、`app.prompts.build_chat_prompt`、`app.providers.get_chat_model`
 - Produces:
-  - 事件类型 `MetaEvent(session_id: str)`、`DeltaEvent(text: str)`、`DoneEvent(finish_reason: str | None, usage: dict | None)`、`ErrorEvent(code: str, message: str)`，联合类型 `DomainEvent`
+  - 事件类型 `DeltaEvent(text: str)`、`DoneEvent(finish_reason: str | None, usage: dict | None)`、`ErrorEvent(code: str, message: str)`，联合类型 `DomainEvent`
+
+- [ ] **Step 0（前置修正）：不要定义 `MetaEvent`**
+
+**controller Ruling 2（约束）：** 本节初稿定义了 `MetaEvent(session_id: str)` 并列为产出，但 `stream_reply` **从不产出它**——它是死代码。meta 事件真正的职责（携带新生成的 `session_id`）属于 `app/api.py`，因为 session id 是在那里生成的。Task 10 的代码已同步删除对它的引用。
+
+**本任务只定义 `DeltaEvent` / `DoneEvent` / `ErrorEvent` 三个类型，以及它们的 `DomainEvent` 联合。**
   - `classify_exception(exc: BaseException) -> str`
   - `async def stream_reply(message: str, history: list[BaseMessage], *, model, token_budget: int) -> AsyncIterator[DomainEvent]`
 
@@ -1243,11 +1252,6 @@ from app.providers import get_chat_model
 
 
 @dataclass(frozen=True)
-class MetaEvent:
-    session_id: str
-
-
-@dataclass(frozen=True)
 class DeltaEvent:
     text: str
 
@@ -1264,7 +1268,7 @@ class ErrorEvent:
     message: str
 
 
-DomainEvent = MetaEvent | DeltaEvent | DoneEvent | ErrorEvent
+DomainEvent = DeltaEvent | DoneEvent | ErrorEvent
 
 _AUTH_ERRORS = (openai.AuthenticationError, openai.PermissionDeniedError)
 _UNAVAILABLE_ERRORS = (
@@ -1661,7 +1665,6 @@ from app.chat import (
     DeltaEvent,
     DoneEvent,
     ErrorEvent,
-    MetaEvent,
     stream_reply,
 )
 from app.config import get_settings
@@ -1714,8 +1717,6 @@ async def chat(
                 model=model,
                 token_budget=settings.history_token_budget,
             ):
-                if isinstance(event, MetaEvent):
-                    continue
                 if isinstance(event, DeltaEvent):
                     collected.append(event.text)
                     yield sse_frame("delta", {"text": event.text})
