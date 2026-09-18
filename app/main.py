@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from app.api import router
 
@@ -14,7 +14,7 @@ async def healthz() -> dict:
 
 
 @app.exception_handler(HTTPException)
-async def flat_http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+async def flat_http_exception_handler(request: Request, exc: HTTPException) -> Response:
     """Ruling 4：spec §9 规定所有错误响应都是扁平的 {code, message}。
 
     FastAPI 默认把 HTTPException(detail={...}) 包成 {"detail": {...}}，
