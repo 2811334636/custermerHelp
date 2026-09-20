@@ -41,7 +41,7 @@ def sse_frame(name: str, data: dict) -> str:
 async def chat(
     req: ChatRequest,
     store: SessionStore = Depends(get_store),
-    db: AsyncSession | None = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     model=Depends(get_default_chat_model),
 ) -> StreamingResponse:
     # is_new_session 必须和 session_id 同源，否则空串 "" 会走到
@@ -104,11 +104,7 @@ async def chat(
                 # 的写入回滚——不提交则本轮消息永远不落库。conversations 行由
                 # append 内部的 get_or_create 建出来，和消息同属一个事务，所以
                 # "只在完成时提交"是自洽的：中断轮两者一起回滚，不留半截。
-                #
-                # db 为 None 只出现在测试里（test_api 把 get_db 覆盖成 None，
-                # 桩 store 自己管状态，没有事务可提交）。
-                if db is not None:
-                    await db.commit()
+                await db.commit()
 
     return StreamingResponse(
         event_stream(),

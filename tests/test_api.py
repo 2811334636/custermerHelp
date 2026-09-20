@@ -42,6 +42,18 @@ class FakeStore:
         return session_id in self._data
 
 
+class FakeDbSession:
+    """路由只调它的 commit()。用桩而不是 None——生产代码里出现
+    `if db is not None` 这类守卫，就是为了迁就一个不诚实的测试替身。
+    """
+
+    def __init__(self):
+        self.commits = 0
+
+    async def commit(self):
+        self.commits += 1
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("APP_LLM_API_KEY", "test-key")
@@ -49,11 +61,12 @@ def client(monkeypatch):
 
     get_settings.cache_clear()
     store = FakeStore()
+    db = FakeDbSession()
     app.dependency_overrides[get_store] = lambda: store
-    # 路由也直接依赖 get_db（整轮成功后要 commit）。覆盖成 None 既避免真去开
-    # 一个数据库 session，也让这些用例保持 DB-free——桩 store 自己管状态，
-    # 没有事务要提交；chat() 里对 db 为 None 有显式分支。
-    app.dependency_overrides[get_db] = lambda: None
+    # 路由也直接依赖 get_db（整轮成功后要 commit）。桩掉它，这些用例就保持
+    # DB-free。这里绑实例（而非类）是为了让用例能读 db.commits 断言提交次数——
+    # 类形式每次请求都新建实例，计数读不到，还得靠类级变量+手动重置。
+    app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_default_chat_model] = lambda: FakeModel()
     with TestClient(app) as c:
         yield c
@@ -92,6 +105,9 @@ def test_chat_emits_meta_then_deltas_then_done(client):
     assert names.count("delta") == 2
     assert "".join(d["text"] for n, d in events if n == "delta") == "您好"
     assert uuid.UUID(events[0][1]["session_id"])  # 是合法 uuid
+    # 完成的一轮必须提交：get_db 退出时会回滚未提交的写入，漏掉这行
+    # 写入就永远不落库（实测：不 commit 时库里查不到本轮消息）。
+    assert client.app.dependency_overrides[get_db]().commits == 1
 
 
 async def test_chat_reuses_given_session_and_keeps_context(client):
@@ -143,9 +159,9 @@ async def test_chat_emits_meta_when_session_id_is_empty_string():
 
     req = ChatRequest.model_construct(session_id="", message="你好")
     store = FakeStore()
-    # db=None：直接调用没有依赖注入，显式说明"本用例没有真 session"，
-    # 免得拿到 Depends 占位对象（见 chat() 里提交那段的注释）。
-    resp = await chat(req, store=store, db=None, model=FakeModel())
+    # 直接调用没有依赖注入，db 得自己给。传桩而不是 None：路由无条件
+    # `await db.commit()`，生产路径下 db 永不为 None。
+    resp = await chat(req, store=store, db=FakeDbSession(), model=FakeModel())
 
     raw = "".join([chunk async for chunk in resp.body_iterator])
     events = parse_sse(raw)
@@ -188,6 +204,8 @@ async def test_failed_turn_leaves_session_store_untouched(client):
     assert parse_sse(r.text)[-1][0] == "error"
     assert not await store.exists(sid)
     assert await store.get(sid) == []
+    # 中止的一轮一句都不许写，所以也不许提交（提交了就等于落库半截）。
+    assert client.app.dependency_overrides[get_db]().commits == 0
 
 
 def test_temperature_is_not_an_endpoint_parameter():
