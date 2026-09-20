@@ -141,6 +141,30 @@ async def test_session_reaches_tool_through_context():
     assert seen["session"] is marker
 
 
+async def test_session_is_inherited_from_outer_context_when_registry_has_none():
+    """Minor 9：registry 没带 session 时，不得把外层上下文的 session 冲成 None。
+
+    conversation_id 有继承回退、session 原先是硬取 `self._session`——同一个
+    上下文里两个字段行为不一致：`with tool_context(cid, session=s)` 包一层再
+    用一个无 session 的 registry 执行，工具会读到 None。
+    """
+    seen = {}
+
+    @tool(args_schema=EchoArgs)
+    async def spy(text: str) -> str:
+        """窥探上下文里的 session。"""
+        seen["session"] = current_context().session
+        return "ok"
+
+    outer = object()
+    reg = ToolRegistry([ToolSpec(tool=spy, timeout_s=1.0, max_retries=0)], session=None)
+    with tool_context(5, outer):
+        out = await reg.execute("spy", {"text": "x"}, "call_13")
+
+    assert out.ok is True
+    assert seen["session"] is outer, "外层 session 被无 session 的 registry 冲掉了"
+
+
 async def test_two_registries_do_not_leak_sessions_into_each_other():
     """两个 registry 各带各的 session，**并发**执行时不能串号。
 

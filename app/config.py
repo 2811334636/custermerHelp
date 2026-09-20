@@ -29,8 +29,12 @@ class Settings(BaseSettings):
     # 容器只能映射到 3307（见 docker-compose.yml 注释）。
     db_url: str = "mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service?charset=utf8mb4"
     default_user_id: str = "anonymous"
-    tool_timeout_s: float = 3.0
-    tool_max_retries: int = 2
+    # 工具执行的两个数值旋钮，与文件里其他数值设置一样带边界（修复轮 · Minor 8）。
+    # timeout_s=0 会让 asyncio.wait_for 立刻超时（工具永远"超时失败"）；
+    # max_retries<0 更隐蔽：attempts = max_retries + 1 变成 0，重试循环一次都不跑，
+    # last_error 保持 None，回灌给模型的是"已尝试 0 次：NoneType"——一句假事实。
+    tool_timeout_s: float = Field(default=3.0, gt=0)
+    tool_max_retries: int = Field(default=2, ge=0)
 
     @field_validator("llm_extra_body")
     @classmethod

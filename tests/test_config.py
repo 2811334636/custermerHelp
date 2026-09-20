@@ -45,12 +45,22 @@ def test_get_settings_is_cached():
         ("APP_LLM_MAX_OUTPUT_TOKENS", "0"),
         ("APP_SESSION_MAX_SESSIONS", "0"),
         ("APP_SESSION_MAX_MESSAGES", "-5"),
+        # 修复轮 · Minor 8：工具旋钮原先没有边界。负数 max_retries 会让
+        # attempts = -1 + 1 = 0，重试循环一次都不跑（last_error 停在 None）。
+        ("APP_TOOL_TIMEOUT_S", "0"),
+        ("APP_TOOL_MAX_RETRIES", "-1"),
     ],
 )
 def test_non_positive_numeric_settings_fail_at_startup(monkeypatch, env, value):
     monkeypatch.setenv(env, value)
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_zero_tool_retries_is_allowed(monkeypatch):
+    """ge=0 的边界：0 次重试是合法配置（只试一次），别误伤成非法。"""
+    monkeypatch.setenv("APP_TOOL_MAX_RETRIES", "0")
+    assert Settings(_env_file=None).tool_max_retries == 0
 
 
 def test_malformed_extra_body_fails_at_startup(monkeypatch):

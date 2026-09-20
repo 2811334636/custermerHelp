@@ -68,6 +68,22 @@ class ToolRegistry:
         except LookupError:
             return 0
 
+    def _effective_session(self, session: AsyncSession | None) -> AsyncSession | None:
+        """决定这次执行注入哪个库会话 —— 与 _effective_conversation_id 对称。
+
+        ★ 为什么要这一层（修复轮 · Minor 9）：会话原来只取 `self._session`，
+        一个没带 session 的 registry 会把外层 `tool_context(cid, session=...)`
+        里的 session **冲成 None**——同一个上下文里 conversation_id 会继承、
+        session 却不会，两个字段行为不一致。显式给了就用它；没给则沿用外层
+        已有的；都没有才退到 None。
+        """
+        if session is not None:
+            return session
+        try:
+            return current_context().session
+        except LookupError:
+            return None
+
     async def execute(
         self, name: str, raw_args: dict, call_id: str, *, conversation_id: int | None = None
     ) -> ToolOutcome:
@@ -97,7 +113,10 @@ class ToolRegistry:
         # 代码 bug 走 break 时只试了 1 次，写"已尝试 3 次"就是喂给模型一条假事实。
         tried = 0
 
-        with tool_context(self._effective_conversation_id(conversation_id), self._session):
+        with tool_context(
+            self._effective_conversation_id(conversation_id),
+            self._effective_session(self._session),
+        ):
             for attempt in range(1, attempts + 1):
                 tried = attempt
                 try:
