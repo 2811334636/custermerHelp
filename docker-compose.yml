@@ -1,0 +1,35 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: custermerhelp-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: customer_service
+      MYSQL_USER: app
+      MYSQL_PASSWORD: apppw
+      # 必须有 locale：镜像默认 POSIX，mysql 客户端会按 latin1 处理。
+      # 两个实测后果：① initdb 执行 01-schema.sql 时把文件里的 UTF-8 中文
+      # 当 latin1 存库，ENUM('进行中',...) 落库成双重编码乱码（HEX 为
+      # C3A8C2BF... 而非 E8BF9BE8A18C...），后续按中文取值会失败；
+      # ② `mysql -e "... LIKE '%退货%'"` 永远匹配不到（返回 0）。
+      LANG: C.UTF-8
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    ports:
+      # 宿主 3306 被本机 MySQL80 服务 + VMware NAT 转发规则(3306=192.168.150.128:3306)占用,
+      # 实测 Docker 无论绑 0.0.0.0:3306 还是 127.0.0.1:3306 都报
+      # "ports are not available ... /forwards/expose returned unexpected status: 500",
+      # 故映射到 3307(与 MewHelp 同机同因的方案一致)。
+      # 改这里必须同步改 .env / .env.example 的 APP_DB_URL。
+      - "3307:3306"
+    volumes:
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/02-test-db.sql:ro
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  mysql_data:

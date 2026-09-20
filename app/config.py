@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     token_chars_per_token: float = Field(default=1.5, gt=0)
     session_max_sessions: int = Field(default=200, gt=0)
     session_max_messages: int = Field(default=100, gt=0)
+    # 3307 而非 3306：宿主 3306 被 MySQL80 服务 + VMware NAT 占用，
+    # 容器只能映射到 3307（见 docker-compose.yml 注释）。
+    db_url: str = "mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service?charset=utf8mb4"
+    default_user_id: str = "anonymous"
+    tool_timeout_s: float = 3.0
+    tool_max_retries: int = 2
 
     @field_validator("llm_extra_body")
     @classmethod
