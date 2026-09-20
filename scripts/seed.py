@@ -56,8 +56,19 @@ async def main() -> None:
     async with test_engine.begin() as conn:
         for stmt in [x.strip() for x in schema.split(";") if x.strip()]:
             await conn.execute(text(stmt))
+        # 测试库也要灌种子：tests/test_repositories.py 的 faq 用例读的就是
+        # customer_service_test，而 db_session fixture 用完即回滚，种子必须在
+        # 库中预先存在。复用同一份 FAQ_SEED，避免两份数据各自漂移。
+        await conn.execute(text("DELETE FROM faq"))
+        for q, a, c in FAQ_SEED:
+            await conn.execute(
+                text("INSERT INTO faq (question, answer, category) VALUES (:q, :a, :c)"),
+                {"q": q, "a": a, "c": c},
+            )
+        m = (await conn.execute(text("SELECT COUNT(*) FROM faq"))).scalar_one()
     await test_engine.dispose()
     print("customer_service_test 已建表")
+    print(f"customer_service_test.faq 已灌入 {m} 条")
 
     await engine.dispose()
 
