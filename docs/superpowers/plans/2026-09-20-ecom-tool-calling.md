@@ -16,7 +16,7 @@
 
 - **Python 3.12.14**，依赖管理用 `uv`（本机无 `pip3`）。所有命令在仓库根 `/home/zzx/custermerHelp` 执行。
 - **Docker 必须可用**（MySQL 8.4 容器）。`docker compose up -d` 起库。
-- **数据库 URL**：`mysql+aiomysql://app:apppw@127.0.0.1:3306/customer_service?charset=utf8mb4`
+- **数据库 URL**：`mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service?charset=utf8mb4`
 - **全程 async**：接口、工具、仓储、会话存储都是 `async def`；DB 访问一律 `await`。**绝不能**在 async 代码里调用同步 SQLAlchemy。
 - **`Chunk + Chunk` 可累加**：LangChain 1.x 的 `AIMessageChunk` 支持 `+`，用于累积流式分片。官方文档确认的写法是 `gathered = chunk if gathered is None else gathered + chunk`。
 - **ch01 的三条上游约束不得回退**（任何"顺手简化"都会破坏）：
@@ -115,11 +115,21 @@ services:
       MYSQL_DATABASE: customer_service
       MYSQL_USER: app
       MYSQL_PASSWORD: apppw
+      # ★ 不是装饰：镜像默认 POSIX locale 时，initdb 会把 DDL 里的中文按
+      # latin1 双重编码落库（enum('进行中') 存成乱码字节），且中文条件查询
+      # 恒返回 0——不报错，只是静默失效。Task 1 实测踩到并修复。
+      LANG: C.UTF-8
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     ports:
-      - "3306:3306"
+      # ★ 3307 而非 3306：宿主 3306 被 Windows 侧 MySQL80 服务 + VMware NAT
+      # 转发规则占用（用户确认）。实测绑 0.0.0.0:3306 与 127.0.0.1:3306 都失败。
+      # 所有连接串必须用 3307。
+      - "3307:3306"
     volumes:
       - ./scripts/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      # 官方 entrypoint 只给 app 授权 MYSQL_DATABASE；测试库需显式建库+授权，
+      # 否则 seed 报 1044，后续测试也连不上。
+      - ./scripts/init-test-db.sql:/docker-entrypoint-initdb.d/02-init-test-db.sql:ro
       - mysql_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-prootpw"]
@@ -130,6 +140,15 @@ services:
 volumes:
   mysql_data:
 ```
+
+> **改了 `docker-compose.yml` 之后必须 `docker compose down -v` 再 `up -d`。** `LANG` 只在**首次 initdb** 时起作用；不删数据卷重建的话，库里已有的乱码字节不会被修正。验证方式是对着真实数据看十六进制：
+>
+> ```bash
+> docker compose exec -T mysql mysql -uapp -papppw customer_service --default-character-set=utf8mb4 \
+>   -N -e "SELECT HEX('进行中');"     # 必须是 E8BF9BE8A18C，不是 C3A8C2BF...
+> docker compose exec -T mysql mysql -uapp -papppw customer_service --default-character-set=utf8mb4 \
+>   -N -e "SELECT COUNT(*) FROM faq WHERE category='售后';"   # 必须 > 0
+> ```
 
 - [ ] **Step 3: 起库并验证四张表**
 
@@ -224,7 +243,7 @@ if __name__ == "__main__":
 `.env.example` 追加：
 
 ```ini
-APP_DB_URL=mysql+aiomysql://app:apppw@127.0.0.1:3306/customer_service?charset=utf8mb4
+APP_DB_URL=mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service?charset=utf8mb4
 APP_DEFAULT_USER_ID=anonymous
 APP_TOOL_TIMEOUT_S=3.0
 APP_TOOL_MAX_RETRIES=2
@@ -233,7 +252,7 @@ APP_TOOL_MAX_RETRIES=2
 `app/config.py` 的 `Settings` 追加字段（保持既有字段不动）：
 
 ```python
-    db_url: str = "mysql+aiomysql://app:apppw@127.0.0.1:3306/customer_service?charset=utf8mb4"
+    db_url: str = "mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service?charset=utf8mb4"
     default_user_id: str = "anonymous"
     tool_timeout_s: float = 3.0
     tool_max_retries: int = 2
@@ -516,7 +535,7 @@ import pytest
 os.environ.setdefault("APP_LLM_API_KEY", "test-key")
 os.environ.setdefault(
     "APP_DB_URL",
-    "mysql+aiomysql://app:apppw@127.0.0.1:3306/customer_service_test?charset=utf8mb4",
+    "mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service_test?charset=utf8mb4",
 )
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402

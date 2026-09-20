@@ -564,7 +564,7 @@ ch01 的 ABC 是同步方法（`def get`），而 DB 访问要 `await`。**这�
 ## 10. 配置
 
 ```ini
-APP_DB_URL=mysql+aiomysql://app:apppw@127.0.0.1:3306/customer_service?charset=utf8mb4
+APP_DB_URL=mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service?charset=utf8mb4
 APP_TOOL_TIMEOUT_S=3.0
 APP_TOOL_MAX_RETRIES=2
 ```
