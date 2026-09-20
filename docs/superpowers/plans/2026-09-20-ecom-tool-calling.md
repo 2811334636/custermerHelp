@@ -3096,6 +3096,8 @@ if _web.is_dir():
 - 顶部标题，中间消息列表，底部输入框 + 发送按钮
 - 用户消息靠右气泡，助手消息靠左气泡
 - **工具徽章**：收到 `phase=start` 时插入一个"⏳ 查物流…"的灰色小徽章；收到 `phase=end` 时改成"🔧 查物流"，`ok=false` 时用警示色
+  - ⚠️ **`phase=end` 帧不带 `name`**（见 §8.1 的帧定义）。前端必须在 start 帧记住 `call_id → name`，否则会渲染成 `🔧 undefined`
+  - ⚠️ **"⏳ 查询中…"这个中间态在本章**看不见**：本地种子数据下工具执行只要 0–2ms。实测的约 1 秒是**上游首 token 延迟**，不是工具耗时。这个中间态是留给"工具接了真实系统之后"的——Task 11 实测确认它确实会被渲染（MutationObserver 抓到过），只是快到肉眼看不出
 - 中文标签映射表 + 未知工具名兜底显示原始 name
 - 用 `fetch` + `ReadableStream` 读 SSE（不用 `EventSource`——它只支持 GET）
 - 首帧 `meta` 里拿 `session_id`，存在变量里供后续轮次使用
@@ -3171,6 +3173,7 @@ document.getElementById("form").addEventListener("submit", async (e) => {
   let badge = null;
   let bubble = null;
   const badges = {};
+  const toolNames = {};   // call_id → 工具名（end 帧不带 name，见下）
 
   const resp = await fetch("/api/chat", {
     method: "POST",
@@ -3196,9 +3199,14 @@ document.getElementById("form").addEventListener("submit", async (e) => {
       if (name === "meta") sessionId = data.session_id;
       else if (name === "tool") {
         if (data.phase === "start") {
+          // ★ 必须记住 call_id → name：按 SSE 契约，phase=end 帧**不带** name
+          // （两帧拆分之后它是冗余的）。直接读 data.name 会渲染成 "🔧 undefined"。
+          // Task 11 实测踩到过。
+          toolNames[data.call_id] = data.name;
           badges[data.call_id] = addBadge(wrap, "⏳ " + labelOf(data.name) + "…");
         } else if (badges[data.call_id]) {
-          badges[data.call_id].textContent = "🔧 " + labelOf(data.name) + " · " + data.summary;
+          badges[data.call_id].textContent =
+            "🔧 " + labelOf(toolNames[data.call_id]) + " · " + data.summary;
           if (!data.ok) badges[data.call_id].classList.add("err");
         }
       } else if (name === "delta") {
