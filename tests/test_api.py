@@ -45,13 +45,17 @@ class FakeStore:
 class FakeDbSession:
     """路由只调它的 commit()。用桩而不是 None——生产代码里出现
     `if db is not None` 这类守卫，就是为了迁就一个不诚实的测试替身。
+
+    计数放在**类**上：fixture 传的是类本身，FastAPI 每次请求新建实例。
+    若把计数放实例上，要断言的实例根本读不到——`dependency_overrides
+    [get_db]().commits` 拿到的是刚建的新实例、恒为 0，是个静默失真的断言。
+    fixture 每个用例前清零。
     """
 
-    def __init__(self):
-        self.commits = 0
+    commits = 0
 
     async def commit(self):
-        self.commits += 1
+        FakeDbSession.commits += 1
 
 
 @pytest.fixture
@@ -61,12 +65,10 @@ def client(monkeypatch):
 
     get_settings.cache_clear()
     store = FakeStore()
-    db = FakeDbSession()
+    FakeDbSession.commits = 0  # 类级计数，每个用例前清零，免得跨用例串
     app.dependency_overrides[get_store] = lambda: store
-    # 路由也直接依赖 get_db（整轮成功后要 commit）。桩掉它，这些用例就保持
-    # DB-free。这里绑实例（而非类）是为了让用例能读 db.commits 断言提交次数——
-    # 类形式每次请求都新建实例，计数读不到，还得靠类级变量+手动重置。
-    app.dependency_overrides[get_db] = lambda: db
+    # 路由也直接依赖 get_db（整轮成功后要 commit），桩掉它这些用例就保持 DB-free
+    app.dependency_overrides[get_db] = FakeDbSession
     app.dependency_overrides[get_default_chat_model] = lambda: FakeModel()
     with TestClient(app) as c:
         yield c
@@ -107,7 +109,7 @@ def test_chat_emits_meta_then_deltas_then_done(client):
     assert uuid.UUID(events[0][1]["session_id"])  # 是合法 uuid
     # 完成的一轮必须提交：get_db 退出时会回滚未提交的写入，漏掉这行
     # 写入就永远不落库（实测：不 commit 时库里查不到本轮消息）。
-    assert client.app.dependency_overrides[get_db]().commits == 1
+    assert FakeDbSession.commits == 1
 
 
 async def test_chat_reuses_given_session_and_keeps_context(client):
@@ -205,7 +207,7 @@ async def test_failed_turn_leaves_session_store_untouched(client):
     assert not await store.exists(sid)
     assert await store.get(sid) == []
     # 中止的一轮一句都不许写，所以也不许提交（提交了就等于落库半截）。
-    assert client.app.dependency_overrides[get_db]().commits == 0
+    assert FakeDbSession.commits == 0
 
 
 def test_temperature_is_not_an_endpoint_parameter():
