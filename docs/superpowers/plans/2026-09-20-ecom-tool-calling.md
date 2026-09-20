@@ -1261,23 +1261,44 @@ fixture 里 `app.dependency_overrides[get_store] = lambda: store`，并把 `stor
 ```python
 class FakeDbSession:
     """路由只调它的 commit()。用桩而不是 None——生产代码里出现
-    `if db is not None` 这类守卫生，就是为了迁就一个不诚实的测试替身。
+    `if db is not None` 这种守卫，就是为了迁就一个不诚实的测试替身。
+
+    ★ 计数放在**类**上，不是实例上。fixture 传的是类本身
+    （`dependency_overrides[get_db] = FakeDbSession`），FastAPI 每个请求会
+    新建一个实例并调用它——注入的那个实例外部够不着，若把计数记在实例上，
+    断言读到的永远是全新实例的 0，成了一条**恒绿的空断言**。
+    Task 5 实测踩到过。
     """
 
-    def __init__(self):
-        self.commits = 0
+    commits = 0
 
     async def commit(self):
-        self.commits += 1
+        type(self).commits += 1
 ```
 
-fixture 里：
+fixture 里注册，并在每个用例开始前复位计数：
 
 ```python
+    FakeDbSession.commits = 0
     app.dependency_overrides[get_db] = FakeDbSession
 ```
 
-这样既能断言"完成的轮次确实提交了"，也不用在生产代码里加任何守卫。
+然后**必须加两条断言**，否则那行 `await db.commit()` 被删掉也不会有测试变红：
+
+```python
+async def test_completed_turn_commits(client):
+    client.post("/api/chat", json={"message": "你好"})
+    assert FakeDbSession.commits == 1
+
+
+async def test_aborted_turn_does_not_commit(client):
+    # 让上游抛错，制造一个未完成的轮次
+    app.dependency_overrides[get_default_chat_model] = lambda: BoomModel()
+    client.post("/api/chat", json={"message": "你好"})
+    assert FakeDbSession.commits == 0
+```
+
+**两条都要做变异验证**：删掉 `await db.commit()`，第一条必须变红；把提交挪出 `if completed:`，第二条必须变红。
 
 - [ ] **Step 6: 跑测试确认通过**
 
