@@ -1,0 +1,38 @@
+# ch02 工具选择评估集
+# 判据是「模型选了哪些工具 + 传给工具的参数」，不是最终回复的措辞——
+# 后者由 evals/cases.yaml（ch01）管，两套不重叠。
+- id: logistics-1
+  input: 订单 1001 的物流到哪了
+  expect_tools: [query_logistics]
+  expect_args_contain: {query_logistics: "1001"}
+- id: order-1
+  input: 1001 这个订单买的什么
+  expect_tools: [query_order]
+  expect_args_contain: {query_order: "1001"}
+- id: faq-hit-1
+  input: 退货政策是什么
+  expect_tools: [query_faq]
+  expect_args_contain: {query_faq: "退货"}
+- id: faq-hit-2
+  input: 怎么开发票
+  expect_tools: [query_faq]
+  expect_args_contain: {query_faq: "发票"}
+- id: faq-miss-1
+  input: 邮费政策是什么
+  expect_tools: [query_faq]
+  expect_args_contain: {query_faq: "邮费"}
+- id: chitchat-1
+  input: 你好
+  expect_tools: []
+- id: chitchat-2
+  input: 谢谢
+  expect_tools: []
+- id: chitchat-3
+  input: 帮我写个 Python 脚本
+  expect_tools: []
+- id: ticket-1
+  input: 我要投诉，帮我转人工
+  expect_tools: [create_ticket]
+- id: ticket-2
+  input: 这个问题解决不了，转人工客服
+  expect_tools: [create_ticket]

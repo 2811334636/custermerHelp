@@ -21,6 +21,7 @@ bash scripts/smoke.sh     # 三条验收标准一键复现
 ```bash
 uv run pytest -v                       # 单元测试
 uv run python -m evals.run_evals       # 评估集（Prompt 行为 + 抽取准确率）
+uv run python -m evals.run_tool_evals  # ch02 工具选择评估集
 ```
 
 脚本一律用 `python -m 包.模块` 调用，**不要**用 `python 路径/文件.py`。后者会把
