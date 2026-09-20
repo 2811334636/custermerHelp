@@ -1,8 +1,10 @@
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from app.api import router
 
@@ -10,6 +12,12 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="电商智能客服 ch01", version="0.1.0")
 app.include_router(router)
+
+# 聊天页：单文件原生 JS，零构建。挂载在 /chat，与 /api 前缀不冲突。
+# 目录不存在时跳过（例如只装了后端、没带 web/ 的部署），不让应用起不来。
+_web = Path(__file__).resolve().parent.parent / "web"
+if _web.is_dir():
+    app.mount("/chat", StaticFiles(directory=_web, html=True), name="chat")
 
 
 @app.get("/healthz")

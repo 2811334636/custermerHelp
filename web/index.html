@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智能客服</title>
+<style>
+  body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 720px; margin: 0 auto; padding: 16px; }
+  h3 { margin: 0 0 12px; }
+  #list { display: flex; flex-direction: column; gap: 10px; min-height: 60vh; }
+  .row { display: flex; }
+  .row.user { justify-content: flex-end; }
+  .wrap { max-width: 76%; display: flex; flex-direction: column; align-items: flex-start; }
+  .row.user .wrap { align-items: flex-end; }
+  .bubble { padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
+  .user .bubble { background: #1677ff; color: #fff; }
+  .bot .bubble { background: #f1f1f1; }
+  .badge { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 10px;
+           background: #e8e8e8; color: #666; margin-bottom: 4px; }
+  .badge.err { background: #fff1f0; color: #cf1322; }
+  form { display: flex; gap: 8px; margin-top: 16px; }
+  input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 8px; }
+  button { padding: 10px 18px; border: 0; border-radius: 8px; background: #1677ff; color: #fff; }
+  button:disabled { background: #b9d4ff; }
+</style>
+</head>
+<body>
+<h3>智能客服</h3>
+<div id="list"></div>
+<form id="form">
+  <input id="input" placeholder="问点什么…" autocomplete="off">
+  <button id="send">发送</button>
+</form>
+<script>
+// 中文标签表放在前端：后端只发工具原始 name，加新工具时这张表落后也不会白屏，
+// labelOf 会退回显示原始 name。
+const TOOL_LABELS = {
+  query_order: "查订单", query_product: "查商品",
+  query_logistics: "查物流", query_faq: "查常见问题",
+  create_ticket: "建工单",
+};
+const labelOf = (n) => TOOL_LABELS[n] || n;
+
+let sessionId = null;
+const list = document.getElementById("list");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+
+function addRow(who) {
+  const row = document.createElement("div");
+  row.className = "row " + who;
+  const wrap = document.createElement("div");
+  wrap.className = "wrap";
+  row.appendChild(wrap);
+  list.appendChild(row);
+  return wrap;
+}
+
+function addBubble(wrap, text) {
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = text;
+  wrap.appendChild(b);
+  return b;
+}
+
+function addBadge(wrap, text, bad) {
+  const b = document.createElement("div");
+  b.className = "badge" + (bad ? " err" : "");
+  b.textContent = text;
+  wrap.appendChild(b);
+  return b;
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  sendBtn.disabled = true;
+
+  addBubble(addRow("user"), text);
+
+  const wrap = addRow("bot");
+  let bubble = null;
+  // call_id -> {el, name}。名字必须在 start 帧记下来：end 帧只带 call_id /
+  // ok / summary，**不带 name**（后端有意不重复发送），只按 end 帧渲染会
+  // 得到「🔧 undefined」。
+  const badges = {};
+
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sessionId ? { session_id: sessionId, message: text } : { message: text }),
+    });
+    if (!resp.ok) {
+      addBadge(wrap, "请求失败：" + resp.status, true);
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    // 一次 read 不等于一帧：SSE 分块是任意的，必须自己缓冲、按空行切帧。
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const blocks = buf.split("\n\n");
+      buf = blocks.pop();
+      for (const block of blocks) {
+        let name = null, data = null;
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event: ")) name = line.slice(7);
+          else if (line.startsWith("data: ")) data = JSON.parse(line.slice(6));
+        }
+        if (!name || !data) continue;
+
+        if (name === "meta") {
+          sessionId = data.session_id;
+        } else if (name === "tool") {
+          if (data.phase === "start") {
+            badges[data.call_id] = {
+              el: addBadge(wrap, "⏳ " + labelOf(data.name) + "…"),
+              name: data.name,
+            };
+          } else if (data.phase === "end") {
+            const slot = badges[data.call_id];
+            const el = slot ? slot.el : addBadge(wrap, "");
+            const name = slot ? slot.name : data.name;   // 兜底：万一没收到 start
+            el.textContent = (data.ok ? "🔧 " : "⚠️ ") + labelOf(name) + " · " + data.summary;
+            if (!data.ok) el.classList.add("err");
+            if (bubble) wrap.appendChild(bubble);   // 徽章始终排在正文上方
+          }
+        } else if (name === "delta") {
+          // 逐帧追加，不缓冲——流式就是要看得见字一个个出来
+          if (!bubble) bubble = addBubble(wrap, "");
+          bubble.textContent += data.text;
+        } else if (name === "done") {
+          // 正常收尾
+        } else if (name === "error") {
+          addBadge(wrap, "出错：" + data.message, true);
+        }
+      }
+    }
+  } catch (err) {
+    addBadge(wrap, "连接中断：" + err, true);
+  } finally {
+    sendBtn.disabled = false;
+    input.focus();
+  }
+});
+</script>
+</body>
+</html>
