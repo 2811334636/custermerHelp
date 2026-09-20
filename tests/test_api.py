@@ -6,9 +6,9 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessageChunk
 
 from app.api import get_store
+from app.db.base import get_db
 from app.main import app
 from app.providers import get_default_chat_model
-from app.sessions import InMemorySessionStore
 
 
 class FakeModel:
@@ -26,14 +26,34 @@ class FakeModel:
         raise AssertionError("extract 测试请覆盖 get_chat_model 为专用桩")
 
 
+class FakeStore:
+    """测试用的内存桩，接口与 SessionStore 一致但全是 async。"""
+
+    def __init__(self):
+        self._data: dict[str, list] = {}
+
+    async def get(self, session_id: str):
+        return list(self._data.get(session_id, []))
+
+    async def append(self, session_id: str, *messages):
+        self._data.setdefault(session_id, []).extend(messages)
+
+    async def exists(self, session_id: str) -> bool:
+        return session_id in self._data
+
+
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("APP_LLM_API_KEY", "test-key")
     from app.config import get_settings
 
     get_settings.cache_clear()
-    store = InMemorySessionStore(max_sessions=10, max_messages=20)
+    store = FakeStore()
     app.dependency_overrides[get_store] = lambda: store
+    # 路由也直接依赖 get_db（整轮成功后要 commit）。覆盖成 None 既避免真去开
+    # 一个数据库 session，也让这些用例保持 DB-free——桩 store 自己管状态，
+    # 没有事务要提交；chat() 里对 db 为 None 有显式分支。
+    app.dependency_overrides[get_db] = lambda: None
     app.dependency_overrides[get_default_chat_model] = lambda: FakeModel()
     with TestClient(app) as c:
         yield c
@@ -74,7 +94,7 @@ def test_chat_emits_meta_then_deltas_then_done(client):
     assert uuid.UUID(events[0][1]["session_id"])  # 是合法 uuid
 
 
-def test_chat_reuses_given_session_and_keeps_context(client):
+async def test_chat_reuses_given_session_and_keeps_context(client):
     """会话复用（服务端侧）：带 session_id 的第二轮不再发 meta，且历史被累积。
 
     注意断言边界：打桩模型不看 messages，所以本用例**不**验证模型真的"看到"
@@ -88,7 +108,7 @@ def test_chat_reuses_given_session_and_keeps_context(client):
     names = [n for n, _ in parse_sse(r2.text)]
     assert names[0] == "delta"  # 自带 session_id 时不再发 meta
 
-    history = client.app.dependency_overrides[get_store]().get(sid)
+    history = await client.app.dependency_overrides[get_store]().get(sid)
     assert [m.content for m in history] == ["我叫张三", "您好", "我叫什么", "您好"]
 
 
@@ -122,8 +142,10 @@ async def test_chat_emits_meta_when_session_id_is_empty_string():
     from app.schemas import ChatRequest
 
     req = ChatRequest.model_construct(session_id="", message="你好")
-    store = InMemorySessionStore()
-    resp = await chat(req, store=store, model=FakeModel())
+    store = FakeStore()
+    # db=None：直接调用没有依赖注入，显式说明"本用例没有真 session"，
+    # 免得拿到 Depends 占位对象（见 chat() 里提交那段的注释）。
+    resp = await chat(req, store=store, db=None, model=FakeModel())
 
     raw = "".join([chunk async for chunk in resp.body_iterator])
     events = parse_sse(raw)
@@ -148,7 +170,7 @@ def test_chat_upstream_error_becomes_error_event(client):
     assert events[-1][1]["code"] == "upstream_rate_limit"
 
 
-def test_failed_turn_leaves_session_store_untouched(client):
+async def test_failed_turn_leaves_session_store_untouched(client):
     """I4.3：失败的一轮不得在会话存储里留下任何痕迹（spec §7.2.1）。"""
     import openai
     import httpx
@@ -164,8 +186,8 @@ def test_failed_turn_leaves_session_store_untouched(client):
     sid = "失败会话"
     r = client.post("/api/chat", json={"session_id": sid, "message": "你好"})
     assert parse_sse(r.text)[-1][0] == "error"
-    assert not store.exists(sid)
-    assert store.get(sid) == []
+    assert not await store.exists(sid)
+    assert await store.get(sid) == []
 
 
 def test_temperature_is_not_an_endpoint_parameter():

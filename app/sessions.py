@@ -1,53 +1,65 @@
 from abc import ABC, abstractmethod
-from collections import OrderedDict
 
 from langchain_core.messages import BaseMessage
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import get_settings
+from app.db.messages_io import from_rows, to_rows
+from app.db.models import Conversation
+from app.repositories import conversation as conversation_repo
+from app.repositories import message as message_repo
 
 
 class SessionStore(ABC):
     """会话历史存储抽象。
 
-    当前只有进程内实现（重启即丢、不支持多 worker）。
-    抽象的意义：以后换 SQLite / Redis 不需要动任何业务代码。
+    ★ ch02 起三个方法都是 async —— 因为 DB 访问要 await。
+    这相对 ch01 是破坏性变更，调用方（api.py）必须跟着加 await。
     """
 
     @abstractmethod
-    def get(self, session_id: str) -> list[BaseMessage]: ...
+    async def get(self, session_id: str) -> list[BaseMessage]: ...
 
     @abstractmethod
-    def append(self, session_id: str, *messages: BaseMessage) -> None: ...
+    async def append(self, session_id: str, *messages: BaseMessage) -> None: ...
 
     @abstractmethod
-    def exists(self, session_id: str) -> bool: ...
+    async def exists(self, session_id: str) -> bool: ...
 
 
-class InMemorySessionStore(SessionStore):
-    """进程内实现。
+class MySQLSessionStore(SessionStore):
+    """基于 MySQL 的实现：上下文从 messages 表读回，重启不丢。
 
-    内存上界由两个 knob 共同保证：
-    - max_sessions：会话总数上限，超出按 LRU 淘汰整个会话
-    - max_messages：单会话消息数上限，超出丢弃最旧消息
+    每通会话在 conversations 表里有一行，messages 通过 conversation_id 挂上去。
+    对外仍用 UUID 形式的 session_id（= conversations.session_uuid）。
     """
 
-    def __init__(self, max_sessions: int = 200, max_messages: int = 100) -> None:
-        self._max_sessions = max_sessions
-        self._max_messages = max_messages
-        self._data: OrderedDict[str, list[BaseMessage]] = OrderedDict()
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
 
-    def get(self, session_id: str) -> list[BaseMessage]:
-        if session_id not in self._data:
+    async def _conversation_id(self, session_id: str) -> int | None:
+        conv = await self._find(session_id)
+        return None if conv is None else conv.id
+
+    async def _find(self, session_id: str) -> Conversation | None:
+        from sqlalchemy import select
+
+        stmt = select(Conversation).where(Conversation.session_uuid == session_id)
+        return (await self._session.execute(stmt)).scalar_one_or_none()
+
+    async def get(self, session_id: str) -> list[BaseMessage]:
+        cid = await self._conversation_id(session_id)
+        if cid is None:
             return []
-        self._data.move_to_end(session_id)  # 标记为最近使用
-        return list(self._data[session_id])  # 返回副本，防止调用方污染存储
+        rows = await message_repo.list_by_conversation(self._session, cid)
+        return from_rows(rows)
 
-    def append(self, session_id: str, *messages: BaseMessage) -> None:
-        bucket = self._data.setdefault(session_id, [])
-        bucket.extend(messages)
-        if len(bucket) > self._max_messages:
-            del bucket[: len(bucket) - self._max_messages]
-        self._data.move_to_end(session_id)
-        while len(self._data) > self._max_sessions:
-            self._data.popitem(last=False)  # 淘汰最久未使用的会话
+    async def append(self, session_id: str, *messages: BaseMessage) -> None:
+        conv = await conversation_repo.get_or_create(
+            self._session, session_id, get_settings().default_user_id
+        )
+        for row in to_rows(list(messages)):
+            await message_repo.append(self._session, conv.id, **row)
 
-    def exists(self, session_id: str) -> bool:
-        return session_id in self._data
+    async def exists(self, session_id: str) -> bool:
+        return await self._find(session_id) is not None

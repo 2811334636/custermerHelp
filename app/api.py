@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chat import (
     DeltaEvent,
@@ -15,24 +16,20 @@ from app.chat import (
     stream_reply,
 )
 from app.config import get_settings
+from app.db.base import get_db
 from app.extract import ExtractionFailed, extract_ticket
 from app.providers import get_default_chat_model
 from app.schemas import AfterSalesTicket, ChatRequest, ExtractRequest
-from app.sessions import InMemorySessionStore, SessionStore
+from app.sessions import MySQLSessionStore, SessionStore
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
 
-_store = InMemorySessionStore(
-    max_sessions=get_settings().session_max_sessions,
-    max_messages=get_settings().session_max_messages,
-)
 
-
-def get_store() -> SessionStore:
+def get_store(db: AsyncSession = Depends(get_db)) -> SessionStore:
     """依赖注入点：测试通过 app.dependency_overrides 替换它。"""
-    return _store
+    return MySQLSessionStore(session=db)
 
 
 def sse_frame(name: str, data: dict) -> str:
@@ -44,6 +41,7 @@ def sse_frame(name: str, data: dict) -> str:
 async def chat(
     req: ChatRequest,
     store: SessionStore = Depends(get_store),
+    db: AsyncSession | None = Depends(get_db),
     model=Depends(get_default_chat_model),
 ) -> StreamingResponse:
     # is_new_session 必须和 session_id 同源，否则空串 "" 会走到
@@ -54,7 +52,7 @@ async def chat(
     settings = get_settings()
 
     # 先读出历史（不含当前消息），剪裁由 stream_reply 内部完成
-    history = store.get(session_id)
+    history = await store.get(session_id)
 
     async def event_stream() -> AsyncIterator[str]:
         if is_new_session:
@@ -97,11 +95,20 @@ async def chat(
             # 只在整轮正常结束时写入历史。客户端断开或上游出错时整轮丢弃，
             # 否则会留下"两个 human 连排"的畸形历史（spec §7.2.1）。
             if completed:
-                store.append(
+                await store.append(
                     session_id,
                     HumanMessage(req.message),
                     AIMessage("".join(collected)),
                 )
+                # 整轮成功才提交。get_db 是 `async with` 形式，退出时会把未提交
+                # 的写入回滚——不提交则本轮消息永远不落库。conversations 行由
+                # append 内部的 get_or_create 建出来，和消息同属一个事务，所以
+                # "只在完成时提交"是自洽的：中断轮两者一起回滚，不留半截。
+                #
+                # db 为 None 只出现在测试里（test_api 把 get_db 覆盖成 None，
+                # 桩 store 自己管状态，没有事务可提交）。
+                if db is not None:
+                    await db.commit()
 
     return StreamingResponse(
         event_stream(),
