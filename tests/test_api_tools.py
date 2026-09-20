@@ -214,6 +214,44 @@ def test_done_frame_carries_real_finish_reason_and_usage(client):
     assert done[-1]["usage"] == MetadataModel.USAGE
 
 
+class FailsOnSecondCallModel:
+    """第一次正常申请工具，第二次（最终回答那次）上游炸了。
+
+    这是 ch01 错误边界在工具轮上的分支：已经开始流式（tool 帧都发了）之后
+    才失败，仍然只许是 event: error，而且整轮不许落库。
+    """
+
+    def __init__(self):
+        self._bound = []
+
+    def bind_tools(self, tools):
+        self._bound = list(tools)
+        return self
+
+    async def astream(self, messages):
+        if len(self._bound) > 0:
+            yield AIMessageChunk(
+                content="",
+                tool_call_chunks=[{
+                    "name": "query_faq", "args": '{"keyword": "退货"}',
+                    "id": "call_f", "index": 0, "type": "tool_call_chunk",
+                }],
+            )
+        else:
+            raise RuntimeError("上游炸了")
+
+
+def test_tool_round_failure_is_error_not_done_and_persists_nothing(client):
+    app.dependency_overrides[get_default_chat_model] = lambda: FailsOnSecondCallModel()
+    r = client.post("/api/chat", json={"message": "退货政策是什么"})
+    names = [n for n, _ in parse_sse(r.text)]
+
+    assert names[-1] == "error", "工具轮中途失败仍是 event: error"
+    assert "done" not in names, "error 与 done 互斥"
+    assert "tool" in names, "工具帧已经发过了"
+    assert client.store._data == {}, "半截的一轮一句都不许落库"
+
+
 class RecordingModel:
     """把每次 astream 收到的消息记进共享列表 rec（跨请求共享——override 的
     lambda 每个请求都会新建实例，实例内部的计数器跨不过请求）。
