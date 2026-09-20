@@ -206,3 +206,27 @@ async def test_code_bug_in_tool_becomes_result_not_exception():
     assert out.ok is False
     assert "执行失败" in out.content
     assert calls["n"] == 1, "非瞬态故障只试一次"
+
+
+async def test_failure_text_reports_actual_attempts_not_budget():
+    """回灌给模型的次数必须是**实际**次数，不是配置的上限。
+
+    content 会进模型上下文（summary 还上徽章），写错就是让模型照着假事实
+    作答——代码 bug 只试了 1 次却说"已尝试 3 次"。
+    两个方向都锁：提前 break 报 1，真的试满报 3。
+    """
+
+    @tool(args_schema=EchoArgs)
+    async def broken(text: str) -> str:
+        """首次调用就抛非瞬态异常。"""
+        raise RuntimeError("boom")
+
+    reg = make_registry(broken, timeout_s=1.0, max_retries=2)
+    out = await reg.execute("broken", {"text": "x"}, "call_11")
+    assert out.ok is False
+    assert "已尝试 1 次" in out.content, f"应报实际次数 1，实际文案：{out.content}"
+
+    reg = make_registry(slow, timeout_s=0.05, max_retries=2)
+    out = await reg.execute("slow", {"text": "x"}, "call_12")
+    assert out.ok is False
+    assert "已尝试 3 次" in out.content, f"试满时应报 3，实际文案：{out.content}"

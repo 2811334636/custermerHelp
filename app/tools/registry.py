@@ -93,9 +93,13 @@ class ToolRegistry:
         # ③④ 执行 + 超时重试（只重试超时/连接类故障）
         attempts = spec.max_retries + 1
         last_error: Exception | None = None
+        # 实际跑了几次。回灌给模型的文案必须写**实际**次数：
+        # 代码 bug 走 break 时只试了 1 次，写"已尝试 3 次"就是喂给模型一条假事实。
+        tried = 0
 
         with tool_context(self._effective_conversation_id(conversation_id), self._session):
             for attempt in range(1, attempts + 1):
+                tried = attempt
                 try:
                     result = await asyncio.wait_for(
                         spec.tool.ainvoke(args.model_dump()), timeout=spec.timeout_s
@@ -120,7 +124,7 @@ class ToolRegistry:
                     break  # 非瞬态故障不重试
 
         kind = "超时" if isinstance(last_error, (TimeoutError, asyncio.TimeoutError)) else "执行失败"
-        content = f"工具 {name} {kind}（已尝试 {attempts} 次）：{type(last_error).__name__}。暂时查不到相关信息。"
+        content = f"工具 {name} {kind}（已尝试 {tried} 次）：{type(last_error).__name__}。暂时查不到相关信息。"
         return ToolOutcome(call_id, False, content, f"{kind}", elapsed())
 
     @staticmethod
