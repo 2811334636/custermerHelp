@@ -1539,6 +1539,17 @@ from app.tools.context import tool_context
 logger = logging.getLogger(__name__)
 
 
+
+
+def _effective_conversation_id(explicit: int | None) -> int:
+    """显式参数优先；否则沿用外层已设的上下文；都没有才退回 0。"""
+    if explicit is not None:
+        return explicit
+    try:
+        return _ctx.get().conversation_id
+    except LookupError:
+        return 0
+
 @dataclass(frozen=True)
 class ToolSpec:
     tool: BaseTool
@@ -1596,7 +1607,11 @@ class ToolRegistry:
         attempts = spec.max_retries + 1
         last_error: Exception | None = None
 
-        with tool_context(conversation_id if conversation_id is not None else 0):
+        # ★ 不能写成 tool_context(conversation_id if ... else 0)：那会在未传
+        # conversation_id 时用 0 覆盖掉外层已设的上下文，与本节测试
+        # test_context_is_visible_inside_tool（外层 tool_context(42) 后断言读到 42）
+        # 直接冲突。正确语义是：显式参数优先 → 否则沿用外层上下文 → 都没有才 0。
+        with tool_context(_effective_conversation_id(conversation_id)):
             for attempt in range(1, attempts + 1):
                 try:
                     result = await asyncio.wait_for(
