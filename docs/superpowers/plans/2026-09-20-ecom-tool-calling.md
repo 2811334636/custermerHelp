@@ -879,7 +879,12 @@ def test_plain_ai_message_roundtrip():
 
 
 def test_ai_message_with_tool_calls_roundtrip():
-    calls = [{"id": "call_1", "name": "query_order", "args": {"order_id": "1001"}}]
+    # ★ tool_calls 里必须带 "type": "tool_call"。langchain-core 1.6.3 的
+    # AIMessage 在构造时会把 tool_calls 规范化——自动注入 type 并重排键序，
+    # 所以不带 type 的字面量与读出结果**永远不相等**，与 to_rows 的实现无关。
+    # Task 4 实测确认过这一点。
+    calls = [{"id": "call_1", "name": "query_order",
+              "args": {"order_id": "1001"}, "type": "tool_call"}]
     msg = AIMessage(content="", tool_calls=calls)
     rows = to_rows([msg])
     assert rows[0]["role"] == "assistant"
