@@ -7,6 +7,11 @@
 长度断言是后补的：约束 4 原先没有任何用例覆盖，直到实测发现 overreach-3
 单条回复 154 字——一条真实违反自身约束的回复，套件结构性看不见。
 
+★ 2026-09-20（ch02 Task 8）起，行为用例的模型**绑上与生产相同的工具**。
+在此之前它不绑工具，测的是一个**永远不会真实运行的配置**，于是 ch02 改写
+System Prompt 后 5 条用例稳定失败——失败的是"该明说查不到"这个已不存在的
+期望，不是模型变差（spec §6.6）。抽取仍走未绑工具的模型。
+
 为什么必须用 `-m`：`python evals/run_evals.py` 会把 sys.path[0] 设成
 `evals/` 目录，导致 `from app.extract import ...` 报 ModuleNotFoundError。
 `-m` 会把 CWD 放进 sys.path[0]，`app` 才能被导入（Task 2 实测踩过同一个坑）。
@@ -24,6 +29,8 @@ from langchain_core.messages import HumanMessage
 from app.extract import extract_ticket
 from app.prompts import SYSTEM_PROMPT, build_chat_prompt
 from app.providers import get_chat_model
+from app.tools import build_registry
+from evals.turn import run_turn
 
 ROOT = Path(__file__).parent
 OUT = ROOT / "out"
@@ -49,16 +56,23 @@ JUDGE_TEMPLATE = """你在给一个电商客服机器人的回复打分。
 回复是否满足期望行为？只输出一个字：是 或 否。"""
 
 
-async def run_prompt_case(case: dict, model) -> dict:
+async def run_prompt_case(case: dict, model, judge_model, registry) -> dict:
     # 这里必须走 build_chat_prompt()，与 app/chat.py:70 的生产路径一致。
     # brief 原文是 `model.ainvoke([HumanMessage(case["input"])])` —— 那样
     # 模型根本收不到 SYSTEM_PROMPT，测的就不是本任务要测的东西（实测首轮
     # Prompt 3/15，且 outofscope-1 直接吐出了完整爬虫脚本）。此为对 brief
     # 脚本的必要修正，用例数据、judge 规则、输出格式均未改动。
+    #
+    # ★ model 是**绑了生产工具**的（见 main）：生产路径永远绑工具，不绑工具的
+    # 评估测的是一个从不会真实运行的形态（spec §6.6）。judge_model 则必须是
+    # **未绑工具**的——裁判要去判断"是/否"，绑着工具它会去调工具而不给判词。
+    #
+    # 而且要跑**完整回合**：模型决定调工具时首轮正文是空的，只调一次会把空串
+    # 交给 judge 与长度断言（fabricate-1/fabricate-3 实测如此）。
     rendered = build_chat_prompt().format_messages(
         history=[HumanMessage(case["input"])]
     )
-    reply = (await model.ainvoke(rendered)).text
+    reply = (await run_turn(model, judge_model, rendered, registry)).final_text
 
     # 确定性断言：禁用词
     violations = []
@@ -67,7 +81,7 @@ async def run_prompt_case(case: dict, model) -> dict:
             violations.append(pattern)
 
     # LLM-judge：语义行为
-    judge = await model.ainvoke(
+    judge = await judge_model.ainvoke(
         JUDGE_TEMPLATE.format(
             system=SYSTEM_PROMPT, user=case["input"], reply=reply, expect=case["expect"]
         )
@@ -108,7 +122,12 @@ def _norm(v):
 
 
 async def main() -> int:
-    model = get_chat_model(temperature=0)
+    judge_model = get_chat_model(temperature=0)
+    # ★ 生产路径（app/chat.py）永远绑工具，评估就必须跑在同一条配置上——
+    # 不绑工具的 run_evals 测的是一个永远不会真实运行的形态（spec §6.6）。
+    # session=None：这一套测的是行为约束不是数据，工具查不到真数据没关系。
+    registry = build_registry(session=None)
+    model = judge_model.bind_tools(registry.as_langchain_tools())
     OUT.mkdir(exist_ok=True)
 
     prompt_cases = yaml.safe_load((ROOT / "cases.yaml").read_text(encoding="utf-8"))
@@ -118,7 +137,7 @@ async def main() -> int:
     print("A. System Prompt 行为评估")
     print("=" * 68)
     prompt_results = [
-        await run_prompt_case(c, model) for c in prompt_cases
+        await run_prompt_case(c, model, judge_model, registry) for c in prompt_cases
     ]
     for r in prompt_results:
         mark = "PASS" if r["passed"] else "FAIL"
@@ -151,7 +170,9 @@ async def main() -> int:
     print("=" * 68)
     print("B. 结构化抽取准确率（字段级）")
     print("=" * 68)
-    extract_results = [await run_extract_case(c, model) for c in extract_cases]
+    # 抽取走未绑工具的 judge_model：with_structured_output 在 bind_tools 之后的
+    # RunnableBinding 上不存在（会 AttributeError），且抽取本就不该带业务工具。
+    extract_results = [await run_extract_case(c, judge_model) for c in extract_cases]
     for r in extract_results:
         mark = "PASS" if r["passed"] else "FAIL"
         why = f"  {r['mismatches']}" if r["mismatches"] else ""
