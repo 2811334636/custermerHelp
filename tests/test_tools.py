@@ -29,11 +29,50 @@ async def test_fake_data_is_deterministic(tool):
 
 @pytest.mark.parametrize("tool", [query_order, query_product, query_logistics])
 async def test_different_keys_give_different_data(tool):
+    """★ 必须先把回显的 id 归一化掉再比，否则这条断言永远不会失败。
+
+    每个工具输出的**第一行都会回显输入的 id**（"订单号 {order_id}：" 等），
+    所以直接 `a != b` 光靠那一行就被满足了。把 _rng 换成"忽略 key、永远
+    返回同一串数据"的实现，这条断言照样通过——Task 7 review 实测证实过。
+    归一化之后，比的才是真正的派生数据。
+    """
     if tool is query_product:
-        a, b = await tool.ainvoke({"product_id": "P1"}), await tool.ainvoke({"product_id": "P2"})
+        args = ({"product_id": "P1"}, {"product_id": "P2"})
     else:
-        a, b = await tool.ainvoke({"order_id": "1"}), await tool.ainvoke({"order_id": "2"})
+        args = ({"order_id": "1"}, {"order_id": "2"})
+
+    def without_echo(text: str) -> str:
+        # 丢掉首行（含回显的输入 id），只留派生出来的内容
+        return text.partition("\n")[2]
+
+    a = without_echo(await tool.ainvoke(args[0]))
+    b = without_echo(await tool.ainvoke(args[1]))
     assert a != b
+
+
+async def test_order_and_logistics_agree_on_the_same_order():
+    """★ 同一个订单号，query_order 报的订单状态必须与 query_logistics 的最后一条一致。
+
+    两者若各自从独立种子流判定，会出现订单说"已发货"、物流最后一条说"已签收"，
+    或者订单"不存在"却有完整轨迹。**验收标准 1 要拿模型回答与工具输出逐字
+    对账**，两个工具自相矛盾会直接毁掉这个验收。Task 7 review 实测到过这两类
+    矛盾（1001 正是验收用的那个订单号）。这条测试就是锁住它们不再出现。
+    """
+    from app.tools.catalog import _STATUS_TO_LAST_NODE
+
+    for oid in ["1001", "1002", "1006", "20260701001", "1", "2", "3"]:
+        order = await query_order.ainvoke({"order_id": oid})
+        logistics = await query_logistics.ainvoke({"order_id": oid})
+
+        if "没有找到" in order:
+            assert "没有找到" in logistics, f"{oid}: 订单说不存在，物流却给了完整轨迹"
+            continue
+
+        assert "没有找到" not in logistics, f"{oid}: 订单存在，物流却说找不到"
+        status = order.split("订单状态：")[-1].strip()
+        assert _STATUS_TO_LAST_NODE[status] in logistics, (
+            f"{oid}: 订单状态「{status}」与物流最后节点不一致"
+        )
 
 
 async def test_query_faq_hit_via_registry(db_session):
