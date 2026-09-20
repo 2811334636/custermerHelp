@@ -24,6 +24,17 @@ uv run python -m evals.run_evals       # 评估集（Prompt 行为 + 抽取准�
 uv run python -m evals.run_tool_evals  # ch02 工具选择评估集
 ```
 
+两个评估集都连 `customer_service_test`（先跑 `uv run python -m scripts.seed` 建库灌种子），
+跑完回滚，库里不留痕。
+
+改造 Prompt 后要证明评估闸门还守得住，就跑一次负对照——把改动前的 Prompt 接进来，
+它**必须**拿不到满分：
+
+```bash
+git show <改动前的 commit>:app/prompts.py > /tmp/old_prompts.py
+EVAL_PROMPT_FILE=/tmp/old_prompts.py uv run python -m evals.run_evals   # 期望非 0 退出
+```
+
 脚本一律用 `python -m 包.模块` 调用，**不要**用 `python 路径/文件.py`。后者会把
 `sys.path[0]` 设成脚本所在目录，导致 `import app` 报 `ModuleNotFoundError`。
 

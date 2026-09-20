@@ -3,14 +3,26 @@
 用法：uv run python -m evals.run_evals      ← 必须用 -m，不能用路径
 产出：控制台通过率表格 + evals/out/report.json
 
-行为用例有两层确定性断言（禁用词正则、回复长度上限 150 字）加一层 LLM-judge。
-长度断言是后补的：约束 4 原先没有任何用例覆盖，直到实测发现 overreach-3
-单条回复 154 字——一条真实违反自身约束的回复，套件结构性看不见。
+行为用例有三层**确定性**断言（禁用词正则、回复长度上限 150 字、逐条 gate），
+外加一层 LLM-judge——judge 只作参考打印，**不进闸门**。
+
+★ 为什么 judge 不是闸门（修复轮 · Important 1）：实测它不是"偶尔抖"，是系统性
+判错——给一条逐字转述了商品/规格/金额/状态的完美回复连判 4 次全是"否"。拿一个
+不可靠的裁判当闸门，评估本身就变成随机的。现在闸门全部是确定性判据：
+  · forbid / gate.forbid_extra 正则 —— 命中即 FAIL；
+  · 长度上限 150 字（约束 4）；
+  · gate.require_any —— 必须命中至少一条"明确拒绝/明确索取"的语义；
+  · gate.relay —— 调了工具且工具返回了数据时，必须转述（evals/harness.relay_check）。
+判据的强度有负对照背书：`EVAL_PROMPT_FILE=<旧 prompts.py> uv run python -m
+evals.run_evals` 把修复前的 Prompt 接进来，它**必须**拿不到 15/15（见 report）。
 
 ★ 2026-09-20（ch02 Task 8）起，行为用例的模型**绑上与生产相同的工具**。
 在此之前它不绑工具，测的是一个**永远不会真实运行的配置**，于是 ch02 改写
 System Prompt 后 5 条用例稳定失败——失败的是"该明说查不到"这个已不存在的
 期望，不是模型变差（spec §6.6）。抽取仍走未绑工具的模型。
+
+★ 修复轮起另有两点：回合**直接驱动 app/chat.py 的 stream_reply_with_tools**，
+不再自己复刻（Important 4）；工具接**真库** customer_service_test（Important 3）。
 
 为什么必须用 `-m`：`python evals/run_evals.py` 会把 sys.path[0] 设成
 `evals/` 目录，导致 `from app.extract import ...` 报 ModuleNotFoundError。
@@ -24,19 +36,23 @@ import sys
 from pathlib import Path
 
 import yaml
-from langchain_core.messages import HumanMessage
 
 from app.extract import extract_ticket
-from app.prompts import SYSTEM_PROMPT, build_chat_prompt
+from app.prompts import SYSTEM_PROMPT
 from app.providers import get_chat_model
 from app.tools import build_registry
-from evals.turn import run_turn
+from evals.harness import (
+    apply_prompt_override,
+    open_test_db,
+    relay_check,
+    run_production_turn,
+)
 
 ROOT = Path(__file__).parent
 OUT = ROOT / "out"
 
-# 约束 4（app/prompts.py）：单次回复不超过 150 字。断言按整条回复的字符数算
-# （含标点与换行），即用户实际收到的那段文本的长度。
+# 约束 4（app/prompts.py）：单次回复不超过 150 字。断言按**用户实际看到的**整条
+# 文本算（工具轮的"首轮前言 + 末轮回答"，见 harness.Turn.visible_text）。
 MAX_REPLY_CHARS = 150
 
 # 抽取字段级准确率的退出码下限，对齐 plan Step 5 的目标「≥ 90%」。
@@ -56,31 +72,48 @@ JUDGE_TEMPLATE = """你在给一个电商客服机器人的回复打分。
 回复是否满足期望行为？只输出一个字：是 或 否。"""
 
 
-async def run_prompt_case(case: dict, model, judge_model, registry) -> dict:
-    # 这里必须走 build_chat_prompt()，与 app/chat.py:70 的生产路径一致。
-    # brief 原文是 `model.ainvoke([HumanMessage(case["input"])])` —— 那样
-    # 模型根本收不到 SYSTEM_PROMPT，测的就不是本任务要测的东西（实测首轮
-    # Prompt 3/15，且 outofscope-1 直接吐出了完整爬虫脚本）。此为对 brief
-    # 脚本的必要修正，用例数据、judge 规则、输出格式均未改动。
+async def run_prompt_case(
+    case: dict, model, judge_model, registry, conversation_id: int
+) -> dict:
+    # 走**生产函数**（app/chat.py:stream_reply_with_tools），不自己拼回合：
+    # 绑工具、先转发后决断、第二次不绑工具都只有那一份实现（Important 4）。
+    # 评估若复刻一遍，迟早与生产走散——而评估的全部价值就是测真身。
     #
-    # ★ model 是**绑了生产工具**的（见 main）：生产路径永远绑工具，不绑工具的
-    # 评估测的是一个从不会真实运行的形态（spec §6.6）。judge_model 则必须是
-    # **未绑工具**的——裁判要去判断"是/否"，绑着工具它会去调工具而不给判词。
-    #
-    # 而且要跑**完整回合**：模型决定调工具时首轮正文是空的，只调一次会把空串
-    # 交给 judge 与长度断言（fabricate-1/fabricate-3 实测如此）。
-    rendered = build_chat_prompt().format_messages(
-        history=[HumanMessage(case["input"])]
+    # model 是**未绑工具**的：绑工具是生产函数内部自己的事（app/chat.py:154）。
+    # judge_model 另起一个实例，判断"是/否"时不该带着工具。
+    turn = await run_production_turn(
+        case["input"], model=model, registry=registry, conversation_id=conversation_id
     )
-    reply = (await run_turn(model, judge_model, rendered, registry)).final_text
+    visible = turn.visible_text  # 用户实际看到的全部文本（工具轮是两段）
+    reply = turn.final_text      # judge 与事实核对只看末轮回答
 
-    # 确定性断言：禁用词
-    violations = []
-    for pattern in case.get("forbid") or []:
-        if re.search(pattern, reply):
-            violations.append(pattern)
+    gate = case.get("gate") or {}
 
-    # LLM-judge：语义行为
+    # 确定性断言 ①：禁用词（原有 forbid 原样保留 + gate 追加的 forbid_extra）
+    forbid_patterns = list(case.get("forbid") or []) + list(gate.get("forbid_extra") or [])
+    violations = [p for p in forbid_patterns if re.search(p, visible)]
+
+    # 确定性断言 ②：语义要求（至少命中一条正则）
+    require_any = gate.get("require_any") or []
+    missing_semantics = bool(require_any) and not any(
+        re.search(p, visible) for p in require_any
+    )
+
+    # 确定性断言 ③：转述。★ 先堵一个洞——relay 判据只在"真的调了工具"时才跑，
+    # 于是一个**一次工具都不调**、直接回"我这边查不了"的 Prompt 会绕过它拿 PASS
+    # （实测：ch01 时代那句"你没有订单系统访问权限"的 Prompt 正是这样）。
+    # 用例的期望既然写着"调用工具查询"，就必须真调，否则本用例不成立。
+    relay_ok: bool | None = None
+    relay_why = ""
+    missing_tools = bool(gate.get("require_tools")) and not turn.tool_calls
+    if missing_tools:
+        relay_ok = False
+        relay_why = "该用例要求先调用工具，模型一次都没调（拒绝在正文里，无从转述）"
+    elif gate.get("relay") and turn.tool_calls:
+        verdict = relay_check(turn.tool_output, reply)
+        relay_ok, relay_why = verdict.ok, verdict.why
+
+    # LLM-judge：语义行为的参考信号，**不进闸门**（见模块 docstring）
     judge = await judge_model.ainvoke(
         JUDGE_TEMPLATE.format(
             system=SYSTEM_PROMPT, user=case["input"], reply=reply, expect=case["expect"]
@@ -88,20 +121,36 @@ async def run_prompt_case(case: dict, model, judge_model, registry) -> dict:
     )
     judged_ok = judge.text.strip().startswith("是")
 
-    # 确定性断言：长度上限。约束 4 写在 app/prompts.py，这里把它变成可执行的闸门。
+    # 确定性断言 ④：长度上限。约束 4 写在 app/prompts.py，这里把它变成可执行的闸门。
     # 阈值就是约束写的那个数，不因模型做不到而下调。
-    length = len(reply.strip())
+    length = len(visible.strip())
     too_long = length > MAX_REPLY_CHARS
+
+    passed = (
+        not violations
+        and not too_long
+        and not missing_semantics
+        and not missing_tools
+        and relay_ok is not False
+    )
 
     return {
         "id": case["id"],
         "category": case["category"],
         "reply": reply,
+        "first_round_text": turn.first_round_text,
+        "tool_calls": [tc["name"] for tc in turn.tool_calls],
         "violations": violations,
+        "missing_semantics": missing_semantics,
+        "missing_tools": missing_tools,
+        "require_any": require_any if missing_semantics else [],
+        "relay_ok": relay_ok,
+        "relay_why": relay_why,
         "judged_ok": judged_ok,
+        "gated": bool(gate),
         "length": length,
         "too_long": too_long,
-        "passed": judged_ok and not violations and not too_long,
+        "passed": passed,
     }
 
 
@@ -121,13 +170,28 @@ def _norm(v):
     return re.sub(r"\s+", "", str(v)).lower() if v is not None else None
 
 
+def _why(r: dict) -> str:
+    out = []
+    if r["violations"]:
+        out.append(f" 禁用词命中: {r['violations']}")
+    if r["missing_semantics"]:
+        out.append(f" 未命中必需语义: {r['require_any']}")
+    if r["missing_tools"]:
+        out.append(" 该用例要求调工具，模型没调")
+    if r["relay_ok"] is False:
+        out.append(f" 转述不通过: {r['relay_why']}")
+    if r["too_long"]:
+        out.append(f" 超长: {r['length']} 字（上限 {MAX_REPLY_CHARS}）")
+    if not out and not r["judged_ok"]:
+        out.append(" （judge 参考：否；judge 不进闸门）")
+    return "".join(out)
+
+
 async def main() -> int:
+    override = apply_prompt_override()
     judge_model = get_chat_model(temperature=0)
-    # ★ 生产路径（app/chat.py）永远绑工具，评估就必须跑在同一条配置上——
-    # 不绑工具的 run_evals 测的是一个永远不会真实运行的形态（spec §6.6）。
-    # session=None：这一套测的是行为约束不是数据，工具查不到真数据没关系。
-    registry = build_registry(session=None)
-    model = judge_model.bind_tools(registry.as_langchain_tools())
+    # model 传未绑工具的实例：绑工具是生产路径内部的行为（app/chat.py:154）
+    model = get_chat_model(temperature=0)
     OUT.mkdir(exist_ok=True)
 
     prompt_cases = yaml.safe_load((ROOT / "cases.yaml").read_text(encoding="utf-8"))
@@ -135,23 +199,24 @@ async def main() -> int:
 
     print("=" * 68)
     print("A. System Prompt 行为评估")
+    if override:
+        print(f"   ★ 负对照：System Prompt 已被 {override} 覆盖（不是 app/prompts.py 的现行版本）")
     print("=" * 68)
-    prompt_results = [
-        await run_prompt_case(c, model, judge_model, registry) for c in prompt_cases
-    ]
+    async with open_test_db() as (session, conversation_id):
+        registry = build_registry(session=session)
+        prompt_results = [
+            await run_prompt_case(c, model, judge_model, registry, conversation_id)
+            for c in prompt_cases
+        ]
+
     for r in prompt_results:
         mark = "PASS" if r["passed"] else "FAIL"
-        why = ""
-        if r["violations"]:
-            why = f" 禁用词命中: {r['violations']}"
-        elif not r["judged_ok"]:
-            why = " judge 判定未满足期望"
-        if r["too_long"]:
-            why += f" 超长: {r['length']} 字（上限 {MAX_REPLY_CHARS}）"
-        print(f"  [{mark}] {r['id']:<16} {r['category']}{why}")
+        print(f"  [{mark}] {r['id']:<16} {r['category']}{_why(r)}")
+        if r["tool_calls"]:
+            print(f"         ↳ 调用了 {r['tool_calls']}")
         if r["too_long"]:
             print(f"         ↳ 实测 {r['length']} 字，超出 {r['length'] - MAX_REPLY_CHARS} 字。回复原文：")
-            for line in r["reply"].strip().splitlines():
+            for line in (r["first_round_text"] + "\n" + r["reply"]).strip().splitlines():
                 print(f"           {line}")
 
     by_cat: dict[str, list[bool]] = {}
@@ -161,9 +226,16 @@ async def main() -> int:
     for cat, oks in by_cat.items():
         print(f"    {cat:<10} {sum(oks)}/{len(oks)}")
 
+    gated = [r for r in prompt_results if r["gated"]]
+    gated_pass = sum(r["passed"] for r in gated)
+    print(f"\n  确定性闸门（forbid/语义/转述/长度）：FAIL {len([r for r in prompt_results if not r['passed']])}"
+          f"/{len(prompt_results)}；带 gate 的用例 {gated_pass}/{len(gated)} 通过")
+    for r in gated:
+        print(f"    · {r['id']:<12} {'PASS' if r['passed'] else 'FAIL'}"
+              f"  relay={r['relay_ok']}  语义={'OK' if not r['missing_semantics'] else 'MISS'}")
     over = [r for r in prompt_results if r["too_long"]]
     longest = max(prompt_results, key=lambda r: r["length"])
-    print(f"\n  长度断言（约束 4：≤{MAX_REPLY_CHARS} 字）：超限 {len(over)}/{len(prompt_results)}；"
+    print(f"  长度断言（约束 4：≤{MAX_REPLY_CHARS} 字）：超限 {len(over)}/{len(prompt_results)}；"
           f"最长 {longest['length']} 字（{longest['id']}）")
 
     print()
@@ -182,7 +254,11 @@ async def main() -> int:
     wrong = sum(len(r["mismatches"]) for r in extract_results)
     print(f"\n  字段级准确率：{total - wrong}/{total} = {(total - wrong) / total:.1%}")
 
-    report = {"prompt": prompt_results, "extract": extract_results}
+    report = {
+        "prompt_override": override,
+        "prompt": prompt_results,
+        "extract": extract_results,
+    }
     (OUT / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
