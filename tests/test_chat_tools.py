@@ -165,6 +165,37 @@ async def test_failing_tool_is_fed_back_not_raised():
     assert any(isinstance(e, DeltaEvent) for e in events), "回灌后模型仍要作答"
 
 
+class BoomRegistry:
+    """registry.execute 意外抛异常的桩（修复轮 · Important 4）。
+
+    `execute` 是**写着**不抛的（spec §11.1「查不到不是错误」，异常都包成
+    ToolOutcome），但那是约定不是类型保证：`args_schema.model_validate` 只挡了
+    ValidationError，别的意外异常会一路窜出 `for call in tool_calls` 循环，
+    用户看到一条**半截流且没有 error 帧**——违反 spec §11.3 那条无条件的
+    「出错必须补一个 error 帧」。这个桩把那条路径钉住。
+    """
+
+    def as_langchain_tools(self):
+        return []
+
+    async def execute(self, name, args, call_id, *, conversation_id=None):
+        raise RuntimeError("registry 意外炸了")
+
+
+async def test_tool_execution_error_ends_stream_with_one_error_event():
+    """工具执行里的意外异常 → 恰好一个 ErrorEvent 收尾，且没有 DoneEvent。"""
+    events = await collect(stream_reply_with_tools(
+        "订单 1001 的物流到哪了", [], model=ToolThenAnswerModel(),
+        registry=BoomRegistry(), token_budget=4096, conversation_id=1,
+    ))
+    kinds = [type(e).__name__ for e in events]
+
+    assert kinds.count("ErrorEvent") == 1, kinds
+    assert kinds[-1] == "ErrorEvent"
+    assert not any(isinstance(e, DoneEvent) for e in events)
+    assert events[-1].code == "internal_error"
+
+
 class PreambleThenToolModel:
     """★ 实测出来的真实行为：模型先吐一段正文，然后才发工具申请。
 
@@ -315,8 +346,8 @@ async def test_no_tool_path_done_event_carries_real_metadata():
 async def test_done_event_metadata_is_none_when_chunks_are_bare():
     """裸 chunk（无元数据）时两个字段是 None —— 不编造一个 "stop"。
 
-    与 ch01 `stream_reply` 的行为一致（tests/test_chat.py::test_done_event_
-    carries_finish_reason）。
+    与 ch01 那批断言一致（tests/test_chat.py::test_done_event_carries_finish_reason
+    —— 修复轮 · Important 3 后它也驱动本函数）。
     """
     model = ToolThenAnswerModel()
     events = await collect(stream_reply_with_tools(

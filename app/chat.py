@@ -1,4 +1,3 @@
-import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -8,13 +7,11 @@ from dataclasses import dataclass
 # 而 BaseChatModel.astream 的契约只保证抛 BaseException，不暴露类型层级。
 # 若以后换 provider，这个文件是除 providers.py 外唯一需要跟着改的地方。
 import openai
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 
 from app.context import prepare_messages
 from app.prompts import build_chat_prompt
 from app.providers import get_chat_model
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -49,8 +46,13 @@ def _absorb_metadata(
 ) -> tuple[str | None, dict | None]:
     """从 chunk 的元数据里取真实的 finish_reason / usage。
 
-    取法就是 ch01 `stream_reply` 里那三行（空值不覆盖，最后一个有值的赢）。
-    工具轮有两个流各要取一次，抽成函数是为了让 ch01 与 ch02 只有一处真相。
+    取法沿用 ch01 的三行（空值不覆盖，最后一个有值的赢）。工具轮有两个流
+    各要取一次，抽成函数是为了让这两处只有一处真相。
+
+    ★ ch01 的 `stream_reply` 已删除（修复轮 · Important 3）：它生产上无人调用，
+    只剩 12 条测试在引用，而这 12 条测的正是 `stream_reply_with_tools` 的空
+    工具路径（同一份 delta 循环 / 异常分类 / 元数据吸收）。留一份已分叉的副本
+    的代价是：将来改活路径改错了对象，还有 12 条绿灯替你背书。
     """
     meta = getattr(chunk, "response_metadata", None) or {}
     if meta.get("finish_reason"):
@@ -71,45 +73,6 @@ def classify_exception(exc: BaseException) -> str:
     if isinstance(exc, openai.APIStatusError):
         return "upstream_unavailable"
     return "internal_error"
-
-
-async def stream_reply(
-    message: str,
-    history: list[BaseMessage],
-    *,
-    model=None,
-    token_budget: int,
-) -> AsyncIterator[DomainEvent]:
-    """跑一轮对话，产出领域事件。
-
-    只吐事件，不碰 HTTP —— SSE 帧由 api.py 负责（spec §4.2）。
-    出错时只发 ErrorEvent 且不补发 DoneEvent（spec §5.1）。
-    """
-    model = model or get_chat_model()
-    messages = prepare_messages(
-        history, HumanMessage(message), token_budget=token_budget
-    )
-    # 展开为 [SystemMessage, *剪裁后历史, 当前用户消息]：system 文案的唯一来源
-    # 是 app/prompts.py 的模板，这里不自己拼 SystemMessage。
-    rendered = build_chat_prompt().format_messages(history=messages)
-
-    finish_reason: str | None = None
-    usage: dict | None = None
-
-    try:
-        async for chunk in model.astream(rendered):
-            if chunk.text:
-                yield DeltaEvent(text=chunk.text)
-            finish_reason, usage = _absorb_metadata(chunk, finish_reason, usage)
-    except Exception as exc:  # noqa: BLE001 — 需要对上游任意异常做分类
-        code = classify_exception(exc)
-        # spec §9：失败轮次必须在服务端留痕（错误码 + 原始异常类型），
-        # 否则每一个失败对服务端都是隐形的，只剩客户端能看见。
-        logger.warning("chat turn failed: code=%s exc=%s", code, type(exc).__name__)
-        yield ErrorEvent(code=code, message=str(exc)[:500])
-        return
-
-    yield DoneEvent(finish_reason=finish_reason, usage=usage)
 
 
 @dataclass(frozen=True)
@@ -188,20 +151,29 @@ async def stream_reply_with_tools(
         return
 
     # ---- ④ 执行工具（可能多个）----
+    # ★ 错误边界（修复轮 · Important 4）：`registry.execute` 是**写着**不抛的，
+    #   但这不由类型系统保证——`spec.tool.args_schema.model_validate` 只挡了
+    #   ValidationError，别的意外异常会一路窜出去，变成"半截流 + 没有 error 帧"，
+    #   违反 spec §11.3「出错必须补一个 error 帧」这条无条件规则。用与上面两个
+    #   模型流完全相同的形状兜住它。
     tool_messages: list[ToolMessage] = []
-    for call in tool_calls:
-        yield ToolCallEvent(name=call["name"], arguments=call["args"], call_id=call["id"])
+    try:
+        for call in tool_calls:
+            yield ToolCallEvent(name=call["name"], arguments=call["args"], call_id=call["id"])
 
-        outcome = await registry.execute(
-            call["name"], call["args"], call["id"], conversation_id=conversation_id
-        )
+            outcome = await registry.execute(
+                call["name"], call["args"], call["id"], conversation_id=conversation_id
+            )
 
-        yield ToolResultEvent(
-            call_id=outcome.call_id, ok=outcome.ok,
-            summary=outcome.summary, content=outcome.content,
-            elapsed_ms=outcome.elapsed_ms,
-        )
-        tool_messages.append(ToolMessage(content=outcome.content, tool_call_id=call["id"]))
+            yield ToolResultEvent(
+                call_id=outcome.call_id, ok=outcome.ok,
+                summary=outcome.summary, content=outcome.content,
+                elapsed_ms=outcome.elapsed_ms,
+            )
+            tool_messages.append(ToolMessage(content=outcome.content, tool_call_id=call["id"]))
+    except Exception as exc:  # noqa: BLE001 — 与两个模型流的错误边界同形
+        yield ErrorEvent(code=classify_exception(exc), message=str(exc)[:500])
+        return
 
     # ---- ⑤⑥ 第二次请求：不绑工具 ----
     # followup 里放的是累积出来的 gathered 本身（AIMessageChunk），
