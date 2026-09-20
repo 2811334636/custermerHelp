@@ -17,6 +17,64 @@ def anyio_backend():
     return "asyncio"
 
 
+def _clear_test_tables() -> None:
+    """清空测试库的 messages / tickets / conversations。
+
+    ★ 只对库名以 `_test` 结尾的库动手：哪怕配置被改错指向生产库，这里也绝不
+    删真数据。宁可跳过清理（泄漏会以"行数又涨了"的形式暴露出来），也不能
+    清错库（不可逆）。
+    """
+    import asyncio
+    import sys
+
+    from sqlalchemy import text
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.config import get_settings
+
+    db_url = get_settings().db_url
+    db_name = make_url(db_url).database or ""
+    if not db_name.endswith("_test"):
+        print(f"[conftest] 跳过测试库清理：{db_name} 不是 *_test 库", file=sys.stderr)
+        return
+
+    async def _run() -> None:
+        engine = create_async_engine(db_url)
+        try:
+            async with engine.begin() as conn:
+                # tickets 的外键指向 conversations，得先删，否则删会话行撞外键
+                for table in ("messages", "tickets", "conversations"):
+                    await conn.execute(text(f"DELETE FROM {table}"))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+@pytest.fixture(scope="session", autouse=True)
+def clean_test_db():
+    """整个测试会话开始前清一次库：messages / tickets / conversations。
+
+    为什么需要它：`/api/chat` 路由会**真提交**本轮写入（commit 不可撤销），
+    每个驱动真路由的用例都会往这几张表里留下自己的会话行/消息行。不清的话
+    customer_service_test 会**无界增长**——实测跑一次 `uv run pytest -q`
+    conversations +13、messages +6，而这个库同时还是 evals/harness.py 给工具
+    评估用的那一个。`scripts/seed.py` 也不会清这两张表。
+
+    为什么放在"会话开始"而不是"会话结束"：开始清是**自愈**的——上一次跑崩
+    （Ctrl-C / 被 kill / teardown 没跑完），下一次照样从干净状态出发；放在
+    结束则会把崩溃留下的垃圾永久留在库里。代价是并发跑第二个 pytest 会互相
+    清表（本项目测试与 evals 都是串行跑，不这么用）。
+
+    faq 表一个字都不动：工具评估（evals）要读它，它由 scripts/seed.py 灌。
+    """
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    _clear_test_tables()
+
+
 @pytest.fixture
 async def db_session():
     """每个用例一个 session，跑完回滚。
@@ -29,10 +87,10 @@ async def db_session():
     这不是被测代码的 bug，是"commit 不可撤销"的必然结果：那些行已经真落库了，
     回滚也回不来。拦在这里只会让每个驱动真路由的用例在 teardown 报错。
 
-    代价要写清楚：tests/test_api.py 与 tests/test_api_tools.py 会在
-    customer_service_test 里留下自己的会话行与消息行（每轮用例几条）。会话
-    uuid 随机，不影响其他用例；要清干净得手工 DELETE 或重建库——seed.py 只
-    重灌 faq，不会清 conversations/messages。
+    所以这些行是**真留在** customer_service_test 里的，跨 run 的累积由
+    clean_test_db（session 级，跑之前清）兜住。而**同一个 run 之内**它们仍然
+    在库里：提交过的固定 session_id 会与后跑的用例撞 UNIQUE key（这就是
+    tests/test_api.py 那条用例把 "失败会话" 换成随机 uuid 的原因）。
     """
     from app.config import get_settings
 

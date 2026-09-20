@@ -166,16 +166,23 @@ def test_stored_tool_message_holds_full_content_not_the_badge_summary(client):
 
 
 class MetadataModel:
-    """第一次申请工具，第二次作答 —— 两次都带真实的 response_metadata / usage。
+    """第一次调用申请工具，第二次作答 —— 两次都带真实的 response_metadata / usage。
 
     第一次的 finish_reason 是真实上游会给的 "tool_calls"，第二次是 "length"
-    （模拟被上游截断）。裸 chunk 的打桩模型看不到这两个值，所以这个桩
-    专门用来锁住 DoneEvent 不再写死 "stop"。
+    （模拟被上游截断）。裸 chunk 的打桩模型看不到这两个值，这个桩就是来锁
+    DoneEvent 不再写死 "stop" 的。
+
+    ★ 分支判据必须是**调用次序**（共享的 rec），不能是"有没有绑工具"：
+    改造前的路由压根不调 bind_tools（那时走的是 stream_reply），按绑定状态
+    分支会直接落到作答那一支、报出 "length" —— 断言就成了假绿，抓不到任何
+    东西。这个坑是 review 指出来的（原版按 `len(self._bound)` 分支，在改造前
+    的路由下也通过）。
     """
 
     USAGE = {"input_tokens": 31, "output_tokens": 7, "total_tokens": 38}
 
-    def __init__(self):
+    def __init__(self, rec):
+        self._rec = rec
         self._bound = []
 
     def bind_tools(self, tools):
@@ -183,7 +190,8 @@ class MetadataModel:
         return self
 
     async def astream(self, messages):
-        if len(self._bound) > 0:
+        self._rec.append(1)
+        if len(self._rec) == 1:
             yield AIMessageChunk(
                 content="",
                 tool_call_chunks=[{
@@ -204,12 +212,15 @@ def test_done_frame_carries_real_finish_reason_and_usage(client):
     """控制项 (3)：被上游截断的一轮不得被报成干净的 "stop"。
 
     旧实现两处都写死 `DoneEvent(finish_reason="stop", usage=None)`，于是
-    finish_reason="length"（截断）与 usage 对客户端完全不可见。
+    finish_reason="length"（截断）与 usage 对客户端完全不可见。这条是**端到端**
+    的钉子；细粒度判据在 tests/test_chat_tools.py 的三条元数据用例。
     """
-    app.dependency_overrides[get_default_chat_model] = lambda: MetadataModel()
+    rec: list[int] = []
+    app.dependency_overrides[get_default_chat_model] = lambda: MetadataModel(rec)
     r = client.post("/api/chat", json={"message": "退货政策是什么"})
     done = [d for n, d in parse_sse(r.text) if n == "done"]
 
+    assert len(rec) == 2, "工具轮：带工具的请求 + 最终回答的请求"
     assert done[-1]["finish_reason"] == "length", "截断必须如实上报，不能是 stop"
     assert done[-1]["usage"] == MetadataModel.USAGE
 

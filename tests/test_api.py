@@ -208,6 +208,10 @@ async def test_failed_turn_leaves_session_store_untouched(client):
     ch02 起"不写消息"和"不提交"是两件事：会话行由 get_or_create 在请求一
     开始就建出来（工具的外键需要它），它**即使本轮失败也要提交**，否则下次
     请求又得重建。所以这里断言的是消息零痕迹 + 恰好一次提交（会话行）。
+
+    session_id 用随机 uuid，不用固定的 "失败会话"：路由会把这一行**真提交**，
+    固定 id 就会在库里留下一条跨越用例（和跨越 run，只是 run 之间会被
+    clean_test_db 清掉）的记录，撞上后面用同一个 id 的用例就是 UNIQUE 冲突。
     """
     import openai
     import httpx
@@ -222,7 +226,7 @@ async def test_failed_turn_leaves_session_store_untouched(client):
     )
     app.dependency_overrides[get_default_chat_model] = lambda: FakeModel(raises=err)
 
-    sid = "失败会话"
+    sid = str(uuid.uuid4())
     r = client.post("/api/chat", json={"session_id": sid, "message": "你好"})
     assert parse_sse(r.text)[-1][0] == "error"
     # 消息存储零痕迹：半截的一轮一句都不许写。
