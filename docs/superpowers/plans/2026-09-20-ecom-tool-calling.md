@@ -4,9 +4,11 @@
 
 **Goal:** 给 ch01 的客服后端装上 Function Calling 工具链：模型自主决定调哪个工具，工具结果回灌后仍逐 token 流式作答，聊天页用徽章显示工具轨迹。
 
-**Architecture:** 四层切分 —— `db/`（表与连接）→ `repositories/`（读写）→ `tools/`（业务能力）→ `chat.py`（编排模型与工具）。工具轮用**流式探测**：判模型吐的第一个增量是正文还是工具申请；**第二次模型调用不绑工具**，从调用方式上结构性保证单轮收敛。
+**Architecture:** 四层切分 —— `db/`（表与连接）→ `repositories/`（读写）→ `tools/`（业务能力）→ `chat.py`（编排模型与工具）。工具轮用**先转发后决断**：首轮正文一律实时转发并累积，流结束后再看累积结果的 `tool_calls` 决定要不要执行工具；**第二次模型调用不带工具**（实现为 `bind_tools([])`，见 spec §7.4），从调用方式上结构性保证单轮收敛。
 
-**Tech Stack:** Python 3.12.14 / uv / FastAPI 0.141.1 / SQLAlchemy 2.0.54 (async) / aiomysql 0.3.2 / MySQL 8.4 (Docker) / LangChain 1.4.1 / langchain-core 1.6.3 / langchain-openai 1.6.2
+> 更新（修复轮，2026-09-20）：本节原先写的机制是**流式探测**（判第一个增量是正文还是工具申请）。实测该模型会**先吐正文再申请工具**，按第一个增量分叉会让工具不执行、用户只看到"我帮您查一下"然后没有下文——已改为**先转发后决断**。文档正文与任务里的旧描述作为历史决策记录保留，**以 spec §7.2/§7.4 为准**。
+
+**Tech Stack:** Python 3.12.14 / uv / FastAPI 0.141.1 / SQLAlchemy 2.0.54 (async) / aiomysql 0.3.2 / MySQL 8.4 (Docker) / langchain-core 1.6.3 / langchain-openai 1.6.2（**不依赖 `langchain` 编排层**，见 `pyproject.toml`）
 
 **Spec:** `docs/superpowers/specs/2026-09-20-ecom-tool-calling-design.md`
 

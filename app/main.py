@@ -10,7 +10,7 @@ from app.api import router
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="电商智能客服 ch01", version="0.1.0")
+app = FastAPI(title="电商智能客服 ch02 · Function Calling 工具链", version="0.2.0")
 app.include_router(router)
 
 # 聊天页：单文件原生 JS，零构建。挂载在 /chat，与 /api 前缀不冲突。
