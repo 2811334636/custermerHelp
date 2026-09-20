@@ -320,7 +320,9 @@ def test_conversations_has_session_uuid_unique():
 
 def test_messages_columns():
     t = Base.metadata.tables["messages"]
-    assert {"conversation_id", "role", "content", "tool_calls", "tool_call_id"} <= set(t.columns)
+    # 注意是 t.columns.keys()：SQLAlchemy 2.0 里 set(t.columns) 迭代出的是
+    # Column 对象而不是列名，直接和字符串集合比较永远为假。Task 2 实测踩到。
+    assert {"conversation_id", "role", "content", "tool_calls", "tool_call_id"} <= set(t.columns.keys())
 
 
 def test_tickets_primary_key_is_ticket_no():
@@ -525,20 +527,28 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 - [ ] **Step 1: 给 `tests/conftest.py` 加测试 DB fixture**
 
-在**现有内容之上追加**（不要删除既有的 `APP_LLM_API_KEY` 设置与 `anyio_backend`）：
+**整份替换** `tests/conftest.py` 为下面的内容。文件里原有的 `APP_LLM_API_KEY` 设置与 `anyio_backend` fixture **必须保留**，所以下面这份代码块把它们一并写全了——不要在这份之外再"追加"旧内容，那样会产生重复定义。
 
 ```python
 import os
 
 import pytest
 
+# 测试期间不读真实 .env，避免测试依赖本机密钥
 os.environ.setdefault("APP_LLM_API_KEY", "test-key")
+# ★ 必须在任何 app.db.base 被 import 之前设置：base.py 在 import 时就用
+# get_settings().db_url 建 engine，晚了就会指向生产库。
 os.environ.setdefault(
     "APP_DB_URL",
     "mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service_test?charset=utf8mb4",
 )
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
 
 
 @pytest.fixture
