@@ -1713,11 +1713,50 @@ async def test_fake_data_is_deterministic(tool):
 
 @pytest.mark.parametrize("tool", [query_order, query_product, query_logistics])
 async def test_different_keys_give_different_data(tool):
+    """★ 必须先把回显的 id 归一化掉再比，否则这条断言永远不会失败。
+
+    每个工具输出的**第一行都会回显输入的 id**（"订单号 {order_id}：" 等），
+    所以直接 `a != b` 光靠那一行就被满足了。把 _rng 换成"忽略 key、永远
+    返回同一串数据"的实现，这条断言照样通过——Task 7 review 实测证实过。
+    归一化之后，比的才是真正的派生数据。
+    """
     if tool is query_product:
-        a, b = await tool.ainvoke({"product_id": "P1"}), await tool.ainvoke({"product_id": "P2"})
+        args = ({"product_id": "P1"}, {"product_id": "P2"})
     else:
-        a, b = await tool.ainvoke({"order_id": "1"}), await tool.ainvoke({"order_id": "2"})
+        args = ({"order_id": "1"}, {"order_id": "2"})
+
+    def without_echo(text: str) -> str:
+        # 丢掉首行（含回显的输入 id），只留派生出来的内容
+        return text.partition("\n")[2]
+
+    a = without_echo(await tool.ainvoke(args[0]))
+    b = without_echo(await tool.ainvoke(args[1]))
     assert a != b
+
+
+async def test_order_and_logistics_agree_on_the_same_order():
+    """★ 同一个订单号，query_order 报的订单状态必须与 query_logistics 的最后一条一致。
+
+    两者若各自从独立种子流判定，会出现订单说"已发货"、物流最后一条说"已签收"，
+    或者订单"不存在"却有完整轨迹。**验收标准 1 要拿模型回答与工具输出逐字
+    对账**，两个工具自相矛盾会直接毁掉这个验收。Task 7 review 实测到过这两类
+    矛盾（1001 正是验收用的那个订单号）。这条测试就是锁住它们不再出现。
+    """
+    from app.tools.catalog import _STATUS_TO_LAST_NODE
+
+    for oid in ["1001", "1002", "1006", "20260701001", "1", "2", "3"]:
+        order = await query_order.ainvoke({"order_id": oid})
+        logistics = await query_logistics.ainvoke({"order_id": oid})
+
+        if "没有找到" in order:
+            assert "没有找到" in logistics, f"{oid}: 订单说不存在，物流却给了完整轨迹"
+            continue
+
+        assert "没有找到" not in logistics, f"{oid}: 订单存在，物流却说找不到"
+        status = order.split("订单状态：")[-1].strip()
+        assert _STATUS_TO_LAST_NODE[status] in logistics, (
+            f"{oid}: 订单状态「{status}」与物流最后节点不一致"
+        )
 
 
 async def test_query_faq_hit_via_registry(db_session):
@@ -1808,12 +1847,36 @@ def _rng(key: str) -> random.Random:
     return random.Random(seed)
 
 
+# ★ 下面两个判定必须由 query_order 与 query_logistics **共用**。
+# 让它们各自从独立的种子流里判定，会出现同一个订单号"不存在却又有完整
+# 物流轨迹"，或者订单说"已发货"而物流最后一条说"已签收"——验收标准 1 要
+# 拿模型回答与工具输出逐字对账，两个工具自相矛盾会直接毁掉这个验收。
+# Task 7 review 实测到了这两类矛盾（1001 正是验收用的号）。
+def _order_exists(order_id: str) -> bool:
+    return _rng(f"order-exists:{order_id}").random() >= 0.05
+
+
+def _order_status(order_id: str) -> str:
+    return _rng(f"order-status:{order_id}").choice(_STATUSES)
+
+
+_STATUS_TO_LAST_NODE = {
+    "已下单": "已揽收",
+    "已发货": "已发出",
+    "运输中": "运输中",
+    "已到达": "已到达",
+    "派送中": "派送中",
+    "已签收": "已签收",
+}
+
+
 @tool
 async def query_order(order_id: str) -> str:
     """按订单号查询订单详情，返回商品、下单时间、金额与订单状态。"""
-    r = _rng(f"order:{order_id}")
-    if r.random() < 0.05:
+    if not _order_exists(order_id):
         return f"没有找到订单 {order_id}。请确认订单号是否正确，或联系人工客服。"
+
+    r = _rng(f"order:{order_id}")
     return (
         f"订单号 {order_id}：\n"
         f"- 商品：{r.choice(_GOODS)}\n"
@@ -1821,7 +1884,7 @@ async def query_order(order_id: str) -> str:
         f"- 下单时间：2026-0{r.randint(1, 9)}-{r.randint(10, 28):02d} "
         f"{r.randint(9, 21):02d}:{r.randint(0, 59):02d}\n"
         f"- 实付金额：{r.randint(59, 899)}.{r.randint(0, 99):02d} 元\n"
-        f"- 订单状态：{r.choice(_STATUSES)}"
+        f"- 订单状态：{_order_status(order_id)}"
     )
 
 
@@ -1842,6 +1905,10 @@ async def query_product(product_id: str) -> str:
 @tool
 async def query_logistics(order_id: str) -> str:
     """按订单号查询物流轨迹，返回承运商、运单号与若干条轨迹节点。"""
+    # 与 query_order 共用同一个存在性判定，避免"订单不存在却有轨迹"
+    if not _order_exists(order_id):
+        return f"没有找到订单 {order_id} 的物流信息。请确认订单号是否正确。"
+
     r = _rng(f"logistics:{order_id}")
     carrier = r.choice(_CARRIERS)
     waybill = f"{r.choice('SFYTJD')}{r.randint(10**11, 10**12 - 1)}"
@@ -1849,8 +1916,10 @@ async def query_logistics(order_id: str) -> str:
     cities = r.sample(_CITIES, n)
     lines = [f"- 2026-09-{r.randint(10, 19):02d} {r.randint(8, 22):02d}:{r.randint(0, 59):02d} "
              f"{c}转运中心：{r.choice(['已揽收', '已发出', '已到达', '运输中'])}" for c in cities]
+    # ★ 最后一条必须与 query_order 报的订单状态一致，否则两个工具会自相矛盾
+    last_node = _STATUS_TO_LAST_NODE[_order_status(order_id)]
     latest = f"- 2026-09-20 {r.randint(8, 22):02d}:{r.randint(0, 59):02d} " \
-             f"{r.choice(_CITIES)}：{r.choice(['派送中', '已签收', '待取件'])}"
+             f"{r.choice(_CITIES)}：{last_node}"
     return (
         f"订单 {order_id} 的物流信息：\n"
         f"- 承运商：{carrier}\n"
