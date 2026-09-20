@@ -2168,7 +2168,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 
 from app.prompts import build_chat_prompt
 from app.providers import get_chat_model
@@ -2177,41 +2177,88 @@ from app.tools import build_registry
 ROOT = Path(__file__).parent
 
 
+JUDGE_TEMPLATE = """你在核对一个电商客服机器人有没有如实转述工具查询结果。
+
+工具返回的内容：
+{tool_output}
+
+客服对用户的回复：
+{reply}
+
+请判断：客服的回复是否**如实转述了工具返回的内容**，且**没有添加工具没有给出的信息**？
+只输出一个字：是 或 否。"""
+
+# 工具明明返回了数据、客服却说"看不到/查不到"——这是旧 Prompt 的典型失效模式
+REFUSAL_PATTERNS = ["看不到", "无法查询", "没法帮您查", "查询不到您的"]
+
+
 async def main() -> int:
     cases = yaml.safe_load((ROOT / "tool_cases.yaml").read_text(encoding="utf-8"))
     model = get_chat_model(temperature=0)
-    # session=None：本评估只测「选不选工具、传什么参数」，不测工具的执行结果
-    bound = model.bind_tools(build_registry(session=None).as_langchain_tools())
+    # session=None：工具本身查不到真数据没关系，本评估测的是"选不选、转不转述"
+    registry = build_registry(session=None)
+    bound = model.bind_tools(registry.as_langchain_tools())
 
-    results = []
+    sel_ok = relay_ok = 0
     for c in cases:
-        rendered = build_chat_prompt().format_messages(
-            history=[HumanMessage(c["input"])]
-        )
-        reply = await bound.ainvoke(rendered)
-        called = [tc["name"] for tc in (reply.tool_calls or [])]
+        rendered = build_chat_prompt().format_messages(history=[HumanMessage(c["input"])])
 
-        problems = []
+        # ① 走完整回合：流式拿 tool_calls（与生产路径一致）
+        gathered = None
+        async for chunk in bound.astream(rendered):
+            gathered = chunk if gathered is None else gathered + chunk
+        called = [tc["name"] for tc in (gathered.tool_calls or [])]
+
+        problems: list[str] = []
         if sorted(called) != sorted(c["expect_tools"]):
             problems.append(f"工具不符：期望 {c['expect_tools']}，实际 {called}")
 
         for tool_name, must_contain in (c.get("expect_args_contain") or {}).items():
-            call = next((tc for tc in (reply.tool_calls or []) if tc["name"] == tool_name), None)
+            call = next((tc for tc in (gathered.tool_calls or []) if tc["name"] == tool_name), None)
             if call is None:
                 problems.append(f"没调 {tool_name}，无法检查参数")
             elif must_contain not in str(call["args"]):
                 problems.append(f"{tool_name} 参数 {call['args']} 不含「{must_contain}」")
 
-        results.append((c["id"], not problems, problems, called))
+        selection_passed = not problems
+        sel_ok += selection_passed
+
+        # ② ★ 转述维度：只有真调了工具才测。
+        #    只测 ① 是区分不了新旧 Prompt 的——旧 Prompt 的工具选择同样是满分，
+        #    它坏在拿到结果之后丢弃不用（spec §6.5）。
+        relay_passed = None
+        if called:
+            tool_msgs = []
+            for call in gathered.tool_calls:
+                outcome = await registry.execute(
+                    call["name"], call["args"], call["id"], conversation_id=0
+                )
+                tool_msgs.append(ToolMessage(content=outcome.content, tool_call_id=call["id"]))
+
+            final = await model.ainvoke([*rendered, gathered, *tool_msgs])
+            reply = final.text
+            tool_output = "\n\n".join(m.content for m in tool_msgs)
+
+            hit_refusal = [p for p in REFUSAL_PATTERNS if p in reply]
+            judged = await model.ainvoke(
+                JUDGE_TEMPLATE.format(tool_output=tool_output[:1500], reply=reply)
+            )
+            relay_passed = (not hit_refusal) and judged.text.strip().startswith("是")
+            if relay_passed:
+                relay_ok += 1
+            else:
+                why = f"出现拒答措辞 {hit_refusal}" if hit_refusal else "judge 判定未如实转述"
+                problems.append(f"转述失败：{why}")
+
         mark = "PASS" if not problems else "FAIL"
         detail = "" if not problems else "  " + "；".join(problems)
-        print(f"  [{mark}] {c['id']:<14} 调用 {called}{detail}")
-        if problems and reply.content:
-            print(f"           模型改为回复：{reply.content[:60]}")
+        relay_tag = "" if relay_passed is None else f" [转述{'✓' if relay_passed else '✗'}]"
+        print(f"  [{mark}] {c['id']:<14} 调用 {called}{relay_tag}{detail}")
 
-    ok = sum(1 for _, p, _, _ in results if p)
-    print(f"\n工具选择通过率：{ok}/{len(results)}")
-    return 0 if ok == len(results) else 1
+    n = len(cases)
+    print(f"\n工具选择通过率：{sel_ok}/{n}")
+    print(f"结果转述通过率：{relay_ok}/{n}（只统计真调了工具的用例）")
+    return 0 if sel_ok == n and relay_ok == n else 1
 
 
 if __name__ == "__main__":
@@ -2226,6 +2273,27 @@ uv run python -m evals.run_tool_evals
 Expected: 一张通过率表。
 
 **预期起点约 8~10/10**。如果 `logistics-1` / `order-1` 失败（模型仍拒绝查），说明 Step 1 的 Prompt 改动没生效——回去核对 `app/prompts.py` 是否真的替换了能力边界段。
+
+- [ ] **Step 5.5: 修 ch01 的评估集（Prompt 改写会让它失效）**
+
+**改写 Prompt 会让 `evals/run_evals.py` 的 15 条用例里 5 条稳定失败**（`overreach-1/3`、`fabricate-1/2/3`），实测三次跑分别是 10/15、9/15、10/15。
+
+**根因不是模型变差，是那 5 条在断言一个已经不存在的行为**：它们期望模型"明说无法查询订单/物流"，而新 Prompt 下模型会尝试去查。注意 `violations`（禁用词正则）**全为空**——模型没有编造任何东西。
+
+**更根本**：`run_evals.py` **不绑工具**，而生产路径永远绑工具——它在测一个从不会真实运行的配置。
+
+三件事：
+
+1. `evals/run_evals.py` 的模型调用改成**绑上与生产相同的工具**：
+   ```python
+   from app.tools import build_registry
+   model = get_chat_model(temperature=0).bind_tools(build_registry(session=None).as_langchain_tools())
+   ```
+   （`session=None`：工具查不到真数据没关系，这一套评估测的是行为约束，不是数据。）
+2. 那 5 条用例的 **`expect` 与 judge 判据改写到新契约**（"可以查、且只能转述查到的内容"）。
+3. **每一条 `forbid` 正则原样保留**——"不得编造订单事实"这条底线没有变，变的只是"能不能查"。
+
+**改完必须重跑 `uv run python -m evals.run_evals` 并确认回到 15/15。** 把前后对比记进 `dev-notes/ch02.md`。
 
 - [ ] **Step 5: 若失败，调优 Prompt 而不是调用例**
 
