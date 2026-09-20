@@ -4,8 +4,11 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessageChunk
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api import get_store
+from app.config import get_settings
 from app.db.base import get_db
 from app.main import app
 from app.providers import get_default_chat_model
@@ -15,6 +18,11 @@ class FakeModel:
     def __init__(self, script=None, raises=None):
         self._script = script or ["您", "好"]
         self._raises = raises
+
+    def bind_tools(self, tools):
+        """ch02 起 /api/chat 走工具轮，模型必须先能绑工具。
+        这个桩一个工具都不申请，所以绑上就等于不用。"""
+        return self
 
     async def astream(self, messages):
         if self._raises:
@@ -42,35 +50,41 @@ class FakeStore:
         return session_id in self._data
 
 
-class FakeDbSession:
-    """路由只调它的 commit()。用桩而不是 None——生产代码里出现
-    `if db is not None` 这类守卫，就是为了迁就一个不诚实的测试替身。
+class SessionSpy:
+    """包住真实 db session，只为了数 commit 次数。
 
-    计数放在**类**上：fixture 传的是类本身，FastAPI 每次请求新建实例。
-    若把计数放实例上，要断言的实例根本读不到——`dependency_overrides
-    [get_db]().commits` 拿到的是刚建的新实例、恒为 0，是个静默失真的断言。
-    fixture 每个用例前清零。
+    ch02 起路由不能再用"只会 commit 的裸桩"：它要 `conv_repo.get_or_create`
+    （execute/add/flush）和 `build_registry(session=db)`（工具要真查库），
+    所以依赖注入的必须是一个能用的 session。除了计数，其余调用一律透传，
+    用例跑的就是生产那条路径。
     """
 
-    commits = 0
+    def __init__(self, inner):
+        self._inner = inner
+        self.commits = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
     async def commit(self):
-        FakeDbSession.commits += 1
+        self.commits += 1
+        await self._inner.commit()
 
 
 @pytest.fixture
-def client(monkeypatch):
+def client(monkeypatch, db_session):
     monkeypatch.setenv("APP_LLM_API_KEY", "test-key")
     from app.config import get_settings
 
     get_settings.cache_clear()
     store = FakeStore()
-    FakeDbSession.commits = 0  # 类级计数，每个用例前清零，免得跨用例串
+    spy = SessionSpy(db_session)
     app.dependency_overrides[get_store] = lambda: store
-    # 路由也直接依赖 get_db（整轮成功后要 commit），桩掉它这些用例就保持 DB-free
-    app.dependency_overrides[get_db] = FakeDbSession
+    # db 不是"只为 commit 而存在"的依赖：路由要用它建会话行、给工具执行。
+    app.dependency_overrides[get_db] = lambda: spy
     app.dependency_overrides[get_default_chat_model] = lambda: FakeModel()
     with TestClient(app) as c:
+        c.db = spy
         yield c
     app.dependency_overrides.clear()
     get_settings.cache_clear()
@@ -109,7 +123,7 @@ def test_chat_emits_meta_then_deltas_then_done(client):
     assert uuid.UUID(events[0][1]["session_id"])  # 是合法 uuid
     # 完成的一轮必须提交：get_db 退出时会回滚未提交的写入，漏掉这行
     # 写入就永远不落库（实测：不 commit 时库里查不到本轮消息）。
-    assert FakeDbSession.commits == 1
+    assert client.db.commits == 1
 
 
 async def test_chat_reuses_given_session_and_keeps_context(client):
@@ -149,7 +163,7 @@ def test_chat_empty_session_id_is_rejected(client):
     assert r.status_code == 422
 
 
-async def test_chat_emits_meta_when_session_id_is_empty_string():
+async def test_chat_emits_meta_when_session_id_is_empty_string(db_session):
     """I1 回归（推导层）：即便空串绕过 pydantic 校验，chat() 也必须回发 meta。
 
     直接驱动路由函数（model_construct 跳过校验），锁住 api.py 里的不变量：
@@ -161,9 +175,9 @@ async def test_chat_emits_meta_when_session_id_is_empty_string():
 
     req = ChatRequest.model_construct(session_id="", message="你好")
     store = FakeStore()
-    # 直接调用没有依赖注入，db 得自己给。传桩而不是 None：路由无条件
-    # `await db.commit()`，生产路径下 db 永不为 None。
-    resp = await chat(req, store=store, db=FakeDbSession(), model=FakeModel())
+    # 直接调用没有依赖注入，db 得自己给：路由无条件 `await db.commit()`，
+    # 而且要拿它建会话行（get_or_create）+ 给工具执行，所以给真 session。
+    resp = await chat(req, store=store, db=db_session, model=FakeModel())
 
     raw = "".join([chunk async for chunk in resp.body_iterator])
     events = parse_sse(raw)
@@ -189,9 +203,16 @@ def test_chat_upstream_error_becomes_error_event(client):
 
 
 async def test_failed_turn_leaves_session_store_untouched(client):
-    """I4.3：失败的一轮不得在会话存储里留下任何痕迹（spec §7.2.1）。"""
+    """I4.3：失败的一轮不得在会话存储里留下任何痕迹（spec §7.2.1）。
+
+    ch02 起"不写消息"和"不提交"是两件事：会话行由 get_or_create 在请求一
+    开始就建出来（工具的外键需要它），它**即使本轮失败也要提交**，否则下次
+    请求又得重建。所以这里断言的是消息零痕迹 + 恰好一次提交（会话行）。
+    """
     import openai
     import httpx
+
+    from app.db.models import Conversation
 
     store = client.app.dependency_overrides[get_store]()
     err = openai.AuthenticationError(
@@ -204,10 +225,31 @@ async def test_failed_turn_leaves_session_store_untouched(client):
     sid = "失败会话"
     r = client.post("/api/chat", json={"session_id": sid, "message": "你好"})
     assert parse_sse(r.text)[-1][0] == "error"
+    # 消息存储零痕迹：半截的一轮一句都不许写。
     assert not await store.exists(sid)
     assert await store.get(sid) == []
-    # 中止的一轮一句都不许写，所以也不许提交（提交了就等于落库半截）。
-    assert FakeDbSession.commits == 0
+    # 会话行则必须留着（本轮唯一被提交的东西）。
+    assert client.db.commits == 1
+
+    async def _session_row_exists() -> bool:
+        # ★ 另起一个引擎来查，而不是复用 client.db：那个 session 的连接建立在
+        # TestClient 的 portal 循环里，在外层测试循环里 await 它会撞上
+        # "got Future attached to a different loop"；就算借着 portal 去查，
+        # 也会留下一笔未了结的事务把 teardown 搅坏。新连接顺带把"真的提交了"
+        # 验证得更硬——只有已提交的行才对别的连接可见。
+        engine = create_async_engine(get_settings().db_url)
+        try:
+            async with async_sessionmaker(engine)() as other:
+                found = (
+                    await other.execute(
+                        select(Conversation).where(Conversation.session_uuid == sid)
+                    )
+                ).scalar_one_or_none()
+                return found is not None
+        finally:
+            await engine.dispose()
+
+    assert client.portal.call(_session_row_exists), "会话行即使本轮失败也要保留"
 
 
 def test_temperature_is_not_an_endpoint_parameter():

@@ -44,6 +44,22 @@ _UNAVAILABLE_ERRORS = (
 )
 
 
+def _absorb_metadata(
+    chunk, finish_reason: str | None, usage: dict | None
+) -> tuple[str | None, dict | None]:
+    """从 chunk 的元数据里取真实的 finish_reason / usage。
+
+    取法就是 ch01 `stream_reply` 里那三行（空值不覆盖，最后一个有值的赢）。
+    工具轮有两个流各要取一次，抽成函数是为了让 ch01 与 ch02 只有一处真相。
+    """
+    meta = getattr(chunk, "response_metadata", None) or {}
+    if meta.get("finish_reason"):
+        finish_reason = meta["finish_reason"]
+    if getattr(chunk, "usage_metadata", None):
+        usage = dict(chunk.usage_metadata)
+    return finish_reason, usage
+
+
 def classify_exception(exc: BaseException) -> str:
     """把上游异常映射成对外的错误码（spec §9）。"""
     if isinstance(exc, _AUTH_ERRORS):
@@ -84,11 +100,7 @@ async def stream_reply(
         async for chunk in model.astream(rendered):
             if chunk.text:
                 yield DeltaEvent(text=chunk.text)
-            meta = getattr(chunk, "response_metadata", None) or {}
-            if meta.get("finish_reason"):
-                finish_reason = meta["finish_reason"]
-            if getattr(chunk, "usage_metadata", None):
-                usage = dict(chunk.usage_metadata)
+            finish_reason, usage = _absorb_metadata(chunk, finish_reason, usage)
     except Exception as exc:  # noqa: BLE001 — 需要对上游任意异常做分类
         code = classify_exception(exc)
         # spec §9：失败轮次必须在服务端留痕（错误码 + 原始异常类型），
@@ -150,6 +162,11 @@ async def stream_reply_with_tools(
     messages = prepare_messages(history, HumanMessage(message), token_budget=token_budget)
     rendered = build_chat_prompt().format_messages(history=messages)
 
+    # 真实元数据（不是写死的 "stop"/None）：最后一个流的取值即本轮终局，
+    # 工具轮由第二次调用（最终回答那次）覆盖第一次的 "tool_calls"。
+    finish_reason: str | None = None
+    usage: dict | None = None
+
     # ---- ② 第一次请求：带工具。正文实时转发，同时累积整条响应 ----
     bound = model.bind_tools(registry.as_langchain_tools())
     gathered = None
@@ -158,6 +175,7 @@ async def stream_reply_with_tools(
             gathered = chunk if gathered is None else gathered + chunk
             if chunk.text:
                 yield DeltaEvent(text=chunk.text)
+            finish_reason, usage = _absorb_metadata(chunk, finish_reason, usage)
     except Exception as exc:  # noqa: BLE001
         yield ErrorEvent(code=classify_exception(exc), message=str(exc)[:500])
         return
@@ -166,7 +184,7 @@ async def stream_reply_with_tools(
 
     if not tool_calls:
         # 不需要工具：正文已逐块转发完毕
-        yield DoneEvent(finish_reason="stop", usage=None)
+        yield DoneEvent(finish_reason=finish_reason, usage=usage)
         return
 
     # ---- ④ 执行工具（可能多个）----
@@ -205,8 +223,9 @@ async def stream_reply_with_tools(
         async for chunk in unbound.astream(followup):
             if chunk.text:
                 yield DeltaEvent(text=chunk.text)
+            finish_reason, usage = _absorb_metadata(chunk, finish_reason, usage)
     except Exception as exc:  # noqa: BLE001
         yield ErrorEvent(code=classify_exception(exc), message=str(exc)[:500])
         return
 
-    yield DoneEvent(finish_reason="stop", usage=None)
+    yield DoneEvent(finish_reason=finish_reason, usage=usage)

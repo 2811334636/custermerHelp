@@ -6,21 +6,25 @@ from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chat import (
     DeltaEvent,
     DoneEvent,
     ErrorEvent,
-    stream_reply,
+    ToolCallEvent,
+    ToolResultEvent,
+    stream_reply_with_tools,
 )
 from app.config import get_settings
 from app.db.base import get_db
 from app.extract import ExtractionFailed, extract_ticket
 from app.providers import get_default_chat_model
+from app.repositories import conversation as conv_repo
 from app.schemas import AfterSalesTicket, ChatRequest, ExtractRequest
 from app.sessions import MySQLSessionStore, SessionStore
+from app.tools import build_registry
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +45,8 @@ def sse_frame(name: str, data: dict) -> str:
 async def chat(
     req: ChatRequest,
     store: SessionStore = Depends(get_store),
-    db: AsyncSession = Depends(get_db),
     model=Depends(get_default_chat_model),
+    db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     # is_new_session 必须和 session_id 同源，否则空串 "" 会走到
     # "服务端生成了 id 却不发 meta" 的岔路：客户端永远学不到 id，
@@ -51,31 +55,71 @@ async def chat(
     is_new_session = req.session_id != session_id
     settings = get_settings()
 
-    # 先读出历史（不含当前消息），剪裁由 stream_reply 内部完成
+    # 先读出历史（不含当前消息），剪裁由 stream_reply_with_tools 内部完成
     history = await store.get(session_id)
+
+    # 会话行在这里就建出来：create_ticket 要拿 conversation_id 当外键，
+    # 工具执行时它必须已经存在（flush 出 id 即可，提交与否见 finally）。
+    conv = await conv_repo.get_or_create(db, session_id, settings.default_user_id)
+
+    # ★ build_registry 必须在请求处理函数里构造：它绑定的是**当前请求**的库
+    # 会话。放到模块级会持有一个早已随上个请求关闭的 session，第二个请求起
+    # 工具全部报错。
+    registry = build_registry(session=db)
 
     async def event_stream() -> AsyncIterator[str]:
         if is_new_session:
             yield sse_frame("meta", {"session_id": session_id})
 
-        collected: list[str] = []
+        # 落库用的累积器（spec §7.1 步骤 ⑧）
+        # 工具轮之前的正文 → preamble；工具轮之后的正文 → final_answer。
+        # 分开放是因为它们分属两条 assistant 消息：带 tool_calls 的那条，
+        # 和最终回答那条。混成一条会让历史回放失真。
+        preamble: list[str] = []
+        final_answer: list[str] = []
+        tool_calls_seen: list[dict] = []
+        tool_messages: list[ToolMessage] = []
+        in_tool_round = False
         completed = False
+
         try:
-            async for event in stream_reply(
+            async for event in stream_reply_with_tools(
                 req.message,
                 history,
                 model=model,
+                registry=registry,
                 token_budget=settings.history_token_budget,
+                conversation_id=conv.id,
             ):
-                if isinstance(event, DeltaEvent):
-                    collected.append(event.text)
+                if isinstance(event, ToolCallEvent):
+                    in_tool_round = True
+                    tool_calls_seen.append({
+                        "id": event.call_id, "name": event.name,
+                        "args": event.arguments, "type": "tool_call",
+                    })
+                    yield sse_frame("tool", {
+                        "phase": "start", "call_id": event.call_id,
+                        "name": event.name, "arguments": event.arguments,
+                    })
+                elif isinstance(event, ToolResultEvent):
+                    # ★ 两个文本字段各走各的路：帧里只放给前端看的摘要，
+                    # 库里存回灌给模型的全文（存摘要 = 下一轮模型只看到截断结果）。
+                    tool_messages.append(
+                        ToolMessage(content=event.content, tool_call_id=event.call_id)
+                    )
+                    yield sse_frame("tool", {
+                        "phase": "end", "call_id": event.call_id,
+                        "ok": event.ok, "summary": event.summary,
+                        "elapsed_ms": event.elapsed_ms,
+                    })
+                elif isinstance(event, DeltaEvent):
+                    (final_answer if in_tool_round else preamble).append(event.text)
                     yield sse_frame("delta", {"text": event.text})
                 elif isinstance(event, DoneEvent):
                     completed = True
-                    yield sse_frame(
-                        "done",
-                        {"finish_reason": event.finish_reason, "usage": event.usage},
-                    )
+                    yield sse_frame("done", {
+                        "finish_reason": event.finish_reason, "usage": event.usage,
+                    })
                 elif isinstance(event, ErrorEvent):
                     yield sse_frame("error", {"code": event.code, "message": event.message})
         except (GeneratorExit, asyncio.CancelledError):
@@ -95,16 +139,25 @@ async def chat(
             # 只在整轮正常结束时写入历史。客户端断开或上游出错时整轮丢弃，
             # 否则会留下"两个 human 连排"的畸形历史（spec §7.2.1）。
             if completed:
-                await store.append(
-                    session_id,
-                    HumanMessage(req.message),
-                    AIMessage("".join(collected)),
-                )
-                # 整轮成功才提交。get_db 是 `async with` 形式，退出时会把未提交
-                # 的写入回滚——不提交则本轮消息永远不落库。conversations 行由
-                # append 内部的 get_or_create 建出来，和消息同属一个事务，所以
-                # "只在完成时提交"是自洽的：中断轮两者一起回滚，不留半截。
-                await db.commit()
+                # ★ 完整序列：user → assistant(带 tool_calls) → tool 结果* → 最终 assistant
+                # 只存 user + 最终 assistant 会让下一轮回放历史时 tool_call_id
+                # 指向一条不存在的申请单，上游会直接报错——而且只在**第二轮**
+                # 才现形，单轮用例看不出来（见 tests/test_api_tools.py）。
+                to_store: list[BaseMessage] = [HumanMessage(req.message)]
+                if tool_calls_seen:
+                    to_store.append(AIMessage(
+                        content="".join(preamble), tool_calls=tool_calls_seen
+                    ))
+                    to_store.extend(tool_messages)
+                    to_store.append(AIMessage("".join(final_answer)))
+                else:
+                    to_store.append(AIMessage("".join(preamble)))
+                await store.append(session_id, *to_store)
+            # ★ 无条件提交，两件事分开看：get_or_create 产生的**会话行**即使
+            # 这一轮失败也要保留（否则下次请求又要重建，工具的外键还得先有），
+            # 而业务消息只在 completed 时才写。get_db 是 `async with` 形式，
+            # 不提交则未提交的写入在退出时被回滚——消息永远不落库。
+            await db.commit()
 
     return StreamingResponse(
         event_stream(),

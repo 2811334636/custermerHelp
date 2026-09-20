@@ -254,3 +254,77 @@ async def test_current_message_is_last_in_rendered_prompt():
     contents = [m.content for m in model.seen]
     assert contents[0].startswith("你是「小助手」"), "第一条应是 System Prompt"
     assert contents[1:] == ["之前的话", "最新提问"]
+
+
+class MetadataModel:
+    """带真实元数据的桩：第一次申请工具、第二次作答，两次都带
+    response_metadata / usage —— 裸 chunk 的桩看不到这些值。"""
+
+    USAGE = {"input_tokens": 31, "output_tokens": 7, "total_tokens": 38}
+
+    def __init__(self, *, tool_call: bool = True):
+        self._bound = []
+        self._tool_call = tool_call
+
+    def bind_tools(self, tools):
+        self._bound = list(tools)
+        return self
+
+    async def astream(self, messages):
+        if self._bound and self._tool_call:
+            yield AIMessageChunk(
+                content="",
+                tool_call_chunks=[{
+                    "name": "query_logistics", "args": '{"order_id": "1001"}',
+                    "id": "call_m", "index": 0, "type": "tool_call_chunk",
+                }],
+                response_metadata={"finish_reason": "tool_calls"},
+            )
+        else:
+            yield AIMessageChunk(
+                content="已到达杭州。",
+                response_metadata={"finish_reason": "length"},
+                usage_metadata=MetadataModel.USAGE,
+            )
+
+
+async def test_tool_path_done_event_carries_real_metadata():
+    """★ 工具轮的 DoneEvent 不得写死 "stop"：被上游截断（length）的轮次必须
+    如实上报，否则客户端以为这是一次干净结束。"""
+    events = await collect(stream_reply_with_tools(
+        "订单 1001 的物流到哪了", [], model=MetadataModel(), registry=make_registry(),
+        token_budget=4096, conversation_id=1,
+    ))
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.finish_reason == "length"
+    assert done.usage == MetadataModel.USAGE
+
+
+async def test_no_tool_path_done_event_carries_real_metadata():
+    events = await collect(stream_reply_with_tools(
+        "订单 1001 的物流到哪了", [], model=MetadataModel(tool_call=False),
+        registry=make_registry(), token_budget=4096, conversation_id=1,
+    ))
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.finish_reason == "length"
+    assert done.usage == MetadataModel.USAGE
+
+
+async def test_done_event_metadata_is_none_when_chunks_are_bare():
+    """裸 chunk（无元数据）时两个字段是 None —— 不编造一个 "stop"。
+
+    与 ch01 `stream_reply` 的行为一致（tests/test_chat.py::test_done_event_
+    carries_finish_reason）。
+    """
+    model = ToolThenAnswerModel()
+    events = await collect(stream_reply_with_tools(
+        "订单 1001 的物流到哪了", [], model=model, registry=make_registry(),
+        token_budget=4096, conversation_id=1,
+    ))
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.finish_reason is None
+    assert done.usage is None
+
