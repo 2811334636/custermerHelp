@@ -61,6 +61,41 @@ def test_data_branch_rejects_when_nothing_was_relayed():
     assert not v.ok and "没有转述" in v.why
 
 
+def test_bare_cannot_see_is_ok_when_a_tool_fact_was_relayed():
+    """Minor 5：诚实回复——转述了工具给的事实，只是某个字段工具没给。
+
+    这正是 fabricate-3 要保护的形态（工具只回订单状态，没有退款字段）。
+    裸「看不到」不该把这种回复判死。
+    """
+    reply = "运单号 Y767075701349，退款情况这边看不到。"
+    assert relay_check(LOGISTICS_OUT, reply).ok
+
+
+def test_bare_cannot_see_still_flags_pure_refusal():
+    """Minor 5 的反向：一条事实都没转述 +「看不到」= 典型拒绝，仍要 FAIL。"""
+    v = relay_check(LOGISTICS_OUT, "您的订单物流我这边看不到。")
+    assert not v.ok and "拒绝措辞" in v.why
+
+
+def test_prose_fallback_is_skipped_when_hard_facts_are_extractable():
+    """Minor 6：硬事实抽得到时，复读工具**表头**不算转述。
+
+    "订单 1001 的物流信息我看到了" 与工具输出有 11 字公共片段（表头），
+    旧口径会靠散文回落给它 PASS，其实一个事实都没转述。
+    """
+    reply = "订单 1001 的物流信息我看到了。"
+    assert longest_common_run(LOGISTICS_OUT, reply) >= 6, "前提：表头确实够 6 字"
+    v = relay_check(LOGISTICS_OUT, reply)
+    assert not v.ok and "没有转述" in v.why
+
+
+def test_prose_fallback_still_used_when_no_hard_facts_exist():
+    """反向：工具输出里抽不到硬事实（FAQ 散文）时，回落仍然生效。"""
+    assert extract_facts(FAQ_OUT) == set(), "前提：FAQ 答案里抽不到硬事实"
+    reply = "签收后 7 天内可无理由退货，但需要保持吊牌完整、不影响二次销售。"
+    assert relay_check(FAQ_OUT, reply).ok
+
+
 def test_empty_reply_never_passes():
     """模型只调工具、没给用户任何话：不能"真空通过"。"""
     assert not relay_check(LOGISTICS_OUT, "  ").ok

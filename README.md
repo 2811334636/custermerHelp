@@ -76,6 +76,12 @@ uv run python -m evals.run_evals       # 评估集（Prompt 行为 + 抽取准�
 uv run python -m evals.run_tool_evals  # ch02 工具选择 + 结果转述评估集
 ```
 
+**退出码会因模型抖动而偶发变红。** `run_evals` 的口径是「Prompt 15/15 且抽取字段级
+≥90%」，判据本身是确定性的（禁用词正则 / 长度上限 / 语义下限 / 转述），但它**打的是
+真实模型**：实测约每 7 次 run 里有 1 次掉到 14/15——是模型某一条的措辞或长度抖了
+（行为用例里 150 字上限那条最常触发），**不是代码回归**。红了先重跑一次再下结论；
+同理，一次绿也不代表稳定。`run_tool_evals` 走同一个模型，一样会抖。
+
 两个评估集都连 `customer_service_test`（先跑 `uv run python -m scripts.seed` 建库灌种子）。
 
 测试库的留痕是**跨 run 有界**，不是「跑完不留痕」：`/api/chat` 路由会**真提交**本轮写入

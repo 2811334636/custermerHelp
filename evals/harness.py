@@ -192,8 +192,14 @@ async def open_test_db():
 
 # ------------------------------------------------------------ 确定性转述判据
 
-# 工具明明返回了数据、客服却说"看不到/查不到"——旧 Prompt 的典型失效模式
-REFUSAL_PATTERNS = ["看不到", "无法查询", "没法帮您查", "查询不到您的"]
+# 工具明明返回了数据、客服却说"看不到/查不到"——旧 Prompt 的典型失效模式。
+REFUSAL_PATTERNS = ["无法查询", "没法帮您查", "查询不到您的"]
+
+# 裸「看不到」单独处理（修复轮 · Minor 5）：它是**口语**，光凭它定罪会误伤
+# 如实回复。实测要保护的那条诚实行为正是 fabricate-3 的回复——工具只回了订单
+# 状态、没有退款字段，模型如实说"退款情况这边看不到"是对的。所以它只在回复
+# **一条工具事实都没转述**时才算罪证：既没转述、又说看不到 = 典型拒绝。
+BARE_REFUSAL_PATTERN = "看不到"
 
 # 工具"没查到"时的返回文案。★ 拒绝措辞只在**工具确实返回了数据**时才是罪证：
 # 工具自己说"没有找到/暂时不可用"时，模型回一句"这边查不到"是**如实转述**，
@@ -285,8 +291,9 @@ def relay_check(
 
     分支：
     - 工具返回了数据 → 回复里必须出现工具给过的具体事实（单号/金额/日期/轨迹
-      城市…）或与工具输出有 ≥ prose_min 字的公共片段（faq 散文答案走这条），
-      且不得用"看不到"这类拒绝措辞，也不得出现工具没给过的日期/时刻/金额；
+      城市…）；**只有**工具输出里抽不到任何硬事实时（FAQ 散文答案）才回落成
+      "与工具输出有 ≥ prose_min 字的公共片段"。且不得用"看不到"这类拒绝措辞，
+      也不得出现工具没给过的日期/时刻/金额；
     - 工具没返回数据（查不到 / 库没绑）→ 回复里不得**声称办成了**。工具说办不到
       而客服说"已为您转人工"，就是编造。
     """
@@ -294,16 +301,34 @@ def relay_check(
         return RelayVerdict(False, "最终回复为空")
 
     if returned_data(tool_output):
+        facts = extract_facts(tool_output)
+        relayed = any(f in reply for f in facts)
+
+        # 拒绝措辞：明确的那几条无条件算；裸「看不到」只在"一条事实都没转述"
+        # 时才算（见 BARE_REFUSAL_PATTERN 处的说明）——否则会把如实回复判死。
         hit = [p for p in REFUSAL_PATTERNS if p in reply]
+        if not relayed and BARE_REFUSAL_PATTERN in reply:
+            hit.append(BARE_REFUSAL_PATTERN)
         if hit:
             return RelayVerdict(False, f"工具返回了数据却回拒绝措辞 {hit}")
-        facts = extract_facts(tool_output)
-        if not any(f in reply for f in facts):
+
+        if facts:
+            # ★ 硬事实抽得到时**不许**回落散文判据（修复轮 · Minor 6）：
+            #   回落只看最长公共片段，而工具输出的**表头**（"物流信息""运单号"）
+            #   就能凑够 6 字——一条只复读表头、什么事实都没给的回复会蒙混过关。
+            #   有硬事实可对账，就只认真事实。
+            if not relayed:
+                return RelayVerdict(
+                    False,
+                    f"没有转述工具给出的任何具体事实（工具给了 {sorted(facts)[:4]}…）",
+                )
+        else:
+            # 工具输出里抽不到任何硬事实（FAQ 散文答案）→ 才走散文回落。
             run = longest_common_run(tool_output, reply)
             if run < prose_min:
                 return RelayVerdict(
                     False,
-                    f"没有转述工具输出的任何内容（工具给了 {sorted(facts)[:4]}…；"
+                    f"没有转述工具输出的任何内容（工具输出里抽不到硬事实；"
                     f"最长公共片段仅 {run} 字，下限 {prose_min}）",
                 )
         fake = fabricated_facts(reply, tool_output)
