@@ -1073,7 +1073,11 @@ async def test_tool_messages_survive_roundtrip(db_session):
     from langchain_core.messages import AIMessage, ToolMessage
 
     store = MySQLSessionStore(session=db_session)
-    calls = [{"id": "c1", "name": "query_order", "args": {"order_id": "1001"}}]
+    # ★ 必须带 "type": "tool_call"：langchain-core 1.6.3 的 AIMessage 构造时
+    # 会规范化 tool_calls（注入 type 并重排键序），不带 type 的字面量与读出
+    # 结果永远不相等。Task 4/5 都实测踩到过。
+    calls = [{"id": "c1", "name": "query_order",
+              "args": {"order_id": "1001"}, "type": "tool_call"}]
     await store.append(
         "u1",
         AIMessage(content="", tool_calls=calls),
@@ -1197,6 +1201,38 @@ def get_store(db: AsyncSession = Depends(get_db)) -> SessionStore:
     return MySQLSessionStore(session=db)
 ```
 
+**并且给 `chat` 路由加上 `db` 参数与提交**（Ruling 2）：
+
+```python
+@router.post("/chat")
+async def chat(
+    req: ChatRequest,
+    store: SessionStore = Depends(get_store),
+    db: AsyncSession = Depends(get_db),     # ★ 新增：本路由要靠它提交
+) -> StreamingResponse:
+    ...
+```
+
+`event_stream` 的 `finally` 里，在写完消息之后提交：
+
+```python
+        finally:
+            if completed:
+                await store.append(
+                    session_id,
+                    HumanMessage(req.message),
+                    AIMessage("".join(collected)),
+                )
+                # ★ 必须提交：get_db 退出时会回滚未提交的工作，不提交则整轮
+                # 都不落库。而 Task 5 的测试覆盖了 get_store（用内存桩），
+                # 结构上测不出这个缺失——所以这条不能漏。
+                await db.commit()
+```
+
+**中止的轮次**（客户端断开、上游出错）：`completed` 为假 → 整块跳过 → `get_db` 退出时回滚 → **会话行与消息都不落库**。这正是 ch01 就有的"断线不写半截历史"语义，必须保住。
+
+> **注意**：`db` 是无条件的 `Depends(get_db)`，生产路径下永远不为 `None`。**不要在实现里加 `if db is not None` 这类守卫**——那是为了让测试桩能通过而污染生产代码。测试应当覆盖 `get_db` 为一个带 `commit()` 的桩（见 Step 5）。
+
 - [ ] **Step 5: 改 `tests/test_api.py` 的桩**
 
 把 `InMemorySessionStore(...)` 换成 fake：
@@ -1220,11 +1256,28 @@ class FakeStore:
 
 fixture 里 `app.dependency_overrides[get_store] = lambda: store`，并把 `store.get(sid)` 断言改成 `await store.get(sid)`（测试函数改成 `async def`）。
 
-**同时**：因为路由现在依赖 `get_db`，测试必须覆盖它，否则会真连数据库。fixture 里加：
+**同时**：路由现在也依赖 `get_db`（为了提交），所以测试必须覆盖它，否则会真连数据库。用一个**带 `commit()` 的桩**，而不是 `lambda: None`：
 
 ```python
-    app.dependency_overrides[get_db] = lambda: None   # get_store 已被覆盖，get_db 不会被真正使用
+class FakeDbSession:
+    """路由只调它的 commit()。用桩而不是 None——生产代码里出现
+    `if db is not None` 这类守卫生，就是为了迁就一个不诚实的测试替身。
+    """
+
+    def __init__(self):
+        self.commits = 0
+
+    async def commit(self):
+        self.commits += 1
 ```
+
+fixture 里：
+
+```python
+    app.dependency_overrides[get_db] = FakeDbSession
+```
+
+这样既能断言"完成的轮次确实提交了"，也不用在生产代码里加任何守卫。
 
 - [ ] **Step 6: 跑测试确认通过**
 
