@@ -1,6 +1,51 @@
-# 电商智能客服 · ch01 纯对话 → ch02 Function Calling 工具链
+# 电商智能客服 · ch01 纯对话 → ch02 Function Calling → ch03 知识库与向量检索
 
-## ch02 · Function Calling 工具链（当前章节）
+## ch03 · 知识库与向量检索（当前章节）
+
+`query_faq` 的内部实现从关键词查表升级为 Milvus dense 向量语义检索，工具的
+名称、入参、出参契约保持不变。知识来自 Markdown 手册、存量 FAQ 表与从历史
+对话挖掘的问答对。
+
+### 启动
+
+```bash
+docker compose up -d                  # MySQL + Milvus Standalone
+uv run python -m scripts.seed         # 灌 FAQ 种子 + 建测试库
+uv run python -m jobs.build_knowledge # 切分 + 向量化
+uv run python -m evals.run_kb_evals   # 检索质量评估
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+**首次在干净机器上启动前先读「已知限制」里的 MinIO 条目**：官方镜像已下架，
+`docker compose up -d` 依赖本机已有该 tag 的缓存，且**不要**执行
+`docker compose pull`。
+
+### 知识来源
+
+| 来源 | 内容 | content_type |
+|---|---|---|
+| `knowledge/*.md` | 政策手册、商品 FAQ、平台规则 | `policy` |
+| `faq` 表 | 存量 12 条 FAQ | `faq` |
+| `mined_qa_staging` | 从历史对话挖掘的问答对 | `mined` |
+
+### 定时任务
+
+```bash
+# 每天凌晨 3 点挖一次历史对话
+0 3 * * * cd /home/zzx/custermerHelp && uv run python -m jobs.mine_knowledge && uv run python -m jobs.build_knowledge
+```
+
+### 已知限制
+
+- 只用 dense 向量单路，无关键词/混合/重排
+- 文档编辑后旧 chunk 的向量不自动清理（孤儿向量）
+- 检索质量依赖知识内容本身是否写完整（见 spec §3.2 的实测对比）
+- **MinIO 镜像只能从本机缓存获取**：`minio/minio:RELEASE.2024-05-28T17-19-04Z`
+  已从公共仓库下架；干净机器需自备同版本镜像，且不要执行 `docker compose pull`。
+- **挖掘任务的零产出对话会重复处理**：抽取结果为 0 条的对话不会留下暂存行，
+  每次 cron 都会重新送 LLM。
+
+## ch02 · Function Calling 工具链（上一章）
 
 在 ch01 的对话链路上加一层工具链：模型自己决定调哪个工具，再按工具返回的结果作答。
 工具调用在聊天页上可见（助手气泡上方的徽章）。
