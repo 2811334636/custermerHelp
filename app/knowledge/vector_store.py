@@ -43,6 +43,13 @@ class VectorStore:
 
     def upsert(self, ids: list[str], vectors: list[list[float]]) -> None:
         """按主键幂等写入；重复 upsert 同一 id 不会产生重复行。"""
+        # zip 会按较短序列静默截断，导致部分 id/向量被悄悄丢弃。
+        if len(ids) != len(vectors):
+            raise ValueError(
+                f"ids 与 vectors 数量不一致：{len(ids)} != {len(vectors)}"
+            )
+        if not ids:
+            return
         rows = [{"id": i, "vector": v} for i, v in zip(ids, vectors)]
         try:
             self._client.upsert(self._collection, rows)
@@ -53,7 +60,13 @@ class VectorStore:
         """返回相似度从高到低的 chunk id，最多 top_k 条。"""
         try:
             res = self._client.search(
-                self._collection, data=[vector], limit=top_k, output_fields=["id"]
+                self._collection,
+                data=[vector],
+                limit=top_k,
+                output_fields=["id"],
+                # 显式指定，不依赖服务端默认：索引是 AUTOINDEX/COSINE。
+                anns_field="vector",
+                metric_type="COSINE",
             )
         except Exception as exc:  # noqa: BLE001
             raise VectorStoreUnavailable(str(exc)) from exc

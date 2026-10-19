@@ -35,6 +35,11 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     for i in range(0, len(texts), s.embed_batch_size):
         batch = texts[i : i + s.embed_batch_size]
         vectors = await _embed_batch(batch)
+        if len(vectors) != len(batch):
+            # 少返回或多返回都会让向量与文本错位，必须在进入下游前挡住。
+            raise ValueError(
+                f"embedding 返回数量不符：期望 {len(batch)}，实际 {len(vectors)}"
+            )
         for v in vectors:
             if len(v) != s.embedding_dim:
                 raise EmbeddingDimensionError(

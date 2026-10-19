@@ -32,12 +32,17 @@ def test_milvus_failure_is_wrapped():
         make_store(client).search([0.0] * 1024, top_k=3)
 
 
-def test_search_passes_top_k_and_requests_id_field():
+def test_search_passes_top_k_and_explicit_retrieval_params():
     client = MagicMock()
     client.search.return_value = []
     assert make_store(client).search([0.0] * 1024, top_k=7) == []
     client.search.assert_called_once_with(
-        "knowledge", data=[[0.0] * 1024], limit=7, output_fields=["id"]
+        "knowledge",
+        data=[[0.0] * 1024],
+        limit=7,
+        output_fields=["id"],
+        anns_field="vector",
+        metric_type="COSINE",
     )
 
 
@@ -86,6 +91,21 @@ def test_upsert_sends_rows():
         "knowledge",
         [{"id": "a", "vector": [0.0] * 1024}, {"id": "b", "vector": [1.0] * 1024}],
     )
+
+
+def test_upsert_rejects_mismatched_lengths():
+    """zip 会静默截断；ids 与 vectors 数量不符必须响亮失败。"""
+    client = MagicMock()
+    with pytest.raises(ValueError) as exc:
+        make_store(client).upsert(["a", "b"], [[0.0] * 1024])
+    assert "2" in str(exc.value) and "1" in str(exc.value)
+    client.upsert.assert_not_called()
+
+
+def test_empty_upsert_is_noop():
+    client = MagicMock()
+    make_store(client).upsert([], [])
+    client.upsert.assert_not_called()
 
 
 def test_upsert_failure_is_wrapped():

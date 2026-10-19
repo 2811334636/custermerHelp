@@ -24,6 +24,18 @@ async def test_embed_texts_rejects_wrong_dim(monkeypatch):
     assert "512" in str(exc.value) and "1024" in str(exc.value)
 
 
+async def test_embed_texts_rejects_wrong_batch_cardinality(monkeypatch):
+    """返回条数与本批输入数不一致时必须报错，否则向量会与文本错位。"""
+
+    async def fake(texts):
+        return [[0.0] * 1024]
+
+    monkeypatch.setattr("app.knowledge.embedding._embed_batch", fake)
+    with pytest.raises(ValueError) as exc:
+        await embed_texts(["甲", "乙"])
+    assert "2" in str(exc.value) and "1" in str(exc.value)
+
+
 async def test_embed_texts_batches_and_preserves_input_order(monkeypatch):
     """按 embed_batch_size 分批，且输出顺序与输入严格一致。"""
     import app.knowledge.embedding as mod
