@@ -37,13 +37,15 @@ def test_search_passes_top_k_and_explicit_retrieval_params():
     client.search.return_value = []
     assert make_store(client).search([0.0] * 1024, top_k=7) == []
     client.search.assert_called_once_with(
-        "knowledge",
+        collection_name="knowledge",
         data=[[0.0] * 1024],
+        anns_field="vector",
+        search_params={"metric_type": "COSINE"},
         limit=7,
         output_fields=["id"],
-        anns_field="vector",
-        metric_type="COSINE",
     )
+    # 裸 metric_type= 会被 pymilvus 3.0.2 接受但静默忽略，不能出现。
+    assert "metric_type" not in client.search.call_args.kwargs
 
 
 def test_ensure_collection_creates_schema_and_cosine_index():

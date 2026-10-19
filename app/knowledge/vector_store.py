@@ -60,13 +60,14 @@ class VectorStore:
         """返回相似度从高到低的 chunk id，最多 top_k 条。"""
         try:
             res = self._client.search(
-                self._collection,
+                collection_name=self._collection,
                 data=[vector],
+                anns_field="vector",
+                # metric_type 必须放进 search_params：pymilvus 3.0.2 接受裸
+                # metric_type= 但会静默忽略，从而退回索引/服务端默认。
+                search_params={"metric_type": "COSINE"},
                 limit=top_k,
                 output_fields=["id"],
-                # 显式指定，不依赖服务端默认：索引是 AUTOINDEX/COSINE。
-                anns_field="vector",
-                metric_type="COSINE",
             )
         except Exception as exc:  # noqa: BLE001
             raise VectorStoreUnavailable(str(exc)) from exc
