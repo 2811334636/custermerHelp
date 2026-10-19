@@ -11,6 +11,10 @@
 本章的核心风险是**盲的**——它会给两个行为截然不同的 Prompt 打同样的满分，
 等于一条恒绿的测试。本章真正要防的是"调了但不用"。
 
+★ query_faq 已改为向量检索，本脚本的 FAQ 内容检查依赖已建库的数据；
+  检索质量请以 `evals.run_kb_evals` 为准。评估库 knowledge_chunks 为空时
+  脚本会直接以退出码 2 报错，而不是在弱判据上假绿。
+
 ★ 2026-09-20 修复轮起有两处结构性改动（详见 evals/harness.py 顶部注释）：
   · 回合**直接驱动 app/chat.py 的 stream_reply_with_tools**，不再自己复刻一遍；
   · 工具接**真库**（spec §5.6 的 customer_service_test），faq/工单不再一律回
@@ -22,7 +26,9 @@ import sys
 from pathlib import Path
 
 import yaml
+from sqlalchemy import func, select
 
+from app.db.models import KnowledgeChunk
 from app.providers import get_chat_model
 from app.repositories import faq as faq_repo
 from app.tools import build_registry
@@ -99,6 +105,21 @@ async def main() -> int:
 
     results = []
     async with open_test_db() as (session, conversation_id):
+        # query_faq 已改为向量检索：Milvus 里的向量来自生产库，若本评估库的
+        # knowledge_chunks 为空，每次检索都会是孤儿向量 → 工具一律回"没有找到"，
+        # FAQ 内容判据被整体跳过、转述检查落到弱分支，脚本会假绿。宁可响亮失败。
+        count = (
+            await session.execute(select(func.count()).select_from(KnowledgeChunk))
+        ).scalar_one()
+        if count == 0:
+            print(
+                "错误：当前评估库的 knowledge_chunks 为空，query_faq 的检索检查无法进行。\n"
+                "请先对同一数据库建库（见 jobs.build_knowledge），或改用 "
+                "evals.run_kb_evals 做检索质量评估。",
+                file=sys.stderr,
+            )
+            return 2
+
         registry = build_registry(session=session)
         for c in cases:
             turn = await run_production_turn(

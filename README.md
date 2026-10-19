@@ -74,7 +74,8 @@ ch02 的验收在浏览器里做：打开聊天页，问「订单 1001 的物流
 uv run pytest -q                       # 单元测试
 uv run python -m evals.run_evals       # 评估集（Prompt 行为 + 抽取准确率）
 uv run python -m evals.run_tool_evals  # ch02 工具选择 + 结果转述评估集
-uv run python -m evals.run_kb_evals    # ch03 检索质量评估（需先建库）
+# ch03 检索质量评估（需先运行 uv run python -m jobs.build_knowledge 建库）
+uv run python -m evals.run_kb_evals
 ```
 
 **退出码会因模型抖动而偶发变红。** `run_evals` 的口径是「Prompt 15/15 且抽取字段级
@@ -83,7 +84,9 @@ uv run python -m evals.run_kb_evals    # ch03 检索质量评估（需先建库�
 （行为用例里 150 字上限那条最常触发），**不是代码回归**。红了先重跑一次再下结论；
 同理，一次绿也不代表稳定。`run_tool_evals` 走同一个模型，一样会抖。
 
-两个评估集都连 `customer_service_test`（先跑 `uv run python -m scripts.seed` 建库灌种子）。
+三个评估集里，`run_evals` 与 `run_tool_evals` 连 `customer_service_test`
+（先跑 `uv run python -m scripts.seed` 建库灌种子）；`run_kb_evals` 直接连生产库与
+Milvus（先跑 `uv run python -m jobs.build_knowledge` 建库）。
 
 测试库的留痕是**跨 run 有界**，不是「跑完不留痕」：`/api/chat` 路由会**真提交**本轮写入
 （commit 不可撤销），每个驱动真路由的用例都会留下自己的会话行/消息行。所以每次 pytest
