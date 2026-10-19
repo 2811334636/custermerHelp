@@ -167,6 +167,12 @@ async def dedupe_and_import(session) -> tuple[int, int]:
     imported = dropped = 0
     for row in staged:
         key = normalize(row.question)
+        # 纯标点/空白问题规范化后是空串：不能当知识入库，否则第一条会变成
+        # 真实 chunk、后续全被当成它的重复。直接丢弃。
+        if not key:
+            row.status = "已丢弃"
+            dropped += 1
+            continue
         if key in seen:
             row.status = "已丢弃"
             dropped += 1

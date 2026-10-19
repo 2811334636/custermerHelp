@@ -22,13 +22,13 @@ def test_normalize_is_case_insensitive():
 
 
 async def test_dedupe_within_batch(db_session):
-    db_session.add_all([
-        MinedQaStaging(question="邮费是多少？", answer="A", category="咨询"),
-        MinedQaStaging(question=" 邮费是多少 ", answer="A", category="咨询"),
-    ])
+    first = MinedQaStaging(question="邮费是多少？", answer="A", category="咨询")
+    duplicate = MinedQaStaging(question=" 邮费是多少 ", answer="A", category="咨询")
+    db_session.add_all([first, duplicate])
     await db_session.flush()
     imported, dropped = await dedupe_and_import(db_session)
     assert (imported, dropped) == (1, 1)
+    assert (first.status, duplicate.status) == ("已入库", "已丢弃")
 
 
 async def test_dedupe_against_existing_chunks(db_session):
@@ -54,6 +54,16 @@ async def test_imported_rows_become_pending_chunks(db_session):
 
     staging = list((await db_session.execute(select(MinedQaStaging))).scalars())
     assert staging[0].status == "已入库"
+
+
+async def test_punctuation_only_question_is_discarded(db_session):
+    db_session.add(MinedQaStaging(question="？！。", answer="无效", category="咨询"))
+    await db_session.flush()
+    imported, dropped = await dedupe_and_import(db_session)
+    assert (imported, dropped) == (0, 1)
+
+    rows = list((await db_session.execute(select(KnowledgeChunk))).scalars())
+    assert rows == []
 
 
 async def test_dedupe_import_reuses_existing_chunk_and_keeps_vectorized_status(db_session):
