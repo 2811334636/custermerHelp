@@ -4,6 +4,7 @@ def test_ch04_config_fields():
 
     s = Settings()
     assert s.reranker_base_url == "https://api.siliconflow.cn/v1"
+    assert s.reranker_api_key == ""
     assert s.reranker_model == "bge-reranker-v2-m3"
     assert s.retrieval_dense_top_k == 50
     assert s.retrieval_bm25_top_k == 50
