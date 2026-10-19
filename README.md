@@ -74,6 +74,7 @@ ch02 的验收在浏览器里做：打开聊天页，问「订单 1001 的物流
 uv run pytest -q                       # 单元测试
 uv run python -m evals.run_evals       # 评估集（Prompt 行为 + 抽取准确率）
 uv run python -m evals.run_tool_evals  # ch02 工具选择 + 结果转述评估集
+uv run python -m evals.run_kb_evals    # ch03 检索质量评估（需先建库）
 ```
 
 **退出码会因模型抖动而偶发变红。** `run_evals` 的口径是「Prompt 15/15 且抽取字段级
