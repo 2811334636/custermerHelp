@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.config import get_settings
 from app.db.models import KnowledgeChunk
 from app.knowledge.builder import build
-from app.knowledge.chunk import Chunk
+from app.knowledge.chunk import Chunk, format_embedding_text
 from app.repositories import knowledge_chunk as repo
 
 PREFIX = "testbuilder:"
@@ -32,6 +32,11 @@ async def fake_embed(texts):
 
 def chunk(cid, answer="内容。"):
     return Chunk(cid, "分类", "标题", answer, "分类 > 标题", "policy")
+
+
+def test_format_embedding_text_matches_chunk_property():
+    c = chunk("fmt:0")
+    assert format_embedding_text(c.category, c.questions, c.answer) == c.embedding_text
 
 
 @pytest.fixture
@@ -83,11 +88,20 @@ async def test_build_writes_mysql_then_vectors(builder_session):
 
 async def test_rerun_is_idempotent(builder_session):
     store = FakeStore()
+    calls = {"n": 0}
+
+    async def counting_embed(texts):
+        calls["n"] += 1
+        return [[float(len(t))] * 1024 for t in texts]
+
     chunks = [chunk(f"{PREFIX}0"), chunk(f"{PREFIX}1")]
-    await build(builder_session, chunks, store=store, embed=fake_embed)
+    await build(builder_session, chunks, store=store, embed=counting_embed)
+    first = calls["n"]
+    assert first == 1  # 2 条在一个默认批次内
     report = await build(
-        builder_session, chunks, store=store, embed=fake_embed
+        builder_session, chunks, store=store, embed=counting_embed
     )  # 同样的输入再跑
+    assert calls["n"] == first, "重跑不应再调用 embedding"
     assert report.chunks_total == 2
     assert report.chunks_pending == 0
     assert report.vectors_written == 0

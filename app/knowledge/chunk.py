@@ -3,6 +3,11 @@ from dataclasses import dataclass
 from typing import Literal
 
 
+def format_embedding_text(category: str, questions: str, answer: str) -> str:
+    """送去向量化的文本：三字段用换行拼接。唯一格式定义处。"""
+    return f"{category}\n{questions}\n{answer}"
+
+
 @dataclass(frozen=True)
 class Chunk:
     chunk_id: str
@@ -17,8 +22,8 @@ class Chunk:
 
     @property
     def embedding_text(self) -> str:
-        """送去向量化的文本：三字段用换行拼接。"""
-        return f"{self.category}\n{self.questions}\n{self.answer}"
+        """送去向量化的文本。"""
+        return format_embedding_text(self.category, self.questions, self.answer)
 
     @property
     def content_hash(self) -> str:

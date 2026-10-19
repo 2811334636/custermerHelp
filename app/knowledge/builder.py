@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.knowledge.chunk import Chunk
+from app.knowledge.chunk import Chunk, format_embedding_text
 from app.knowledge.embedding import embed_texts
 from app.knowledge.vector_store import VectorStore
 from app.repositories import knowledge_chunk as repo
@@ -54,10 +54,12 @@ async def build(
     written = 0
     for i in range(0, len(pending), effective_batch_size):
         batch = pending[i : i + effective_batch_size]
-        # list_pending 返回的是 ORM 行而非领域 Chunk；文本格式必须与
-        # Chunk.embedding_text 一致（category/questions/answer 换行拼接），
-        # 否则重排后算出的 content_hash 与这里送去向量化的内容会脱节。
-        texts = [f"{c.category}\n{c.questions}\n{c.answer}" for c in batch]
+        # list_pending 返回的是 ORM 行而非领域 Chunk。格式统一走
+        # format_embedding_text，保证与 Chunk.embedding_text / content_hash
+        # 使用同一份定义，不会随重构漂移。
+        texts = [
+            format_embedding_text(c.category, c.questions, c.answer) for c in batch
+        ]
         vectors = await embed(texts)
 
         ids = [c.chunk_id for c in batch]
