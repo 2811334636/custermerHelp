@@ -16,6 +16,9 @@ venv/
 evals/out/
 *.eval-report.json
 
+# 容器持久化目录（etcd / minio）
+volumes/
+
 # 编辑器
 .vscode/
 .idea/

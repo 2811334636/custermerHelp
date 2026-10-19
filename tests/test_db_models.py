@@ -4,8 +4,11 @@ from app.db.base import Base
 from app.db import models  # noqa: F401  确保模型被注册进 metadata
 
 
-def test_four_tables_registered():
-    assert set(Base.metadata.tables) == {"conversations", "messages", "faq", "tickets"}
+def test_all_tables_registered():
+    assert set(Base.metadata.tables) == {
+        "conversations", "messages", "faq", "tickets",
+        "knowledge_chunks", "mined_qa_staging",
+    }
 
 
 def test_conversations_has_session_uuid_unique():
@@ -28,6 +31,28 @@ def test_messages_has_fk_to_conversations():
     t = Base.metadata.tables["messages"]
     fks = {fk.target_fullname for fk in t.foreign_keys}
     assert "conversations.id" in fks
+
+
+def test_knowledge_tables_registered():
+    t = Base.metadata.tables
+    assert "knowledge_chunks" in t
+    assert "mined_qa_staging" in t
+
+
+def test_knowledge_chunk_columns():
+    cols = set(Base.metadata.tables["knowledge_chunks"].columns.keys())
+    assert cols == {
+        "chunk_id", "category", "questions", "answer",
+        "section_path", "content_type", "is_key_clause",
+        "prev_chunk_id", "next_chunk_id",
+        "status", "vector_id", "content_hash",
+        "created_at", "updated_at",
+    }
+
+
+def test_knowledge_chunk_pk_is_chunk_id():
+    t = Base.metadata.tables["knowledge_chunks"]
+    assert [c.name for c in t.primary_key.columns] == ["chunk_id"]
 
 
 async def test_live_ddl_matches_orm_metadata(db_session):

@@ -53,3 +53,39 @@ CREATE TABLE IF NOT EXISTS tickets (
   KEY idx_conversation_id (conversation_id),
   CONSTRAINT fk_tickets_conversation FOREIGN KEY (conversation_id) REFERENCES conversations (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='人工工单';
+
+-- ch03 · 知识库
+
+-- 知识块:MySQL 为权威源,Milvus 只按 chunk_id 存向量
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+  chunk_id      VARCHAR(64)  NOT NULL COMMENT '确定性主键：source:ordinal',
+  category      VARCHAR(255) NOT NULL,
+  questions     VARCHAR(512) NOT NULL,
+  answer        TEXT         NOT NULL,
+  section_path  VARCHAR(512) NOT NULL,
+  content_type  ENUM('policy','faq','mined') NOT NULL,
+  is_key_clause TINYINT(1)   NOT NULL DEFAULT 0,
+  prev_chunk_id VARCHAR(64)  NULL,
+  next_chunk_id VARCHAR(64)  NULL,
+  status        ENUM('待向量化','已向量化') NOT NULL DEFAULT '待向量化',
+  vector_id     VARCHAR(64)  NULL COMMENT '回填的 Milvus 主键',
+  content_hash  CHAR(64)     NOT NULL COMMENT 'embedding 文本的 sha256',
+  created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (chunk_id),
+  KEY idx_status (status),
+  KEY idx_content_type (content_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 挖掘暂存区:LLM 从会话中抽出的问答候选,人审/去重后进 knowledge_chunks
+CREATE TABLE IF NOT EXISTS mined_qa_staging (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  question        VARCHAR(512) NOT NULL,
+  answer          TEXT         NOT NULL,
+  category        VARCHAR(64)  NOT NULL,
+  conversation_id BIGINT UNSIGNED NULL,
+  status          ENUM('待入库','已入库','已丢弃') NOT NULL DEFAULT '待入库',
+  created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
