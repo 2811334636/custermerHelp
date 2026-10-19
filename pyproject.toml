@@ -15,6 +15,7 @@ dependencies = [
     "openai>=3.15.0",
     "sqlalchemy[asyncio]>=2.0.54",
     "aiomysql>=0.3.2",
+    "pymilvus>=3.0.2",
 ]
 
 [dependency-groups]

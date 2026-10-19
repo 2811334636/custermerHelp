@@ -36,6 +36,17 @@ class Settings(BaseSettings):
     tool_timeout_s: float = Field(default=3.0, gt=0)
     tool_max_retries: int = Field(default=2, ge=0)
 
+    embedding_base_url: str = "https://api.siliconflow.cn/v1"
+    embedding_api_key: str = ""
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_dim: int = Field(default=1024, gt=0)
+    milvus_uri: str = "http://127.0.0.1:19530"
+    milvus_collection: str = "knowledge"
+    retrieval_top_k: int = Field(default=3, gt=0)
+    chunk_max_chars: int = Field(default=400, gt=0)
+    chunk_overlap_chars: int = Field(default=80, ge=0)
+    embed_batch_size: int = Field(default=16, gt=0)
+
     @field_validator("llm_extra_body")
     @classmethod
     def _validate_extra_body(cls, v: str) -> str:

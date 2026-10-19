@@ -74,3 +74,30 @@ def test_extra_body_must_be_json_object(monkeypatch):
     monkeypatch.setenv("APP_LLM_EXTRA_BODY", "[1,2]")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_knowledge_defaults():
+    from app.config import Settings
+
+    s = Settings(_env_file=None)
+    assert s.embedding_base_url == "https://api.siliconflow.cn/v1"
+    assert s.embedding_model == "BAAI/bge-m3"
+    assert s.embedding_dim == 1024
+    assert s.milvus_uri == "http://127.0.0.1:19530"
+    assert s.milvus_collection == "knowledge"
+    assert s.retrieval_top_k == 3
+    assert s.chunk_max_chars == 400
+    assert s.chunk_overlap_chars == 80
+    assert s.embed_batch_size == 16
+
+
+def test_chunk_params_must_be_sane():
+    import pytest
+    from pydantic import ValidationError
+
+    from app.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, chunk_max_chars=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, chunk_overlap_chars=-1)
