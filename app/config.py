@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     chunk_overlap_chars: int = Field(default=80, ge=0)
     embed_batch_size: int = Field(default=16, gt=0)
 
+    reranker_base_url: str = "https://api.siliconflow.cn/v1"
+    reranker_api_key: str = ""
+    reranker_model: str = "bge-reranker-v2-m3"
+    retrieval_dense_top_k: int = Field(default=50, gt=0)
+    retrieval_bm25_top_k: int = Field(default=50, gt=0)
+    retrieval_rerank_top_k: int = Field(default=10, gt=0)
+    retrieval_rerank_threshold: float = Field(default=0.5, ge=0, le=1)
+    retrieval_strategy: str = Field(default="hybrid_rerank", pattern="^(dense|bm25|hybrid|hybrid_rerank)$")
+    rerank_arrangement_strategy: str = Field(default="first_last", pattern="^(score_desc|first_last)$")
+
     @field_validator("llm_extra_body")
     @classmethod
     def _validate_extra_body(cls, v: str) -> str:
