@@ -81,9 +81,12 @@ services:
     ports:
       - "19530:19530"
       - "9091:9091"
+    # 长语法：等 etcd / MinIO 真正可服务后再启动 Milvus，避免启动即连不上。
     depends_on:
-      - etcd
-      - minio
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     # Milvus 官方 compose 携带此参数；缺了会因容器默认 seccomp 起不来。
     security_opt:
       - "seccomp:unconfined"

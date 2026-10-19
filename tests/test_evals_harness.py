@@ -36,6 +36,12 @@ FAQ_OUT = (
 )
 FAQ_MISS_OUT = "没有找到与「邮费」相关的常见问题。可以换个说法，或帮你转人工客服。"
 
+# ch03 的 query_faq 输出格式：问：<2–4 字章节名> / 答：<散文>
+FAQ_SECTION_OUT = (
+    "问：运费说明\n"
+    "答：因商品质量问题导致的退换货，往返运费由平台承担。"
+)
+
 
 def test_extract_facts_pulls_waybill_amount_date_city():
     facts = extract_facts(LOGISTICS_OUT)
@@ -94,6 +100,18 @@ def test_prose_fallback_still_used_when_no_hard_facts_exist():
     assert extract_facts(FAQ_OUT) == set(), "前提：FAQ 答案里抽不到硬事实"
     reply = "签收后 7 天内可无理由退货，但需要保持吊牌完整、不影响二次销售。"
     assert relay_check(FAQ_OUT, reply).ok
+
+
+def test_faq_section_name_is_not_a_hard_fact():
+    """ch03 回归：2–4 字章节名不能命中行尾状态正则。
+
+    「问：运费说明」会匹配 `[：:]([一-龥]{2,4})$`，旧逻辑于是把「运费说明」
+    当成工具事实，要求回复逐字出现；模型换了说法就被判 FAIL。问题的章节名
+    是排版，不是业务事实。
+    """
+    assert extract_facts(FAQ_SECTION_OUT) == set()
+    reply = "商品质量问题的退换货，往返运费由平台承担。"
+    assert relay_check(FAQ_SECTION_OUT, reply).ok
 
 
 def test_empty_reply_never_passes():

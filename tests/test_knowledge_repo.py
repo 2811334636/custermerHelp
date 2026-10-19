@@ -166,6 +166,49 @@ async def test_mark_vectorized_empty_is_noop(db_session):
     assert [p.chunk_id for p in await repo.list_pending(db_session)] == ["a:0"]
 
 
+async def test_mark_vectorized_keeps_row_pending_when_hash_changed(db_session):
+    """final review I3：读到 hash H1、写入前文本已变成 H2 时不能标完成。
+
+    模拟并发建库：A 读到旧内容并生成 H1 向量；B 在这期间改了文本（hash
+    变为 H2）；A 回填状态时带 expected_hashes=[H1]，UPDATE 命中 0 行。
+    该块必须保持【待向量化】，否则会出现「MySQL 新文本 + Milvus 旧向量」。
+    """
+    await repo.upsert_chunks(db_session, [make_chunk("a:0", answer="旧内容。")])
+    stale_hash = make_chunk("a:0", answer="旧内容。").content_hash
+
+    # B 的写入：文本变了，hash 变化，状态重置为待向量化。
+    await repo.upsert_chunks(db_session, [make_chunk("a:0", answer="新内容。")])
+
+    await repo.mark_vectorized(
+        db_session, ["a:0"], ["a:0"], expected_hashes=[stale_hash]
+    )
+
+    row = (await repo.get_by_ids(db_session, ["a:0"]))[0]
+    assert row.answer == "新内容。"
+    assert row.status == "待向量化", "hash 已变，不能被旧批次的回填标成已完成"
+    assert row.vector_id is None
+
+
+async def test_mark_vectorized_rejects_mismatched_expected_hashes(db_session):
+    await repo.upsert_chunks(db_session, [make_chunk("a:0")])
+    with pytest.raises(ValueError, match="expected_hashes"):
+        await repo.mark_vectorized(
+            db_session, ["a:0"], ["a:0"], expected_hashes=[]
+        )
+    row = (await repo.get_by_ids(db_session, ["a:0"]))[0]
+    assert row.status == "待向量化"
+
+
+async def test_get_by_ids_can_filter_to_vectorized(db_session):
+    await repo.upsert_chunks(db_session, [make_chunk("a:0"), make_chunk("a:1")])
+    await repo.mark_vectorized(db_session, ["a:1"], ["a:1"])
+
+    rows = await repo.get_by_ids(
+        db_session, ["a:0", "a:1"], status=repo.VECTORIZED
+    )
+    assert [r.chunk_id for r in rows] == ["a:1"]
+
+
 async def test_counts(db_session):
     # 用增量断言，不依赖库里的绝对条数（其他测试可能 commit 过数据）
     before_all = await repo.count_all(db_session)

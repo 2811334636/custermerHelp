@@ -1,8 +1,12 @@
-from sqlalchemy import func, select
+import logging
+
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import KnowledgeChunk
 from app.knowledge.chunk import Chunk
+
+logger = logging.getLogger(__name__)
 
 PENDING = "待向量化"
 VECTORIZED = "已向量化"
@@ -81,49 +85,93 @@ async def list_pending(session: AsyncSession) -> list[KnowledgeChunk]:
 
 
 async def mark_vectorized(
-    session: AsyncSession, chunk_ids: list[str], vector_ids: list[str]
+    session: AsyncSession,
+    chunk_ids: list[str],
+    vector_ids: list[str],
+    expected_hashes: list[str] | None = None,
 ) -> None:
     """把 chunk 标为已向量化并写入对应 vector_id。
 
     ★ 先整体校验再写：长度不一致或出现未知 chunk_id 都抛 ValueError。
       未知 id 意味着 builder 的写入顺序有问题，静默跳过会让缺口永远不被发现
       （重跑时该块仍是待向量化，但调用方以为已经完成）。
-      一次 SELECT 取回全部行后再校验、再改内存对象。
+
+    ★ expected_hashes（并发安全，final review I3）：builder 传它**实际送去
+      向量化时**读到的 content_hash。写入条件加上 ``content_hash = ?``：
+      如果另一个进程在建库期间改了文本，这里的 UPDATE 命中 0 行，该块保持
+      【待向量化】——绝不会出现「MySQL 是新文本、Milvus 是旧向量、状态却
+      显示已完成」的静默不一致。命中 0 行的 id 只记日志，不整体失败。
     """
     if len(chunk_ids) != len(vector_ids):
         raise ValueError(
             f"chunk_ids 与 vector_ids 长度不一致：{len(chunk_ids)} != {len(vector_ids)}"
         )
+    if expected_hashes is not None and len(expected_hashes) != len(chunk_ids):
+        raise ValueError(
+            "chunk_ids 与 expected_hashes 长度不一致："
+            f"{len(chunk_ids)} != {len(expected_hashes)}"
+        )
     if not chunk_ids:
         return
 
-    stmt = select(KnowledgeChunk).where(KnowledgeChunk.chunk_id.in_(chunk_ids))
-    rows_by_id = {
-        row.chunk_id: row for row in (await session.execute(stmt)).scalars()
-    }
-    missing = [cid for cid in chunk_ids if cid not in rows_by_id]
+    # 用列查询而不是实体查询：下面走 Core UPDATE，避免 identity map 里的
+    # 旧对象与数据库状态各说各话。
+    stmt = select(KnowledgeChunk.chunk_id).where(
+        KnowledgeChunk.chunk_id.in_(chunk_ids)
+    )
+    existing = set((await session.execute(stmt)).scalars())
+    missing = [cid for cid in chunk_ids if cid not in existing]
     if missing:
         raise ValueError(f"mark_vectorized 收到未知 chunk_id：{', '.join(missing)}")
 
-    for chunk_id, vector_id in zip(chunk_ids, vector_ids):
-        row = rows_by_id[chunk_id]
-        row.status = VECTORIZED
-        row.vector_id = vector_id
+    if expected_hashes is None:
+        for chunk_id, vector_id in zip(chunk_ids, vector_ids):
+            await session.execute(
+                update(KnowledgeChunk)
+                .where(KnowledgeChunk.chunk_id == chunk_id)
+                .values(status=VECTORIZED, vector_id=vector_id)
+                .execution_options(synchronize_session="fetch")
+            )
+        await session.flush()
+        return
 
+    skipped: list[str] = []
+    for chunk_id, vector_id, expected_hash in zip(
+        chunk_ids, vector_ids, expected_hashes
+    ):
+        result = await session.execute(
+            update(KnowledgeChunk)
+            .where(
+                KnowledgeChunk.chunk_id == chunk_id,
+                KnowledgeChunk.content_hash == expected_hash,
+            )
+            .values(status=VECTORIZED, vector_id=vector_id)
+            .execution_options(synchronize_session="fetch")
+        )
+        if result.rowcount == 0:
+            skipped.append(chunk_id)
+    if skipped:
+        logger.warning(
+            "以下 chunk 的内容在建库期间已变化，保持待向量化等待重跑：%s",
+            ", ".join(skipped),
+        )
     await session.flush()
 
 
 async def get_by_ids(
-    session: AsyncSession, chunk_ids: list[str]
+    session: AsyncSession, chunk_ids: list[str], *, status: str | None = None
 ) -> list[KnowledgeChunk]:
-    """按 id 批量取行；未知 id 直接缺席，不报错。结果按 chunk_id 排序。"""
+    """按 id 批量取行；未知 id 直接缺席，不报错。结果按 chunk_id 排序。
+
+    ``status`` 可选过滤：在线检索传【已向量化】，避免内容变更后、重跑补齐前
+    的窗口里把「新文本 + 旧向量」返回给模型（final review M11）。
+    """
     if not chunk_ids:
         return []
-    stmt = (
-        select(KnowledgeChunk)
-        .where(KnowledgeChunk.chunk_id.in_(chunk_ids))
-        .order_by(KnowledgeChunk.chunk_id)
-    )
+    stmt = select(KnowledgeChunk).where(KnowledgeChunk.chunk_id.in_(chunk_ids))
+    if status is not None:
+        stmt = stmt.where(KnowledgeChunk.status == status)
+    stmt = stmt.order_by(KnowledgeChunk.chunk_id)
     return list((await session.execute(stmt)).scalars())
 
 

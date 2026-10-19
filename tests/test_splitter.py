@@ -167,3 +167,33 @@ def test_top_level_section_uses_heading_as_category_fallback():
     chunks = split_markdown(text, source_key="top.md")
     assert chunks[0].category == "退货政策"
     assert chunks[0].questions == "退货政策"
+
+
+def test_document_without_headings_falls_back_to_source_key():
+    """final review M5：没有标题的文档不能让 category 变成空串。"""
+    chunks = split_markdown("没有标题的一段内容。", source_key="plain.md")
+    assert chunks[0].section_path == ""
+    assert chunks[0].category == "plain.md"
+    assert chunks[0].questions == "plain.md"
+
+
+def test_chunk_id_over_mysql_limit_is_rejected():
+    """final review M6：超长 source_key 不能静默截断，也不能拖到写库才报错。"""
+    with pytest.raises(ValueError, match=r"chunk_id.*VARCHAR\(64\)"):
+        split_markdown("# 标题\n\n内容。", source_key="a" * 65)
+
+
+def test_questions_over_mysql_limit_is_rejected():
+    text = "# " + "标" * 513 + "\n\n内容。\n"
+    with pytest.raises(ValueError, match=r"questions.*VARCHAR\(512\)"):
+        split_markdown(text, source_key="ok.md")
+
+
+def test_category_over_mysql_limit_is_rejected():
+    text = (
+        "# " + "甲" * 200 + "\n\n"
+        "## " + "乙" * 200 + "\n\n"
+        "### 叶子\n\n内容。\n"
+    )
+    with pytest.raises(ValueError, match=r"category.*VARCHAR\(255\)"):
+        split_markdown(text, source_key="ok.md")

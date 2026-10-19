@@ -22,8 +22,9 @@ def test_normalize_is_case_insensitive():
 
 
 async def test_dedupe_within_batch(db_session):
-    first = MinedQaStaging(question="邮费是多少？", answer="A", category="咨询")
-    duplicate = MinedQaStaging(question=" 邮费是多少 ", answer="A", category="咨询")
+    marker = "task10-batch-unique 邮费是多少"
+    first = MinedQaStaging(question=f"{marker}？", answer="A", category="咨询")
+    duplicate = MinedQaStaging(question=f" {marker} ", answer="A", category="咨询")
     db_session.add_all([first, duplicate])
     await db_session.flush()
     imported, dropped = await dedupe_and_import(db_session)
@@ -43,26 +44,57 @@ async def test_dedupe_against_existing_chunks(db_session):
 
 
 async def test_imported_rows_become_pending_chunks(db_session):
-    db_session.add(MinedQaStaging(question="能开专票吗", answer="可以。", category="咨询"))
+    # 唯一 marker：测试库可能已有建库留下的 knowledge_chunks，断言必须
+    # 只针对本用例造的那一行（final review I5）。
+    marker = "task10-imported-unique"
+    row = MinedQaStaging(
+        question=f"{marker} 能开专票吗", answer="可以。", category="咨询"
+    )
+    db_session.add(row)
     await db_session.flush()
     await dedupe_and_import(db_session)
 
-    rows = list((await db_session.execute(select(KnowledgeChunk))).scalars())
+    rows = list(
+        (
+            await db_session.execute(
+                select(KnowledgeChunk).where(
+                    KnowledgeChunk.chunk_id == f"mined:{row.id}"
+                )
+            )
+        ).scalars()
+    )
     assert len(rows) == 1
     assert rows[0].content_type == "mined"
     assert rows[0].status == "待向量化"
 
-    staging = list((await db_session.execute(select(MinedQaStaging))).scalars())
+    staging = list(
+        (
+            await db_session.execute(
+                select(MinedQaStaging).where(MinedQaStaging.id == row.id)
+            )
+        ).scalars()
+    )
     assert staging[0].status == "已入库"
 
 
 async def test_punctuation_only_question_is_discarded(db_session):
-    db_session.add(MinedQaStaging(question="？！。", answer="无效", category="咨询"))
+    row = MinedQaStaging(question="？！。", answer="无效", category="咨询")
+    db_session.add(row)
     await db_session.flush()
     imported, dropped = await dedupe_and_import(db_session)
     assert (imported, dropped) == (0, 1)
 
-    rows = list((await db_session.execute(select(KnowledgeChunk))).scalars())
+    # 只断言这一行没有被写进 knowledge_chunks；库里其他已建库的行与
+    # 本用例无关（final review I5）。
+    rows = list(
+        (
+            await db_session.execute(
+                select(KnowledgeChunk).where(
+                    KnowledgeChunk.chunk_id == f"mined:{row.id}"
+                )
+            )
+        ).scalars()
+    )
     assert rows == []
 
 
@@ -74,14 +106,15 @@ async def test_dedupe_import_reuses_existing_chunk_and_keeps_vectorized_status(d
     抽取撞车的历史值，好让去重检查放行、真正走到 upsert 分支；content_hash 与
     待入库内容一致。
     """
-    row = MinedQaStaging(question="能开专票吗", answer="可以。", category="咨询")
+    question = "task10-reuse-unique 能开专票吗"
+    row = MinedQaStaging(question=question, answer="可以。", category="咨询")
     db_session.add(row)
     await db_session.flush()
 
     target = Chunk(
         chunk_id=f"mined:{row.id}",
         category="咨询",
-        questions="能开专票吗",
+        questions=question,
         answer="可以。",
         section_path="咨询",
         content_type="mined",
@@ -100,7 +133,7 @@ async def test_dedupe_import_reuses_existing_chunk_and_keeps_vectorized_status(d
     # 可观察行为：hash 没变 → 状态与 vector_id 原样保留，元数据刷新为本次内容。
     assert after.status == "已向量化"
     assert after.vector_id == "vec-1"
-    assert after.questions == "能开专票吗"
+    assert after.questions == question
 
 
 async def test_rerun_guard_skips_conversation_with_staging_row(db_session):

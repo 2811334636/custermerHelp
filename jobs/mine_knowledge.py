@@ -21,6 +21,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy import select
 
 from app.db.base import AsyncSessionLocal, engine
+from app.db.locks import mysql_named_lock
 from app.db.models import KnowledgeChunk, Message, MinedQaStaging
 from app.knowledge.chunk import Chunk
 from app.knowledge.dedupe import normalize
@@ -199,46 +200,51 @@ async def dedupe_and_import(session) -> tuple[int, int]:
 
 async def main() -> None:
     try:
-        async with AsyncSessionLocal() as session:
-            by_conversation = await load_unmined_conversations(session)
-            print(f"待挖掘会话：{len(by_conversation)} 个")
+        # 同一把命名锁：两个 cron 同时跑会重复抽同一批会话、重复付费。
+        async with mysql_named_lock("knowledge_mine") as acquired:
+            if not acquired:
+                print("另一个挖掘任务正在运行（knowledge_mine 锁被占用），本次退出。")
+                return
+            async with AsyncSessionLocal() as session:
+                by_conversation = await load_unmined_conversations(session)
+                print(f"待挖掘会话：{len(by_conversation)} 个")
 
-            model = get_chat_model(temperature=0)
-            processed = 0
-            for conversation_id, messages in by_conversation.items():
-                try:
-                    pairs = await extract_conversation(messages, model=model)
-                except Exception:
-                    # 单个会话失败不能拖垮整个 cron 任务；本会话不写 staging，
-                    # 下次运行会重新尝试。
-                    logger.exception("会话 %s 抽取失败，跳过", conversation_id)
-                    await session.rollback()
-                    continue
+                model = get_chat_model(temperature=0)
+                processed = 0
+                for conversation_id, messages in by_conversation.items():
+                    try:
+                        pairs = await extract_conversation(messages, model=model)
+                    except Exception:
+                        # 单个会话失败不能拖垮整个 cron 任务；本会话不写 staging，
+                        # 下次运行会重新尝试。
+                        logger.exception("会话 %s 抽取失败，跳过", conversation_id)
+                        await session.rollback()
+                        continue
 
-                for pair in pairs:
-                    session.add(
-                        MinedQaStaging(
-                            question=pair["question"][:512],
-                            answer=pair["answer"],
-                            category=pair["category"][:64],
-                            conversation_id=conversation_id,
+                    for pair in pairs:
+                        session.add(
+                            MinedQaStaging(
+                                question=pair["question"][:512],
+                                answer=pair["answer"],
+                                category=pair["category"][:64],
+                                conversation_id=conversation_id,
+                            )
                         )
-                    )
 
-                try:
-                    # 逐会话提交：成功的会话立刻落库，失败的不影响其他会话。
-                    await session.commit()
-                    processed += 1
-                except Exception:
-                    logger.exception("会话 %s 写入暂存表失败，跳过", conversation_id)
-                    await session.rollback()
+                    try:
+                        # 逐会话提交：成功的会话立刻落库，失败的不影响其他会话。
+                        await session.commit()
+                        processed += 1
+                    except Exception:
+                        logger.exception("会话 %s 写入暂存表失败，跳过", conversation_id)
+                        await session.rollback()
 
-            imported, dropped = await dedupe_and_import(session)
-            await session.commit()
-            print(
-                f"挖掘完成：处理 {processed} 个会话，"
-                f"入库 {imported}，去重丢弃 {dropped}"
-            )
+                imported, dropped = await dedupe_and_import(session)
+                await session.commit()
+                print(
+                    f"挖掘完成：处理 {processed} 个会话，"
+                    f"入库 {imported}，去重丢弃 {dropped}"
+                )
     finally:
         # 与 jobs/build_knowledge.py 一致：显式释放全局异步引擎，避免解释器
         # 关闭时 aiomysql 连接被 GC 回收而打出 "Event loop is closed"。

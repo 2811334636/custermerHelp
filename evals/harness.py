@@ -244,8 +244,15 @@ def _normalize(text: str) -> str:
 
 def extract_facts(tool_output: str) -> set[str]:
     found: set[str] = set()
+    # ★ 「问：<章节名>」是 query_faq 的排版行，不是业务事实。ch03 的章节名
+    # 常是 2–4 字（运费说明/退货政策/换货流程），会命中行尾状态正则
+    # `[：:]([一-龥]{2,4})$`，把正确转述判成「没转述事实」。FAQ 答案是散文，
+    # 应该走 prose 回落，而不是被问题的标题带进硬事实分支。
+    text = "\n".join(
+        line for line in tool_output.splitlines() if not line.strip().startswith("问：")
+    )
     for pattern in _FACT_PATTERNS:
-        for m in re.finditer(pattern, tool_output, re.MULTILINE):
+        for m in re.finditer(pattern, text, re.MULTILINE):
             found.add(m.group(1) if m.groups() else m.group(0))
     return found
 

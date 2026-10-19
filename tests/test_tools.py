@@ -135,6 +135,83 @@ async def test_query_faq_degrades_when_milvus_down(db_session, monkeypatch):
     assert "暂时不可用" in out.content
 
 
+# ---------------------------------------------------------------------------
+# C1 回归：不 mock retrieval.search，走真实的「构造 Milvus / 调 embedding」路径
+# ---------------------------------------------------------------------------
+
+
+async def test_query_faq_degrades_when_milvus_constructor_raises_raw(
+    db_session, monkeypatch
+):
+    """Milvus 不可达时 MilvusClient 抛原生异常，必须在构造处包装成降级。
+
+    这里不打桩 retrieval.search：只让真实 VectorStore 构造时拿到一个
+    抛 pymilvus 原生 MilvusException 的 MilvusClient。旧实现会让异常直接
+    冒到 registry（ok=False），本用例即红。
+    """
+    from pymilvus.exceptions import MilvusException
+
+    import app.knowledge.vector_store as vector_store
+
+    def raw_boom(*args, **kwargs):
+        raise MilvusException("connection refused")
+
+    monkeypatch.setattr(vector_store, "MilvusClient", raw_boom)
+    reg = build_registry(session=db_session)
+    out = await reg.execute(
+        "query_faq", {"keyword": "邮费"}, "c-raw-construct", conversation_id=1
+    )
+    assert out.ok is True
+    assert "知识库暂时不可用" in out.content
+
+
+async def test_query_faq_degrades_when_milvus_search_raises_raw(
+    db_session, monkeypatch
+):
+    """真实 store.search 抛原生 MilvusException 时也要降级。"""
+    from pymilvus.exceptions import MilvusException
+
+    import app.knowledge.vector_store as vector_store
+
+    class RawClient:
+        def search(self, **kwargs):
+            raise MilvusException("rpc error")
+
+    monkeypatch.setattr(vector_store, "MilvusClient", lambda uri: RawClient())
+    reg = build_registry(session=db_session)
+    out = await reg.execute(
+        "query_faq", {"keyword": "邮费"}, "c-raw-search", conversation_id=1
+    )
+    assert out.ok is True
+    assert "知识库暂时不可用" in out.content
+
+
+async def test_query_faq_degrades_when_embedding_upstream_fails(
+    db_session, monkeypatch
+):
+    """embedding 上游连接失败时返回降级文案，而不是工具失败。"""
+    import app.knowledge.embedding as embedding
+    import app.knowledge.retrieval as retrieval
+
+    class FakeStore:
+        def search(self, vector, top_k):
+            return []
+
+    class BoomClient:
+        async def aembed_documents(self, texts):
+            raise ConnectionError("embedding upstream down")
+
+    monkeypatch.setattr(retrieval, "VectorStore", lambda: FakeStore())
+    monkeypatch.setattr(embedding, "_client", lambda: BoomClient())
+
+    reg = build_registry(session=db_session)
+    out = await reg.execute(
+        "query_faq", {"keyword": "邮费"}, "c-embed-down", conversation_id=1
+    )
+    assert out.ok is True
+    assert "知识库暂时不可用" in out.content
+
+
 async def test_create_ticket_writes_row_and_updates_conversation(db_session):
     from app.repositories import conversation as conv_repo
 

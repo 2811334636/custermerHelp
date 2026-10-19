@@ -9,18 +9,26 @@
   input: 1001 这个订单买的什么
   expect_tools: [query_order]
   expect_args_contain: {query_order: "1001"}
+# ch03 起 query_faq 是语义检索：FAQ 用例的内容判据改为
+# expect_faq_contains —— 该片段必须存在于 knowledge_chunks 中、出现在
+# query_faq 的工具输出里，并被模型如实转述（见 run_tool_evals.check_faq_content）。
 - id: faq-hit-1
   input: 退货政策是什么
   expect_tools: [query_faq]
   expect_args_contain: {query_faq: "退货"}
+  expect_faq_contains: "签收后 7 天内可无理由退货"
 - id: faq-hit-2
   input: 怎么开发票
   expect_tools: [query_faq]
   expect_args_contain: {query_faq: "发票"}
-- id: faq-miss-1
+  expect_faq_contains: "电子发票会在 3 个工作日内"
+# ch02 时这是「邮费」漏召回（faq 表没有该词）；ch03 语义检索应命中
+# 「运费说明」——同义说法正是这一章要验证的能力。
+- id: faq-synonym-1
   input: 邮费政策是什么
   expect_tools: [query_faq]
   expect_args_contain: {query_faq: "邮费"}
+  expect_faq_contains: "往返运费由平台承担"
 - id: chitchat-1
   input: 你好
   expect_tools: []

@@ -11,9 +11,12 @@
 本章的核心风险是**盲的**——它会给两个行为截然不同的 Prompt 打同样的满分，
 等于一条恒绿的测试。本章真正要防的是"调了但不用"。
 
-★ query_faq 已改为向量检索，本脚本的 FAQ 内容检查依赖已建库的数据；
-  检索质量请以 `evals.run_kb_evals` 为准。评估库 knowledge_chunks 为空时
-  脚本会直接以退出码 2 报错，而不是在弱判据上假绿。
+★ query_faq 已改为向量检索，本脚本的 FAQ 内容判据基于
+  `knowledge_chunks` 的期望答案原文（不再查 `faq` 表的 LIKE），且要求
+  该库与它的 Milvus 集合**显式配对**（测试库必须配独立的 *_test 集合）。
+  评估库为空、集合为空或两者条数不一致时，脚本以退出码 2 明确失败，
+  而不是把生产向量静默 join 到测试库的行上。检索质量仍以
+  `evals.run_kb_evals` 为准。
 
 ★ 2026-09-20 修复轮起有两处结构性改动（详见 evals/harness.py 顶部注释）：
   · 回合**直接驱动 app/chat.py 的 stream_reply_with_tools**，不再自己复刻一遍；
@@ -26,11 +29,14 @@ import sys
 from pathlib import Path
 
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import select
+from sqlalchemy.engine import make_url
 
+from app.config import get_settings
 from app.db.models import KnowledgeChunk
+from app.knowledge.vector_store import VectorStore, VectorStoreUnavailable
 from app.providers import get_chat_model
-from app.repositories import faq as faq_repo
+from app.repositories.knowledge_chunk import count_vectorized
 from app.tools import build_registry
 from evals.harness import (
     PROSE_MIN_RUN,
@@ -38,9 +44,10 @@ from evals.harness import (
     longest_common_run,
     open_test_db,
     relay_check,
-    returned_data,
     run_production_turn,
+    test_db_url,
 )
+
 
 ROOT = Path(__file__).parent
 
@@ -65,27 +72,41 @@ JUDGE_TEMPLATE = """你在核对一个电商客服机器人有没有如实转述
 
 
 async def check_faq_content(session, case: dict, turn) -> tuple[bool, str]:
-    """faq 用例的加强判据（修复轮 · Important 3）：回复里要出现**库里答案**的内容。
+    """FAQ 用例的加强判据（final review I2）：基于 `knowledge_chunks` 的期望原文。
 
-    两层，都是确定性的：
-      ① 工具返回的就是 faq 表里的答案原文 —— 证明确实查到了库，不是编的；
-      ② 回复与答案原文的最长公共片段 ≥ PROSE_MIN_RUN —— 证明真的转述给了用户。
-    只从用例的 `expect_args_contain` 取关键词，不额外写死数据。
+    三层，都是确定性的：
+      ① 用例标注的期望片段确实存在于当前库的 knowledge_chunks 中
+         —— 否则是用例与知识库脱节，必须响亮失败；
+      ② 工具输出里出现该片段 —— 证明语义检索真的召回了期望知识块，
+         而不是答非所问；
+      ③ 回复与该块 answer 的最长公共片段 ≥ PROSE_MIN_RUN —— 证明模型
+         把召回内容如实转述给了用户。
     """
-    keyword = (case.get("expect_args_contain") or {}).get("query_faq")
-    if not keyword:
+    needle = case.get("expect_faq_contains")
+    if not needle:
         return True, ""
-    rows = await faq_repo.search_by_keyword(session, keyword)
-    if not rows:
-        return False, f"库里没有 question 含「{keyword}」的 FAQ 行，用例与种子数据已脱节"
-    answer = rows[0].answer
-    if answer not in turn.tool_output:
-        return False, f"工具输出里没有 faq 表的答案原文（关键词「{keyword}」）——工具没真查库？"
-    run = longest_common_run(answer, turn.final_text)
+    stmt = (
+        select(KnowledgeChunk)
+        .where(KnowledgeChunk.answer.contains(needle))
+        .order_by(KnowledgeChunk.chunk_id)
+        .limit(1)
+    )
+    row = (await session.execute(stmt)).scalars().first()
+    if row is None:
+        return False, (
+            f"评估期望「{needle}」在 knowledge_chunks 中不存在——"
+            "用例与已建知识库已脱节，请先按 README 建库"
+        )
+    if needle not in turn.tool_output:
+        return False, (
+            f"检索没有返回含「{needle}」的知识块（期望 top-3 命中 {row.chunk_id}）"
+            "——query_faq 的检索结果不对"
+        )
+    run = longest_common_run(row.answer, turn.final_text)
     if run < PROSE_MIN_RUN:
         return False, (
-            f"回复没转述 faq 答案内容（与答案原文最长公共片段仅 {run} 字，"
-            f"下限 {PROSE_MIN_RUN}）：{answer[:30]}…"
+            f"回复没转述召回的知识内容（与答案原文最长公共片段仅 {run} 字，"
+            f"下限 {PROSE_MIN_RUN}）：{row.answer[:30]}…"
         )
     return True, ""
 
@@ -105,20 +126,59 @@ async def main() -> int:
 
     results = []
     async with open_test_db() as (session, conversation_id):
-        # query_faq 已改为向量检索：Milvus 里的向量来自生产库，若本评估库的
-        # knowledge_chunks 为空，每次检索都会是孤儿向量 → 工具一律回"没有找到"，
-        # FAQ 内容判据被整体跳过、转述检查落到弱分支，脚本会假绿。宁可响亮失败。
-        count = (
-            await session.execute(select(func.count()).select_from(KnowledgeChunk))
-        ).scalar_one()
-        if count == 0:
+        # ★ 一库一集合，配置必须显式配对（Ruling 9）。测试库若仍指向生产
+        # 集合 `knowledge`，条数可能碰巧相同，但向量与行来自不同库——
+        # 这正是最隐蔽的错配，必须在跑用例前挡住。
+        db_name = make_url(test_db_url()).database or ""
+        collection = get_settings().milvus_collection
+        if db_name.endswith("_test") and not collection.endswith("_test"):
             print(
-                "错误：当前评估库的 knowledge_chunks 为空，query_faq 的检索检查无法进行。\n"
-                "请先对同一数据库建库（见 jobs.build_knowledge），或改用 "
+                f"错误：评估库 {db_name} 必须配独立的 Milvus 集合，"
+                f"当前 APP_MILVUS_COLLECTION={collection!r}。\n"
+                "请用 APP_MILVUS_COLLECTION=knowledge_test 对该测试库建库后，"
+                "在同一个环境变量下重跑本脚本（见 README）。",
+                file=sys.stderr,
+            )
+            return 2
+
+        # query_faq 已改为向量检索：若评估库为空或集合为空，检索会一律
+        # 落空/变孤儿，内容判据被整体跳过、脚本假绿。宁可响亮失败。
+        db_count = await count_vectorized(session)
+        if db_count == 0:
+            print(
+                f"错误：评估库 {db_name} 的 knowledge_chunks 没有【已向量化】行，"
+                "query_faq 的检索检查无法进行。\n"
+                "请先对同一数据库建库（见 README 的测试库建库命令），或改用 "
                 "evals.run_kb_evals 做检索质量评估。",
                 file=sys.stderr,
             )
             return 2
+
+        try:
+            store = await asyncio.to_thread(VectorStore)
+            vector_count = await asyncio.to_thread(store.count)
+        except VectorStoreUnavailable as exc:
+            print(
+                f"错误：无法连接 Milvus 集合 {collection!r}：{exc}\n"
+                "请确认 Milvus 已启动，且 APP_MILVUS_COLLECTION 与该库建库时一致。",
+                file=sys.stderr,
+            )
+            return 2
+
+        if vector_count != db_count:
+            print(
+                f"错误：数据库与 Milvus 集合不配对：库 {db_name} 已向量化 "
+                f"{db_count} 行，集合 {collection!r} 有 {vector_count} 个实体。\n"
+                "请用与建库相同的 APP_MILVUS_COLLECTION 重跑本脚本；"
+                "不要拿生产向量 join 测试库的行。",
+                file=sys.stderr,
+            )
+            return 2
+
+        print(
+            f"知识库配对检查：库 {db_name} 已向量化 {db_count} == "
+            f"集合 {collection!r} 实体 {vector_count}"
+        )
 
         registry = build_registry(session=session)
         for c in cases:
@@ -156,15 +216,16 @@ async def main() -> int:
                 verdict = relay_check(turn.tool_output, turn.final_text)
                 relay_passed, relay_why = verdict.ok, verdict.why
 
-                # faq 用例加一层「回复里有库里答案」的判据。
-                # ★ 只在**工具真的查到了数据**时用：faq-miss 这类用例库里本来
-                # 就没有那一行，走的是"查不到"分支，不该拿"没有对应 FAQ 行"判它失败。
-                if (
-                    relay_passed
-                    and returned_data(turn.tool_output)
-                    and "query_faq" in (c.get("expect_args_contain") or {})
-                ):
-                    relay_passed, relay_why = await check_faq_content(session, c, turn)
+                # FAQ 用例加一层「检索召回/回复转述」的判据。
+                # ★ 只要用例标了 expect_faq_contains 就检查，不因
+                # returned_data() 为假而跳过——检索没命中正是要抓的失败。
+                if "expect_faq_contains" in c:
+                    content_ok, content_why = await check_faq_content(session, c, turn)
+                    if not content_ok:
+                        relay_passed = False
+                        relay_why = "；".join(
+                            x for x in (relay_why, content_why) if x
+                        )
 
                 # judge 只作参考（见 harness 的说明：它系统性判错，不进闸门）
                 judged = await judge_model.ainvoke(

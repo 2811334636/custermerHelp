@@ -1,0 +1,62 @@
+# ch03 · 对话挖知识抽取质量评估（spec §12.4，final review I4）
+#
+# 5 段短对话，每段都含可复用知识 + 一次性订单/地址细节。
+# 判据是确定性的关键词/事实包含，不要求措辞与标注完全一致：
+#   - expect[].question_any：抽出的 question 必须含其中任意一个词
+#   - expect[].answer_any：抽出的 answer 必须含其中任意一个词
+#   - forbid_contains：这些一次性细节不得出现在任何抽出的问答里
+# 一段对话可以有多条期望，每条都要被某个抽出的问答对命中。
+- id: mining-1-return-shipping
+  label: 退货运费
+  conversation: |
+    user: 我上周买的跑步鞋不合脚，订单 20261015001，想退货。寄回去的邮费谁出？
+    assistant: 因个人原因（比如尺码不合适）发起的退换货，寄回运费需要您自行承担；如果是商品质量问题，往返运费由平台承担。您的订单 20261015001 可以在订单页直接申请售后。
+  expect:
+    - question_any: [运费, 邮费, 退货运费]
+      answer_any: [自行承担, 平台承担]
+  forbid_contains: ["20261015001"]
+
+- id: mining-2-invoice
+  label: 发票开具与改抬头
+  conversation: |
+    user: 订单 20261016002 收到了，怎么开发票？抬头写错了还能改吗？
+    assistant: 订单完成后在订单详情页点「申请开票」，填写抬头和税号，电子发票会在 3 个工作日内发到您的邮箱。电子发票未开具前可以修改抬头；已开具的需要先冲红再重开，请联系人工客服。
+  expect:
+    - question_any: [发票, 开票]
+      answer_any: [申请开票, 3 个工作日, 邮箱]
+    - question_any: [抬头, 发票]
+      answer_any: [冲红, 重开, 人工客服]
+  forbid_contains: ["20261016002"]
+
+- id: mining-3-delivery
+  label: 发货时效
+  conversation: |
+    user: 我买的 T 恤什么时候发货？收货地址是杭州市西湖区文三路 88 号。
+    assistant: 现货商品会在付款后 48 小时内发出；预售商品以商品页标注的发货时间为准。收货地址不影响发货时效。
+  expect:
+    - question_any: [发货, 多久, 什么时候]
+      answer_any: [48 小时, 付款后, 预售]
+  forbid_contains: ["文三路", "88 号", "西湖区"]
+
+- id: mining-4-price-protection
+  label: 价保
+  conversation: |
+    user: 我 3 天前买的耳机，订单 20261017003，现在降价了，能退差价吗？
+    assistant: 支持 15 天价保：下单后 15 天内同商品官方渠道降价，可以申请退还差价。价保申请必须在降价发生后 15 天内提交，逾期不再受理。
+  expect:
+    - question_any: [价保, 差价, 降价]
+      answer_any: [15 天, 退还差价]
+  forbid_contains: ["20261017003"]
+
+- id: mining-5-exchange
+  label: 换货流程
+  conversation: |
+    user: 衣服买大了一码，订单 20261018004，想换成 M 码，怎么操作？
+    assistant: 在订单页点「申请售后」选换货，填写要更换的规格。换货商品寄回验收后我们会重新发货。衣服可以按胸围和身高对照表选码。
+  expect:
+    # 「一码」覆盖真实抽取里常见的「换小一码/换大一码」说法；
+    # 首跑时模型抽出的正是「衣服买大了想换小一码怎么操作？」，事实完全
+    # 正确，只是标注的关键词过窄（spec §12.4：措辞可不同，事实要一致）。
+    - question_any: [换货, 换码, 尺码, 一码]
+      answer_any: [申请售后, 更换, 重新发货]
+  forbid_contains: ["20261018004"]

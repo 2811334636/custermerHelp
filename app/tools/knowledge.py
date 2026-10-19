@@ -6,7 +6,7 @@
 from langchain_core.tools import tool
 
 from app.knowledge import retrieval
-from app.knowledge.vector_store import VectorStoreUnavailable
+from app.knowledge.errors import KnowledgeBackendUnavailable
 from app.tools.context import current_context
 
 
@@ -25,7 +25,9 @@ async def query_faq(keyword: str) -> str:
 
     try:
         hits = await retrieval.search(session, keyword)
-    except VectorStoreUnavailable:
+    except KnowledgeBackendUnavailable:
+        # Milvus 与 embedding 上游都在这个基类下：基础设施故障一律降级，
+        # 不让 ToolRegistry 把它当成工具故障重试/回灌错误码。
         return "知识库暂时不可用，请稍后再试或转人工客服。"
 
     if not hits:

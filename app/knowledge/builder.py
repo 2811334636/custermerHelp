@@ -24,11 +24,14 @@ async def build(
     embed=embed_texts,
     fail_after: int | None = None,
     batch_size: int | None = None,
+    only_ids: set[str] | None = None,
 ) -> BuildReport:
     """双写：MySQL 记【待向量化】→ Milvus upsert → 回填状态。
 
     `batch_size` 覆盖 Settings.embed_batch_size（测试用，便于构造小批次）。
     `fail_after` 仅测试用：累计写入达到该数后抛异常，模拟进程中断。
+    `only_ids` 仅用于测试/定点重建：只处理这些 chunk_id 的待办，避免
+    测试库中已有的其他待办行污染 `chunks_pending` 与写向量条数。
     """
     # 先校验再动手：非法批大小不应留下任何已提交的 MySQL 行。
     if batch_size is not None and batch_size <= 0:
@@ -47,6 +50,8 @@ async def build(
 
     # ② 取待办集（本进程启动时仍待向量化的行；已完成的不会重复处理）
     pending = await repo.list_pending(session)
+    if only_ids is not None:
+        pending = [p for p in pending if p.chunk_id in only_ids]
     if not pending:
         return BuildReport(len(chunks), 0, 0)
 
@@ -63,9 +68,12 @@ async def build(
         vectors = await embed(texts)
 
         ids = [c.chunk_id for c in batch]
+        # 传本次实际读到的 hash：若另一个进程在建库期间改了文本，
+        # mark_vectorized 会命中 0 行并让该块保持待向量化（final review I3）。
+        hashes = [c.content_hash for c in batch]
         store.upsert(ids, vectors)
         # vector_id == chunk_id：Milvus 主键就是 chunk_id。
-        await repo.mark_vectorized(session, ids, ids)
+        await repo.mark_vectorized(session, ids, ids, expected_hashes=hashes)
         await session.commit()
         written += len(batch)
 

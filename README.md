@@ -12,9 +12,15 @@
 docker compose up -d                  # MySQL + Milvus Standalone
 uv run python -m scripts.seed         # 灌 FAQ 种子 + 建测试库
 uv run python -m jobs.build_knowledge # 切分 + 向量化
+uv run python -m scripts.check_kb_consistency  # MySQL 与 Milvus 条数对账
 uv run python -m evals.run_kb_evals   # 检索质量评估
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+> **必须配置 `APP_EMBEDDING_API_KEY`。** ch03 的建库与在线检索都要调
+> embedding 上游；只填 `APP_LLM_API_KEY` 会在第一次
+> `jobs.build_knowledge` 时才失败。配置项见 `.env.example` 的
+> `APP_EMBEDDING_*`。
 
 **首次在干净机器上启动前先读「已知限制」里的 MinIO 条目**：官方镜像已下架，
 `docker compose up -d` 依赖本机已有该 tag 的缓存，且**不要**执行
@@ -26,14 +32,17 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 |---|---|---|
 | `knowledge/*.md` | 政策手册、商品 FAQ、平台规则 | `policy` |
 | `faq` 表 | 存量 12 条 FAQ | `faq` |
-| `mined_qa_staging` | 从历史对话挖掘的问答对 | `mined` |
+| `mined_qa_staging` | 从历史对话挖掘的问答对（由 `mine_knowledge` 去重后写入 `knowledge_chunks`，`build_knowledge` 不再直接读取） | `mined` |
 
 ### 定时任务
 
 ```bash
-# 每天凌晨 3 点挖一次历史对话
-0 3 * * * cd /home/zzx/custermerHelp && uv run python -m jobs.mine_knowledge && uv run python -m jobs.build_knowledge
+# 每天凌晨 3 点挖一次历史对话；把 /path/to/custermerHelp 换成你的仓库根目录
+0 3 * * * cd /path/to/custermerHelp && uv run python -m jobs.mine_knowledge && uv run python -m jobs.build_knowledge
 ```
+
+两个任务都用 MySQL 命名锁（`knowledge_mine` / `knowledge_build`）互斥：
+上一次还没跑完时，本次会打印提示并干净退出，不会重复付费或并发双写。
 
 ### 已知限制
 
@@ -46,6 +55,10 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
   每次 cron 都会重新送 LLM。
 
 ## ch02 · Function Calling 工具链（上一章）
+
+> **本节描述的是 ch02 交付时的行为。** ch03 已把 `query_faq` 从
+> `faq` 表的 `LIKE` 关键词查表替换为 Milvus 向量语义检索；下面表格与
+> 「已知限制」里关于关键词匹配/漏召回的描述仅用于对照历史。
 
 在 ch01 的对话链路上加一层工具链：模型自己决定调哪个工具，再按工具返回的结果作答。
 工具调用在聊天页上可见（助手气泡上方的徽章）。
@@ -72,7 +85,7 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `query_order` | 查订单 | 工具内确定性生成（不接真实系统） |
 | `query_product` | 查商品 | 同上 |
 | `query_logistics` | 查物流 | 同上 |
-| `query_faq` | 查常见问题 | `faq` 表，SQL `LIKE`（**只搜 `question` 列**） |
+| `query_faq` | 查常见问题 | ch02：`faq` 表 SQL `LIKE`；**ch03 已改为向量检索** |
 | `create_ticket` | 建人工工单 | 写 `tickets` 表 + 会话转「已转人工」 |
 
 三个「确定性生成」的工具由订单号/商品号派生种子（`sha256` → `random.Random`），
@@ -121,6 +134,10 @@ uv run python -m evals.run_evals       # 评估集（Prompt 行为 + 抽取准�
 uv run python -m evals.run_tool_evals  # ch02 工具选择 + 结果转述评估集
 # ch03 检索质量评估（需先运行 uv run python -m jobs.build_knowledge 建库）
 uv run python -m evals.run_kb_evals
+# ch03 挖掘抽取质量评估（spec §12.4；调真实 LLM，不写库）
+uv run python -m evals.run_mining_evals
+# ch03 MySQL 已向量化条数 == Milvus 实体数（建库后一键对账）
+uv run python -m scripts.check_kb_consistency
 ```
 
 **退出码会因模型抖动而偶发变红。** `run_evals` 的口径是「Prompt 15/15 且抽取字段级
@@ -129,9 +146,28 @@ uv run python -m evals.run_kb_evals
 （行为用例里 150 字上限那条最常触发），**不是代码回归**。红了先重跑一次再下结论；
 同理，一次绿也不代表稳定。`run_tool_evals` 走同一个模型，一样会抖。
 
-三个评估集里，`run_evals` 与 `run_tool_evals` 连 `customer_service_test`
-（先跑 `uv run python -m scripts.seed` 建库灌种子）；`run_kb_evals` 直接连生产库与
-Milvus（先跑 `uv run python -m jobs.build_knowledge` 建库）。
+四个评估集里，`run_evals` 与 `run_tool_evals` 连 `customer_service_test`
+（先跑 `uv run python -m scripts.seed` 建表灌种子）；`run_kb_evals` 直接连生产库与
+Milvus（先跑 `uv run python -m jobs.build_knowledge` 建库）；`run_mining_evals`
+只调真实 LLM，不读写数据库。
+
+**一个 Milvus 集合只能服务一个 MySQL 库（显式配置）。** `run_tool_evals`
+走 `customer_service_test`，因此测试库必须配独立的集合并先对测试库建库：
+
+```bash
+# 对测试库建库（工作量大的一次性前置；会调用真实 embedding）
+APP_DB_URL='mysql+aiomysql://app:apppw@127.0.0.1:3307/customer_service_test?charset=utf8mb4' \
+APP_MILVUS_COLLECTION=knowledge_test \
+uv run python -m jobs.build_knowledge
+
+# 用同一个集合跑工具评估（脚本会断言测试库已向量化条数 == 集合实体数）
+APP_MILVUS_COLLECTION=knowledge_test \
+uv run python -m evals.run_tool_evals
+```
+
+`run_tool_evals` 在以下情况直接 exit 2，避免把生产向量静默 join 到测试库的行上：
+测试库没有已向量化行、集合为空、两者条数不一致，或测试库配了非 `*_test`
+后缀的集合。
 
 测试库的留痕是**跨 run 有界**，不是「跑完不留痕」：`/api/chat` 路由会**真提交**本轮写入
 （commit 不可撤销），每个驱动真路由的用例都会留下自己的会话行/消息行。所以每次 pytest

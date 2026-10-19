@@ -3,12 +3,13 @@ from typing import Any
 from pymilvus import DataType, MilvusClient
 
 from app.config import get_settings
+from app.knowledge.errors import KnowledgeBackendUnavailable
 
 # chunk_id 目前最长的是 "<文件名>:<序号>"，512 足够且留有充分余量。
 _ID_MAX_LENGTH = 512
 
 
-class VectorStoreUnavailable(RuntimeError):
+class VectorStoreUnavailable(KnowledgeBackendUnavailable):
     """Milvus 读写失败（连接、超时、服务端错误等）。"""
 
 
@@ -21,7 +22,16 @@ class VectorStore:
         dim: int | None = None,
     ):
         s = get_settings()
-        self._client = client if client is not None else MilvusClient(uri=s.milvus_uri)
+        if client is not None:
+            self._client = client
+        else:
+            # MilvusClient 构造时会等待 channel ready（默认约 10s），连不上
+            # 抛的是 pymilvus/gRPC 原生异常。必须在构造处就转成我们自己的
+            # 类型，否则 query_faq 的降级分支永远走不到（final review C1）。
+            try:
+                self._client = MilvusClient(uri=s.milvus_uri)
+            except Exception as exc:  # noqa: BLE001
+                raise VectorStoreUnavailable(str(exc)) from exc
         self._collection = collection if collection is not None else s.milvus_collection
         self._dim = dim if dim is not None else s.embedding_dim
 

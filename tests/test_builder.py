@@ -75,10 +75,17 @@ async def _vectorized(session) -> int:
     return (await session.execute(stmt)).scalar_one()
 
 
+def ids(chunks) -> set[str]:
+    return {c.chunk_id for c in chunks}
+
+
 async def test_build_writes_mysql_then_vectors(builder_session):
     store = FakeStore()
     chunks = [chunk(f"{PREFIX}0"), chunk(f"{PREFIX}1")]
-    report = await build(builder_session, chunks, store=store, embed=fake_embed)
+    report = await build(
+        builder_session, chunks, store=store, embed=fake_embed,
+        only_ids=ids(chunks),
+    )
     assert report.chunks_total == 2
     assert report.chunks_pending == 2
     assert report.vectors_written == 2
@@ -95,11 +102,15 @@ async def test_rerun_is_idempotent(builder_session):
         return [[float(len(t))] * 1024 for t in texts]
 
     chunks = [chunk(f"{PREFIX}0"), chunk(f"{PREFIX}1")]
-    await build(builder_session, chunks, store=store, embed=counting_embed)
+    await build(
+        builder_session, chunks, store=store, embed=counting_embed,
+        only_ids=ids(chunks),
+    )
     first = calls["n"]
     assert first == 1  # 2 条在一个默认批次内
     report = await build(
-        builder_session, chunks, store=store, embed=counting_embed
+        builder_session, chunks, store=store, embed=counting_embed,
+        only_ids=ids(chunks),
     )  # 同样的输入再跑
     assert calls["n"] == first, "重跑不应再调用 embedding"
     assert report.chunks_total == 2
@@ -122,13 +133,15 @@ async def test_interrupted_build_resumes(builder_session):
             embed=fake_embed,
             fail_after=2,
             batch_size=2,
+            only_ids=ids(chunks),
         )
 
     assert store.count() == 2
     assert await _vectorized(builder_session) == 2
 
     report = await build(
-        builder_session, chunks, store=store, embed=fake_embed, batch_size=2
+        builder_session, chunks, store=store, embed=fake_embed, batch_size=2,
+        only_ids=ids(chunks),
     )
     assert report.chunks_total == 5
     assert report.chunks_pending == 3

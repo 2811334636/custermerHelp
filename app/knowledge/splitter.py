@@ -233,9 +233,10 @@ def split_markdown(
 
     for block in _parse_blocks(text):
         path = " > ".join(block.section_path)
-        # 顶层标题没有上级路径：回退为自身 heading。确定性、非空；
-        # heading 在 embedding_text 中重复出现无害（spec §5.5 裁决）。
-        category = " > ".join(block.section_path[:-1]) or path
+        # 顶层标题没有上级路径：回退为自身 heading；整篇没有标题时连 path
+        # 都是空串，再回退到 source_key。确定性、非空（Ruling 6 的延伸，
+        # final review M5）。
+        category = " > ".join(block.section_path[:-1]) or path or source_key
         questions = block.section_path[-1] if block.section_path else source_key
 
         if block.kind == "table":

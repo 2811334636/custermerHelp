@@ -1,11 +1,24 @@
-"""Task 0 阻塞性探测：embedding 客户端兼容性 + Milvus 客户端/服务端匹配。"""
+"""Task 0 阻塞性探测：embedding 客户端兼容性 + Milvus 客户端/服务端匹配。
+
+重跑时必须能复现「语义可分」的结论，而不只是维度正确：生产配置已确认
+必须关闭 check_embedding_ctx_length，且「邮费是多少」与运费说明文本的
+cosine 应明显高于无关文本（final review M4）。
+"""
 
 import asyncio
+import math
 import time
 
 from pymilvus import DataType, MilvusClient
 
 from app.config import get_settings
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
 
 
 def probe_milvus() -> None:
@@ -56,6 +69,9 @@ async def probe_embedding() -> None:
         base_url=s.embedding_base_url,
         api_key=s.embedding_api_key,
         model=s.embedding_model,
+        # ★ 与生产 app/knowledge/embedding.py 保持一致：默认 True 会把文本
+        # 转成 tiktoken token ID 数组，端点不报错但语义显著变差。
+        check_embedding_ctx_length=False,
     )
     try:
         vec = await emb.aembed_query("邮费是多少")
@@ -64,6 +80,17 @@ async def probe_embedding() -> None:
         print("  aembed_documents 条数:", len(vecs), "维度:", len(vecs[0]))
         assert len(vec) == s.embedding_dim, (
             f"维度不符: {len(vec)} != {s.embedding_dim}"
+        )
+        # 语义可分性：这是比维度更关键的验收条件（阶段 7 的教训）。
+        shipping = (
+            "售后政策 > 退换货\n运费说明\n"
+            "因商品质量问题导致的退换货，往返运费由平台承担。"
+        )
+        shipping_vec = (await emb.aembed_documents([shipping]))[0]
+        cos = cosine(vec, shipping_vec)
+        print(f"  cos(邮费是多少, 运费说明) = {cos:.4f}")
+        assert cos >= 0.5, (
+            f"语义塌陷：cos={cos:.4f} < 0.5，检查 check_embedding_ctx_length 是否为 False"
         )
         # 维度 1024 不足以证明 model 字段真的送达上游（也可能是默认模型）。
         # 再用裸 openai SDK 直接调一次，读响应里的 model 回显来确认。
