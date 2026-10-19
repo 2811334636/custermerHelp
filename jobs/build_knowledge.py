@@ -12,6 +12,7 @@ from app.db.locks import mysql_named_lock
 from app.knowledge.builder import build
 from app.knowledge.sources.faq_table import load_faq_chunks
 from app.knowledge.sources.markdown import load_markdown_dir
+from app.knowledge.vector_store import VectorStore
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
@@ -38,7 +39,9 @@ async def main() -> None:
                 chunks = md + faq
                 print(f"切分得到 {len(chunks)} 块（Markdown {len(md)} / FAQ {len(faq)}）")
 
-                report = await build(session, chunks)
+                # 创建支持 BM25 的 VectorStore
+                store = VectorStore(support_bm25=True)
+                report = await build(session, chunks, store=store)
                 print(
                     f"完成：总数 {report.chunks_total}，本次待办 {report.chunks_pending}，"
                     f"本次写入 {report.vectors_written}"
