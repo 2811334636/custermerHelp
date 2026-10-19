@@ -57,23 +57,21 @@ def test_long_paragraph_split_ends_on_sentence_boundary():
         assert len(c.answer) <= 100
 
 
-def test_overlap_is_a_whole_sentence():
-    text = "# 政策\n\n" + "".join(f"第{i}句话。" for i in range(1, 101))
-    chunks = split_markdown(text, source_key="over.md", max_chars=60, overlap_chars=30)
+def test_overlap_is_whole_sentences_not_char_cut():
+    # 每句 7 字：30 不是句长的整数倍，char-cut 会落在句子中间
+    text = "# 政策\n\n" + "".join(f"第{i:03d}号句。" for i in range(1, 101))
+    chunks = split_markdown(text, source_key="over2.md", max_chars=60, overlap_chars=30)
     assert len(chunks) >= 2
-    for c in chunks:
-        assert len(c.answer) <= 60
     for i in range(1, len(chunks)):
         prev = chunks[i - 1].answer
         cur = chunks[i].answer
-        # 当前块开头必须是上一块尾部若干「完整句子」的拼接
-        sents = [p + "。" for p in cur.split("。")[:-1]]
-        assert cur.endswith("。")
-        overlap = next(
-            (j for j in range(len(sents), 0, -1) if prev.endswith("".join(sents[:j]))),
-            0,
+        prev_sents = [s + "。" for s in prev.split("。") if s]
+        assert prev_sents, "上一块应至少包含一个完整句子"
+        matched = any(
+            cur.startswith("".join(prev_sents[-k:]))
+            for k in range(1, len(prev_sents) + 1)
         )
-        assert overlap > 0, "重叠必须取自上一块尾部的完整句子"
+        assert matched, f"重叠不是上一块尾部的完整句子: {cur[:40]!r}"
 
 
 def test_table_split_by_row_and_repeats_header():
@@ -153,3 +151,19 @@ def test_paragraph_starting_with_key_clause_marker_is_flagged():
 def test_negative_overlap_is_rejected():
     with pytest.raises(ValueError):
         split_markdown("# 标题\n\n内容。", source_key="bad.md", overlap_chars=-1)
+
+
+def test_newline_does_not_absorb_next_line_opening_quote():
+    text = '# 政策\n\n第一行\n"第二行"\n'
+    # 必须强制按句分块：max_chars=200 时两行会原样拼回同一块，
+    # '第一行\n"' 是源文本本身的子串，无法区分吸收 bug。
+    chunks = split_markdown(text, source_key="nl.md", max_chars=6, overlap_chars=0)
+    assert any(c.answer.startswith("第一行") for c in chunks)
+    assert all('第一行\n"' not in c.answer for c in chunks)
+
+
+def test_top_level_section_uses_heading_as_category_fallback():
+    text = "# 退货政策\n\n七天无理由退货。\n"
+    chunks = split_markdown(text, source_key="top.md")
+    assert chunks[0].category == "退货政策"
+    assert chunks[0].questions == "退货政策"

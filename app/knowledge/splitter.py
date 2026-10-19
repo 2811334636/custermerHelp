@@ -44,9 +44,11 @@ def _split_sentences(text: str) -> list[str]:
         if not boundary and ch == ".":
             boundary = i >= n or text[i].isspace()
         if boundary:
-            while i < n and text[i] in _CLOSERS:
-                buf += text[i]
-                i += 1
+            # 换行不是句末标点：不吸收下一行开头的引号/括号
+            if ch != "\n":
+                while i < n and text[i] in _CLOSERS:
+                    buf += text[i]
+                    i += 1
             carry = ""
             if buf.endswith("\n"):
                 buf = buf.rstrip("\n")
@@ -231,6 +233,8 @@ def split_markdown(
 
     for block in _parse_blocks(text):
         path = " > ".join(block.section_path)
+        # 顶层标题没有上级路径：回退为自身 heading。确定性、非空；
+        # heading 在 embedding_text 中重复出现无害（spec §5.5 裁决）。
         category = " > ".join(block.section_path[:-1]) or path
         questions = block.section_path[-1] if block.section_path else source_key
 
