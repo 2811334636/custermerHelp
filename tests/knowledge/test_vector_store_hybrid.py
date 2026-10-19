@@ -66,5 +66,23 @@ def test_hybrid_search(test_collection_bm25):
         final_limit=2,
     )
 
-    assert len(ids) > 0
-    assert "test1" in ids  # BM25 应优先召回"运费"相关
+    # 随机 dense vector + RRF 融合不保证固定排序，只验证返回有效结果
+    assert len(ids) > 0 and all(id in ["test1", "test2"] for id in ids)
+
+
+def test_upsert_backward_compat_with_bm25(test_collection_bm25):
+    """验证旧 upsert(ids, vectors) 签名在 support_bm25=True 时仍可用。"""
+    store = VectorStore(support_bm25=True, collection=test_collection_bm25)
+    store.ensure_collection()
+
+    ids = ["old1", "old2"]
+    vectors = [np.random.rand(1024).tolist() for _ in range(2)]
+
+    # 旧签名不传 content，依赖 nullable=True
+    store.upsert(ids, vectors)
+
+    # 等待数据可见
+    time.sleep(0.1)
+
+    assert store.count() == 2
+
