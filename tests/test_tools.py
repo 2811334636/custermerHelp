@@ -75,19 +75,64 @@ async def test_order_and_logistics_agree_on_the_same_order():
         )
 
 
-async def test_query_faq_hit_via_registry(db_session):
+def _knowledge_row(questions="运费说明", answer="因商品质量问题导致的退换货，往返运费由平台承担。"):
+    """构造一条未落库的 KnowledgeChunk，供打桩的 retrieval.search 返回。"""
+    from app.db.models import KnowledgeChunk
+
+    return KnowledgeChunk(
+        chunk_id="policy.md:9",
+        category="售后政策 > 退换货",
+        questions=questions,
+        answer=answer,
+        section_path="售后政策 > 退换货 > 运费",
+        content_type="policy",
+        status="已向量化",
+        content_hash="x",
+    )
+
+
+async def test_query_faq_hit_via_registry(db_session, monkeypatch):
+    """工具只负责取 session、调用 retrieval.search 并把结果排版成问答。"""
+    from app.knowledge import retrieval
+
+    async def fake_search(session, query, top_k=None, **kw):
+        return [_knowledge_row()]
+
+    monkeypatch.setattr(retrieval, "search", fake_search)
     reg = build_registry(session=db_session)
-    out = await reg.execute("query_faq", {"keyword": "退货"}, "c1", conversation_id=1)
+    out = await reg.execute("query_faq", {"keyword": "邮费是多少"}, "c1", conversation_id=1)
     assert out.ok is True
-    assert "退货" in out.content
+    assert "往返运费由平台承担" in out.content
+    assert out.content.startswith("问：运费说明\n答：")
 
 
-async def test_query_faq_miss_via_registry(db_session):
-    """★ 验收标准 3：『邮费』查不到。工具正常返回"没找到"，不是异常。"""
+async def test_query_faq_miss_via_registry(db_session, monkeypatch):
+    """★ 验收标准 3：空白检索是业务结果。工具正常返回"没找到"，不是异常。"""
+    from app.knowledge import retrieval
+
+    async def fake_search(session, query, top_k=None, **kw):
+        return []
+
+    monkeypatch.setattr(retrieval, "search", fake_search)
     reg = build_registry(session=db_session)
     out = await reg.execute("query_faq", {"keyword": "邮费"}, "c2", conversation_id=1)
     assert out.ok is True, "查不到是业务结果，不是工具故障"
     assert "没有找到" in out.content or "未找到" in out.content
+
+
+async def test_query_faq_degrades_when_milvus_down(db_session, monkeypatch):
+    """Milvus 故障在工具内降级成文案，不向 registry 抛异常。"""
+    from app.knowledge import retrieval
+    from app.knowledge.vector_store import VectorStoreUnavailable
+
+    async def boom(session, query, top_k=None, **kw):
+        raise VectorStoreUnavailable("down")
+
+    monkeypatch.setattr(retrieval, "search", boom)
+    reg = build_registry(session=db_session)
+    out = await reg.execute("query_faq", {"keyword": "邮费"}, "c3", conversation_id=1)
+    assert out.ok is True
+    assert "暂时不可用" in out.content
 
 
 async def test_create_ticket_writes_row_and_updates_conversation(db_session):
@@ -133,7 +178,9 @@ async def test_create_ticket_rejects_bad_type(db_session):
 # ---------------------------------------------------------------------------
 
 
-async def test_two_registries_built_with_different_sessions_do_not_cross(db_session):
+async def test_two_registries_built_with_different_sessions_do_not_cross(
+    db_session, monkeypatch
+):
     """★ 两个 registry 各带各的 session，重叠执行时不能互相看见。
 
     Task 6 证明了机制，这里是它开始真正起作用的地方（Task 9 的工具轮依赖它）。
@@ -146,6 +193,16 @@ async def test_two_registries_built_with_different_sessions_do_not_cross(db_sess
     若 session 落在模块级全局（brief 原本的 bind_session 写法），后跑的
     registry 会把它覆盖掉，真会话那路就会拿到哨兵而失败——本测试即红。
     """
+    from sqlalchemy import select
+
+    from app.knowledge import retrieval
+
+    async def fake_search(session, query, top_k=None, **kw):
+        # 打桩不碰 Milvus/embedding，但仍触碰 session：哨兵在这里 TypeError/AttributeError
+        await session.execute(select(1))
+        return [_knowledge_row(questions="退货政策", answer="签收后 7 天内可无理由退货。")]
+
+    monkeypatch.setattr(retrieval, "search", fake_search)
     reg_real = build_registry(session=db_session)
     reg_marker = build_registry(session=object())
 
@@ -160,8 +217,16 @@ async def test_two_registries_built_with_different_sessions_do_not_cross(db_sess
     assert marker.ok is False, "哨兵不是 AsyncSession，那一路本就该失败——失败才说明它没串到真会话"
 
 
-async def test_tool_session_is_scoped_to_the_registry_that_built_it(db_session):
+async def test_tool_session_is_scoped_to_the_registry_that_built_it(
+    db_session, monkeypatch
+):
     """不带 session 构造的 registry 里，工具看到的就是 None（未绑定），不会捡到别人的会话。"""
+    from app.knowledge import retrieval
+
+    async def fake_search(session, query, top_k=None, **kw):
+        return [_knowledge_row(questions="退货政策", answer="签收后 7 天内可无理由退货。")]
+
+    monkeypatch.setattr(retrieval, "search", fake_search)
     bound = build_registry(session=db_session)
     unbound = build_registry()
 

@@ -11,6 +11,38 @@ from app.api import get_store
 from app.db.base import get_db
 
 
+@pytest.fixture(autouse=True)
+def _stub_faq_retrieval(monkeypatch):
+    """路由测试不碰外部 embedding/Milvus。
+
+    这些用例测的是 SSE 帧、落库与历史回放，不是检索本身；真检索会让整条
+    链路依赖 SiliconFlow 与已建好的知识库。检索行为由 tests/test_retrieval.py
+    和 tests/test_tools.py 单独覆盖。
+    """
+    from app.db.models import KnowledgeChunk
+    from app.knowledge import retrieval
+
+    async def fake_search(session, query, top_k=None, **kw):
+        return [
+            KnowledgeChunk(
+                chunk_id="policy.md:9",
+                category="售后政策 > 退换货",
+                questions="退货政策",
+                answer=(
+                    "签收后 7 天内可无理由退货。商品需保持吊牌完整、不影响二次销售。"
+                    "定制类商品不支持无理由退货。因商品质量问题导致的退换货，"
+                    "往返运费由平台承担。"
+                ),
+                section_path="售后政策 > 退换货 > 退货政策",
+                content_type="policy",
+                status="已向量化",
+                content_hash="x",
+            )
+        ]
+
+    monkeypatch.setattr(retrieval, "search", fake_search)
+
+
 class FakeStore:
     def __init__(self):
         self._data = {}
