@@ -17,6 +17,9 @@ def _client() -> OpenAIEmbeddings:
         base_url=s.embedding_base_url,
         api_key=s.embedding_api_key,
         model=s.embedding_model,
+        # 默认 True 会用 tiktoken 把文本转成 token ID 数组再发给上游；
+        # SiliconFlow 虽不报错，但会返回语义显著变差的向量（实测余弦 0.23 vs 0.635）。
+        check_embedding_ctx_length=False,
     )
 
 

@@ -36,6 +36,26 @@ async def test_embed_texts_rejects_wrong_batch_cardinality(monkeypatch):
     assert "2" in str(exc.value) and "1" in str(exc.value)
 
 
+def test_client_disables_ctx_length_tokenization(monkeypatch):
+    """SiliconFlow 收到 token ID 数组时返回语义很差的向量，必须发原始字符串。"""
+    import app.knowledge.embedding as mod
+
+    captured: dict = {}
+
+    class FakeEmbeddings:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(mod, "OpenAIEmbeddings", FakeEmbeddings)
+    mod._client.cache_clear()
+    try:
+        mod._client()
+    finally:
+        mod._client.cache_clear()
+
+    assert captured.get("check_embedding_ctx_length") is False
+
+
 async def test_embed_texts_batches_and_preserves_input_order(monkeypatch):
     """按 embed_batch_size 分批，且输出顺序与输入严格一致。"""
     import app.knowledge.embedding as mod
