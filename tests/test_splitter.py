@@ -58,12 +58,22 @@ def test_long_paragraph_split_ends_on_sentence_boundary():
 
 
 def test_overlap_is_a_whole_sentence():
-    text = "# 政策\n\n" + "第一句话。" * 100
+    text = "# 政策\n\n" + "".join(f"第{i}句话。" for i in range(1, 101))
     chunks = split_markdown(text, source_key="over.md", max_chars=60, overlap_chars=30)
+    assert len(chunks) >= 2
+    for c in chunks:
+        assert len(c.answer) <= 60
     for i in range(1, len(chunks)):
         prev = chunks[i - 1].answer
         cur = chunks[i].answer
-        assert cur.startswith("第一句话。"), "重叠部分应从完整句子开始"
+        # 当前块开头必须是上一块尾部若干「完整句子」的拼接
+        sents = [p + "。" for p in cur.split("。")[:-1]]
+        assert cur.endswith("。")
+        overlap = next(
+            (j for j in range(len(sents), 0, -1) if prev.endswith("".join(sents[:j]))),
+            0,
+        )
+        assert overlap > 0, "重叠必须取自上一块尾部的完整句子"
 
 
 def test_table_split_by_row_and_repeats_header():
@@ -92,6 +102,7 @@ def test_code_fence_is_never_split():
     code_chunks = [c for c in chunks if "这不是标题" in c.answer]
     assert len(code_chunks) == 1
     assert code_chunks[0].answer.startswith("```python")
+    assert code_chunks[0].answer.rstrip().endswith("```")
 
 
 def test_important_blockquote_sets_key_clause():
@@ -112,3 +123,33 @@ def test_invalid_chunk_params_are_rejected():
         split_markdown("# 标题\n\n内容。", source_key="bad.md", max_chars=0)
     with pytest.raises(ValueError):
         split_markdown("# 标题\n\n内容。", source_key="bad.md", max_chars=100, overlap_chars=100)
+
+
+def test_single_overlong_sentence_is_hard_cut_within_max():
+    text = "# 规则\n\n" + "超" * 250
+    chunks = split_markdown(text, source_key="huge.md", max_chars=100, overlap_chars=20)
+    assert all(len(c.answer) <= 100 for c in chunks)
+    assert sum(len(c.answer) for c in chunks) >= 250
+
+
+def test_overlap_never_pushes_chunk_over_max():
+    text = "# 政策\n\n" + "短句。" * 30 + "超长句" + "啊" * 160 + "。" + "短句。" * 30
+    chunks = split_markdown(text, source_key="mix.md", max_chars=100, overlap_chars=30)
+    assert all(len(c.answer) <= 100 for c in chunks)
+
+
+def test_table_without_separator_does_not_duplicate_row():
+    text = "# 表\n\n| a | b |\n| c | d |\n"
+    chunks = split_markdown(text, source_key="noseg.md")
+    assert sum(c.answer.count("| a | b |") for c in chunks) == 1
+
+
+def test_paragraph_starting_with_key_clause_marker_is_flagged():
+    text = "# 规则\n\n**关键条款**每人限购 2 件。\n"
+    chunks = split_markdown(text, source_key="key.md")
+    assert any(c.is_key_clause for c in chunks)
+
+
+def test_negative_overlap_is_rejected():
+    with pytest.raises(ValueError):
+        split_markdown("# 标题\n\n内容。", source_key="bad.md", overlap_chars=-1)

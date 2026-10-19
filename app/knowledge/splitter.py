@@ -15,8 +15,11 @@ from dataclasses import dataclass
 
 from app.knowledge.chunk import Chunk
 
-_SENTENCE_DELIMS = "。！？；"
+_SENTENCE_ENDS = "。！？；"
+_ASCII_ENDS = "!?"
+_CLOSERS = "”’」』）】》\"')]"
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_SEPARATOR_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 
 
 @dataclass
@@ -28,17 +31,46 @@ class _Block:
 
 
 def _split_sentences(text: str) -> list[str]:
-    """按句末标点切，保留标点。无标点时整体返回。"""
+    """按句末标点/换行切，保留标点与紧随的右引号、右括号。无边界时整体返回。"""
     parts: list[str] = []
     buf = ""
-    for ch in text:
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
         buf += ch
-        if ch in _SENTENCE_DELIMS:
+        i += 1
+        boundary = ch in _SENTENCE_ENDS or ch in _ASCII_ENDS or ch == "\n"
+        if not boundary and ch == ".":
+            boundary = i >= n or text[i].isspace()
+        if boundary:
+            while i < n and text[i] in _CLOSERS:
+                buf += text[i]
+                i += 1
+            carry = ""
+            if buf.endswith("\n"):
+                buf = buf.rstrip("\n")
+                carry = "\n"
             parts.append(buf)
-            buf = ""
+            buf = carry
     if buf:
         parts.append(buf)
     return parts
+
+
+def _overlap_tail(chunk: str, overlap_chars: int, room: int) -> str:
+    """取 chunk 尾部若干完整句子，总长不超过 min(overlap_chars, room)。"""
+    limit = min(overlap_chars, room)
+    if limit <= 0:
+        return ""
+    tail: list[str] = []
+    acc = 0
+    for s in reversed(_split_sentences(chunk)):
+        if acc + len(s) > limit:
+            break
+        tail.insert(0, s)
+        acc += len(s)
+    return "".join(tail)
 
 
 def _pack_sentences(sentences: list[str], max_chars: int, overlap_chars: int) -> list[str]:
@@ -46,25 +78,24 @@ def _pack_sentences(sentences: list[str], max_chars: int, overlap_chars: int) ->
     out: list[str] = []
     cur = ""
     for sent in sentences:
+        # 单句超长：先冲掉当前块，再把这句话硬切（spec 规则 ③）
+        while len(sent) > max_chars:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(sent[:max_chars])
+            sent = sent[max_chars:]
+        if not sent:
+            continue
         if len(cur) + len(sent) <= max_chars:
             cur += sent
             continue
         if cur:
             out.append(cur)
-            # 用尾部若干完整句子做重叠
-            tail: list[str] = []
-            acc = 0
-            for s in reversed(_split_sentences(cur)):
-                if len(s) + acc > overlap_chars:
-                    break
-                tail.insert(0, s)
-                acc += len(s)
-            cur = "".join(tail) + sent
+            # 重叠只能占 sent 之外的剩余额度，绝不能把块挤出上限
+            tail = _overlap_tail(cur, overlap_chars, max_chars - len(sent))
+            cur = tail + sent
         else:
-            # 单句已超长：硬切（spec 规则 ③）
-            while len(sent) > max_chars:
-                out.append(sent[:max_chars])
-                sent = sent[max_chars:]
             cur = sent
     if cur.strip():
         out.append(cur)
@@ -153,19 +184,28 @@ def _parse_blocks(text: str) -> list[_Block]:
                 break
             para.append(nxt)
             i += 1
-        blocks.append(_Block("paragraph", para, [s for s in stack if s]))
+        blocks.append(
+            _Block(
+                "paragraph",
+                para,
+                [s for s in stack if s],
+                is_key_clause=para[0].strip().startswith("**关键条款**"),
+            )
+        )
 
     return blocks
 
 
 def _table_row_chunks(lines: list[str], max_chars: int) -> list[str]:
-    """表格按行切，每块复述表头（首行 + 分隔行）。"""
-    if len(lines) < 2:
-        return ["\n".join(lines)] if lines else []
-    header = lines[:2]
-    rows = [ln for ln in lines[2:] if ln.strip()]
+    """表格按行切，每块复述表头（仅当存在分隔行时）。行本身不硬切。"""
+    lines = [ln for ln in lines if ln.strip()]
+    if not lines:
+        return []
+    has_sep = len(lines) >= 2 and bool(_SEPARATOR_RE.match(lines[1])) and "-" in lines[1]
+    header = lines[:2] if has_sep else []
+    rows = lines[2:] if has_sep else lines
     if not rows:
-        return ["\n".join(header)]
+        return ["\n".join(header)] if header else []
     return ["\n".join(header + [row]) for row in rows]
 
 
