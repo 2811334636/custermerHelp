@@ -16,6 +16,9 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.54",
     "aiomysql>=0.3.2",
     "pymilvus>=3.0.2",
+    # MySQL 8.4 的 caching_sha2_password 认证在非 TLS 连接下需要 RSA 加密；
+    # 缺了它 aiomysql 会在连接时报 "cryptography package is required"。
+    "cryptography>=42.0",
 ]
 
 [dependency-groups]
