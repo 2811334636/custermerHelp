@@ -132,9 +132,10 @@ def test_chat_emits_meta_then_deltas_then_done(client):
     assert names.count("delta") == 2
     assert "".join(d["text"] for n, d in events if n == "delta") == "您好"
     assert uuid.UUID(events[0][1]["session_id"])  # 是合法 uuid
-    # 完成的一轮必须提交：get_db 退出时会回滚未提交的写入，漏掉这行
-    # 写入就永远不落库（实测：不 commit 时库里查不到本轮消息）。
-    assert client.db.commits == 1
+    # 完成的一轮提交两次：SAVEPOINT 成功后先 commit（保证客户端收到 done
+    # 时 message_id 已持久化），finally 再提交一次作为无害的 no-op。
+    # get_db 退出时会回滚未提交的写入，任何一次都不能省。
+    assert client.db.commits == 2
 
 
 async def test_chat_reuses_given_session_and_keeps_context(client):

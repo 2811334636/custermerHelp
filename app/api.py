@@ -40,6 +40,58 @@ REFUSAL_TEXT = (
 )
 REASON_MODEL_INSUFFICIENT = "model_insufficient"
 
+
+class _MarkerStreamFilter:
+    """在 SSE 增量里吞掉模型自评标记，并按需换成标准拒答话术。
+
+    约束：
+    - 只扣留「可能是标记前缀」的尾巴（最长 len(marker)-1 个字符），
+      其余文本立刻放行——不能为了过滤牺牲流式延迟。
+    - 标记可能被切在两个 delta 帧之间，所以必须跨帧累积判断。
+    - 一旦看到完整标记，后续文本一律丢弃（标记后的内容按噪声处理），
+      并在 flush 时返回一次拒答话术，保证浏览器看到的文本与落库一致。
+    """
+
+    def __init__(self, marker: str, replacement: str) -> None:
+        self._marker = marker
+        self._replacement = replacement
+        self._buf = ""
+        self.seen = False
+
+    def feed(self, text: str) -> str:
+        if self.seen:
+            return ""
+
+        self._buf += text
+        idx = self._buf.find(self._marker)
+        if idx != -1:
+            prefix = self._buf[:idx]
+            self._buf = ""
+            self.seen = True
+            return prefix
+
+        # 扣住最长的「标记真前缀」尾巴，等下一帧补齐后再判断。
+        hold = 0
+        max_hold = min(len(self._marker) - 1, len(self._buf))
+        for n in range(max_hold, 0, -1):
+            if self._buf.endswith(self._marker[:n]):
+                hold = n
+                break
+        if hold:
+            emit, self._buf = self._buf[:-hold], self._buf[-hold:]
+        else:
+            emit, self._buf = self._buf, ""
+        return emit
+
+    def flush(self) -> str:
+        """本轮文本结束时调用：标记出现过则补发拒答话术，否则放行残留尾巴。"""
+        if self.seen:
+            self._buf = ""
+            return self._replacement
+        emit, self._buf = self._buf, ""
+        return emit
+
+
 router = APIRouter(prefix="/api")
 router.include_router(chunks_router)
 router.include_router(feedback_router)
@@ -100,6 +152,10 @@ async def chat(
         # dict 挂到 ToolOutcome.metadata，工具帧与最终落库都从这里取。
         retrieval_meta: dict = {}
         citations: list[dict] = []
+        # 浏览器只看 delta，不读落库正文：标记必须在流里就被替换，否则用户
+        # 会看到 "<INSUFFICIENT_KNOWLEDGE>"。工具调用会开启新的 assistant
+        # 消息段，届时 flush + 重建过滤器。
+        delta_filter = _MarkerStreamFilter(INSUFFICIENT_MARKER, REFUSAL_TEXT)
 
         try:
             async for event in stream_reply_with_tools(
@@ -112,6 +168,14 @@ async def chat(
                 retrieval_meta=retrieval_meta,
             ):
                 if isinstance(event, ToolCallEvent):
+                    # 前一段正文到此结束：把过滤器扣留的尾巴放出去，再为新
+                    # 的最终回答段建一个干净的状态。
+                    tail = delta_filter.flush()
+                    if tail:
+                        yield sse_frame("delta", {"text": tail})
+                    delta_filter = _MarkerStreamFilter(
+                        INSUFFICIENT_MARKER, REFUSAL_TEXT
+                    )
                     in_tool_round = True
                     tool_calls_seen.append({
                         "id": event.call_id, "name": event.name,
@@ -138,12 +202,21 @@ async def chat(
                         "citations": citations,
                     })
                 elif isinstance(event, DeltaEvent):
+                    # 累积原始文本用于落库；SSE 只发过滤后的文本。两者最终
+                    # 都走同一条「标记 → 标准拒答」规则，保持一致。
                     (final_answer if in_tool_round else preamble).append(event.text)
-                    yield sse_frame("delta", {"text": event.text})
+                    filtered = delta_filter.feed(event.text)
+                    if filtered:
+                        yield sse_frame("delta", {"text": filtered})
                 elif isinstance(event, DoneEvent):
                     completed = True
-                    # 先不 yield：done 帧要带 message_id，而 id 只有在落库
-                    # flush 之后才存在。持久化放到循环外统一做。
+                    # 放行残留尾巴；若标记出现过，这里会补发 REFUSAL_TEXT，
+                    # 使流里拼出来的正文与落库正文完全一致。
+                    tail = delta_filter.flush()
+                    if tail:
+                        yield sse_frame("delta", {"text": tail})
+                    # 先不 yield done：done 帧要带 message_id，而 id 只有在
+                    # 落库 flush 之后才存在。持久化放到循环外统一做。
                     done_event = event
                 elif isinstance(event, ErrorEvent):
                     yield sse_frame("error", {"code": event.code, "message": event.message})
@@ -153,19 +226,28 @@ async def chat(
             if completed and done_event is not None:
                 answer_parts = final_answer if tool_calls_seen else preamble
                 answer = "".join(answer_parts)
-                if INSUFFICIENT_MARKER in answer:
+                insufficient = INSUFFICIENT_MARKER in answer
+                if insufficient:
                     # spec §3.5.2：模型自评不足 → 替换为标准拒答话术 + 入池。
-                    answer = answer.replace(INSUFFICIENT_MARKER, REFUSAL_TEXT)
-                    await lcq_repo.create(
-                        db,
-                        req.message,
-                        str(conv.id),
-                        REASON_MODEL_INSUFFICIENT,
+                    # 只保留标记之前的正文、丢弃标记后的噪声，与 SSE 过滤器
+                    # 的行为严格一致。
+                    answer = (
+                        answer.split(INSUFFICIENT_MARKER, 1)[0] + REFUSAL_TEXT
                     )
                     if tool_calls_seen:
                         final_answer = [answer]
                     else:
                         preamble = [answer]
+
+                # 工具轮前言里若也出现标记（罕见），同样规范化，保持落库
+                # 文本与浏览器看到的流式文本一致。
+                if tool_calls_seen:
+                    preamble_text = "".join(preamble)
+                    if INSUFFICIENT_MARKER in preamble_text:
+                        preamble = [
+                            preamble_text.split(INSUFFICIENT_MARKER, 1)[0]
+                            + REFUSAL_TEXT
+                        ]
 
                 # ★ 完整序列：user → assistant(带 tool_calls) → tool 结果* → 最终 assistant
                 # 只存 user + 最终 assistant 会让下一轮回放历史时 tool_call_id
@@ -180,13 +262,30 @@ async def chat(
                     to_store.append(AIMessage("".join(final_answer)))
                 else:
                     to_store.append(AIMessage("".join(preamble)))
-                ids = await store.append(
-                    session_id,
-                    *to_store,
-                    metadata=retrieval_meta or None,
-                )
+
+                # ★ 入池与落库放进同一个 SAVEPOINT：append 可能已经 flush 了
+                # user 行之后才抛错（或被取消）。若直接让 finally 提交，半截
+                # 一轮会落库；回滚到保存点则只丢弃本轮业务写入，先前建好的
+                # 会话行仍然保留。
+                async with db.begin_nested():
+                    if insufficient:
+                        await lcq_repo.create(
+                            db,
+                            req.message,
+                            str(conv.id),
+                            REASON_MODEL_INSUFFICIENT,
+                        )
+                    ids = await store.append(
+                        session_id,
+                        *to_store,
+                        metadata=retrieval_meta or None,
+                    )
+                    citations = list(retrieval_meta.get("citations") or [])
                 assistant_message_id = ids[-1] if ids else None
-                citations = list(retrieval_meta.get("citations") or [])
+
+                # message_id 必须在客户端收到 done 时已经持久化（反馈接口
+                # 的唯一凭据）。finally 的 commit 保留为无害的 no-op。
+                await db.commit()
 
                 yield sse_frame("done", {
                     "finish_reason": done_event.finish_reason,
