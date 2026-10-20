@@ -2,12 +2,25 @@
 
 用法：uv run python -m evals.run_hybrid_evals
 
-与 `run_kb_evals.py` 相同，直接连真实 MySQL 与 Milvus；`hybrid_cases.yaml`
-里的 ground_truth_ids 先与 knowledge_chunks 校验，标错一个就整体失败——
-否则 Recall 会因一个 typo 永远缺一块，而且没人看得出来。
+运行前提（本脚本是端到端评估，不是纯单测）：
+- MySQL 可连（默认 127.0.0.1:3307/customer_service），知识块已建好；
+- Milvus 可连（默认 127.0.0.1:19530），`knowledge` collection 已建好且含
+  dense + BM25 两路索引；
+- `APP_EMBEDDING_API_KEY` 必须配置：dense / hybrid / hybrid_rerank 共
+  20 × 3 = 60 次线上 embedding 调用；
+- `APP_RERANKER_API_KEY` 可选：配置后 hybrid_rerank 对 20 条 query 各调
+  一次真实 reranker；未配置时显式降级（hybrid_rerank 等同 hybrid），并在
+  报告里打印 0/20，避免把降级结果当成重排效果。
+
+与 `run_kb_evals.py` 相同，ground_truth_ids 先与 knowledge_chunks 校验，
+标错一个就整体失败——否则 Recall 会因一个 typo 永远缺一块，而且没人看得出来。
 
 报告给出总体指标，以及按 query_type（fact / procedure / comparison）分桶的
 指标（spec §3.6.3），另附 difficulty 分桶供人工判读。
+
+判读注意：本评估集的 query 多为知识块问法的近义改写，语料天然偏向 dense；
+RRF（k=60）+ identity 改写又可能让较弱的 BM25 单路在某些 query 上压过
+dense。因此不能把这里的"dense 更高"推广成"dense 优于 hybrid"。
 """
 
 import asyncio
@@ -241,6 +254,11 @@ async def main() -> int:
             "本行数字不代表重排效果"
         )
     print(f"hybrid_rerank 实际启用重排：{rerank_applied}/{len(cases)} 条")
+    print(
+        "判读注意：query 多为知识块问法的近义改写，语料偏向 dense；"
+        "RRF k=60 + identity 改写可能让较弱的 BM25 单路在个别 query 上"
+        "压过 dense，不能据此推广「dense 优于 hybrid」。"
+    )
 
     _table("总体", {"all": overall}, ("all",))
     _table("按 query_type 分桶", by_type, QUERY_TYPES)
