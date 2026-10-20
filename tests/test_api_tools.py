@@ -22,36 +22,51 @@ def _stub_faq_retrieval(monkeypatch):
     from app.db.models import KnowledgeChunk
     from app.knowledge import retrieval
 
-    async def fake_search(session, query, top_k=None, **kw):
-        return [
-            KnowledgeChunk(
-                chunk_id="policy.md:9",
-                category="售后政策 > 退换货",
-                questions="退货政策",
-                answer=(
-                    "签收后 7 天内可无理由退货。商品需保持吊牌完整、不影响二次销售。"
-                    "定制类商品不支持无理由退货。因商品质量问题导致的退换货，"
-                    "往返运费由平台承担。"
-                ),
-                section_path="售后政策 > 退换货 > 退货政策",
-                content_type="policy",
-                status="已向量化",
-                content_hash="x",
-            )
-        ]
+    async def fake_search_with_metadata(session, query, top_k=None, **kw):
+        return (
+            [
+                KnowledgeChunk(
+                    chunk_id="policy.md:9",
+                    category="售后政策 > 退换货",
+                    questions="退货政策",
+                    answer=(
+                        "签收后 7 天内可无理由退货。商品需保持吊牌完整、不影响二次销售。"
+                        "定制类商品不支持无理由退货。因商品质量问题导致的退换货，"
+                        "往返运费由平台承担。"
+                    ),
+                    section_path="售后政策 > 退换货 > 退货政策",
+                    content_type="policy",
+                    status="已向量化",
+                    content_hash="x",
+                )
+            ],
+            {"strategy": "dense", "scores": None, "top_score": None},
+        )
 
-    monkeypatch.setattr(retrieval, "search", fake_search)
+    monkeypatch.setattr(
+        retrieval, "search_with_metadata", fake_search_with_metadata
+    )
 
 
 class FakeStore:
     def __init__(self):
         self._data = {}
+        self.metadata = {}
+        self._next_id = 1
 
     async def get(self, session_id):
         return list(self._data.get(session_id, []))
 
-    async def append(self, session_id, *messages):
-        self._data.setdefault(session_id, []).extend(messages)
+    async def append(self, session_id, *messages, metadata=None):
+        msgs = self._data.setdefault(session_id, [])
+        ids = []
+        for m in messages:
+            msgs.append(m)
+            ids.append(self._next_id)
+            self._next_id += 1
+        if metadata is not None and messages:
+            self.metadata[session_id] = metadata
+        return ids
 
     async def exists(self, session_id):
         return session_id in self._data

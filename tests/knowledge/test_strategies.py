@@ -93,6 +93,7 @@ async def test_strategy_dense_only(db_session):
 
     assert meta["strategy"] == "dense"
     assert "bm25_count" not in meta
+    assert meta["scores"] is None, "dense 没有可跨 chunk 比较的分数"
     assert len(chunks) <= 3
     assert [c.chunk_id for c in chunks] == ["a:1", "a:0"]
     assert store.search_calls[0][1] == 3
@@ -115,6 +116,7 @@ async def test_strategy_bm25_only(db_session):
 
     assert meta["strategy"] == "bm25"
     assert meta["query_rewritten"] == "邮费如何计算"
+    assert meta["scores"] is None
     assert [c.chunk_id for c in chunks] == ["a:0"]
     assert store.bm25_calls == [("邮费如何计算", 5)]
     assert store.search_calls == [] and store.hybrid_calls == []
@@ -140,6 +142,7 @@ async def test_strategy_hybrid_metadata_counts(db_session):
     assert meta["dense_count"] == s.retrieval_dense_top_k
     assert meta["bm25_count"] == s.retrieval_bm25_top_k
     assert meta["fused_count"] == 2
+    assert meta["scores"] is None, "RRF 融合分不可比，不能作为 chunk 分数"
     assert "rerank_applied" not in meta
     assert store.hybrid_calls == [
         (
@@ -182,6 +185,8 @@ async def test_strategy_hybrid_rerank(db_session):
     assert meta["top_score"] == 0.9
     # 重排降序 [a:2, a:0, a:1]，first_last 排列后为 [a:2, a:1, a:0]
     assert [c.chunk_id for c in chunks] == ["a:2", "a:1", "a:0"]
+    # scores 必须跟着同一套 first_last 排列，否则 citations 的分数会错位。
+    assert meta["scores"] == [0.9, 0.3, 0.7]
 
 
 async def test_first_last_arrangement_matches_spec_for_ten(db_session):
@@ -209,6 +214,11 @@ async def test_first_last_arrangement_matches_spec_for_ten(db_session):
         "c:0", "c:2", "c:4", "c:6", "c:8",
         "c:9", "c:7", "c:5", "c:3", "c:1",
     ]
+    assert meta["scores"] == pytest.approx([
+        1.0, 0.98, 0.96, 0.94, 0.92,
+        0.91, 0.93, 0.95, 0.97, 0.99,
+    ])
+    assert len(meta["scores"]) == len(chunks), "scores 必须与 chunks 一一对齐"
 
 
 async def test_hybrid_rerank_falls_back_when_reranker_unavailable(
@@ -236,6 +246,7 @@ async def test_hybrid_rerank_falls_back_when_reranker_unavailable(
     assert [c.chunk_id for c in chunks] == ["a:0", "a:1"]
     assert meta["rerank_applied"] is False
     assert meta["top_score"] is None
+    assert meta["scores"] is None, "降级重排没有分数，不能编造"
     assert "重排不可用" in caplog.text
 
 

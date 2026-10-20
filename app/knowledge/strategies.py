@@ -11,7 +11,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, TypeVar
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +31,8 @@ STRATEGIES = ("dense", "bm25", "hybrid", "hybrid_rerank")
 RerankFn = Callable[..., Any]
 RewriteFn = Callable[[str], Any]
 
+_T = TypeVar("_T")
+
 
 async def _maybe_await(value: Any) -> Any:
     """允许注入同步替身（如 unittest.mock.Mock），生产函数本身是 async。"""
@@ -39,16 +41,16 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _arrange_first_last(
-    chunks: list[KnowledgeChunk],
-) -> list[KnowledgeChunk]:
+def _arrange_first_last(items: list[_T]) -> list[_T]:
     """首尾优先排列：偶数位（0-based）升序 + 奇数位降序。
 
     n=10 时得到 0,2,4,6,8,9,7,5,3,1，即
     [1st, 3rd, 5th, 7th, 9th, 10th, 8th, 6th, 4th, 2nd]。
     最相关的在首尾，避免全部堆在中间被模型忽略。
+
+    对 chunks 与 scores 用同一函数，保证两者始终一一对齐。
     """
-    return chunks[0::2] + list(reversed(chunks[1::2]))
+    return items[0::2] + list(reversed(items[1::2]))
 
 
 async def _default_store() -> Any:
@@ -77,6 +79,8 @@ async def _dense_only(
         "strategy": "dense",
         "query_rewritten": query,
         "dense_count": len(ids),
+        # 只有重排分数可跨 chunk 比较；其余策略没有可对齐的分数。
+        "scores": None,
     }
     logger.info("dense 检索 dense_count=%d", len(ids))
     return chunks, meta
@@ -99,6 +103,7 @@ async def _bm25_only(
         "strategy": "bm25",
         "query_rewritten": query,
         "bm25_count": len(ids),
+        "scores": None,
     }
     logger.info("bm25 检索 bm25_count=%d", len(ids))
     return chunks, meta
@@ -141,6 +146,8 @@ async def _hybrid_ids(
         "dense_count": dense_limit,
         "bm25_count": bm25_limit,
         "fused_count": len(ids),
+        # RRF 融合分不可比，不能当作 chunk 级分数暴露。
+        "scores": None,
     }
     logger.info(
         "混合检索 dense_count=%d bm25_count=%d fused_count=%d",
@@ -217,9 +224,13 @@ async def _hybrid_rerank(
 
     if s.rerank_arrangement_strategy == "first_last":
         reranked = _arrange_first_last(reranked)
+        # ★ chunks 与 scores 必须走同一个排列：前端 citations 的 score
+        # 按 chunk 顺序读取，只排 chunk 会让分数与引用错位。
+        scores = _arrange_first_last(scores)
 
     meta["rerank_applied"] = True
     meta["top_score"] = top_score
+    meta["scores"] = scores
     logger.info(
         "重排完成 rerank_applied=True rerank_top_score=%s 保留=%d 条",
         top_score,

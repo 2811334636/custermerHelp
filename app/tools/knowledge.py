@@ -11,6 +11,39 @@ from app.knowledge.errors import KnowledgeBackendUnavailable
 from app.tools.context import current_context
 
 
+def _publish_retrieval_meta(
+    ctx, hits, meta: dict | None
+) -> None:
+    """把本次检索结果写进请求级 metadata 容器（registry 随后挂到 ToolOutcome）。
+
+    citations 的 index 与工具回灌给模型的问答顺序一致（1-based），前端
+    用它与回答里的 [n] 交叉验证。scores 与 chunks 已由策略层对齐；非重排
+    策略没有可比较分数，score 填 null。
+    """
+    container = ctx.retrieval_meta
+    if container is None:
+        return
+
+    meta = meta or {}
+    scores = meta.get("scores")
+    citations = [
+        {
+            "index": i + 1,
+            "chunk_id": hit.chunk_id,
+            "score": (
+                scores[i] if scores is not None and i < len(scores) else None
+            ),
+        }
+        for i, hit in enumerate(hits)
+    ]
+    container.clear()
+    container.update({
+        "citations": citations,
+        "retrieval_strategy": meta.get("strategy"),
+        "top_score": meta.get("top_score"),
+    })
+
+
 @tool
 async def query_faq(keyword: str) -> str:
     """按语义检索常见问题与政策手册（退货、运费、发票、尺码、价保等）。
@@ -35,7 +68,7 @@ async def query_faq(keyword: str) -> str:
         return "FAQ 查询暂时不可用（数据库未绑定）。"
 
     try:
-        hits = await retrieval.search(
+        hits, meta = await retrieval.search_with_metadata(
             session,
             keyword,
             strategy=get_settings().retrieval_strategy,
@@ -44,7 +77,11 @@ async def query_faq(keyword: str) -> str:
     except KnowledgeBackendUnavailable:
         # Milvus 与 embedding 上游都在这个基类下：基础设施故障一律降级，
         # 不让 ToolRegistry 把它当成工具故障重试/回灌错误码。
+        # 本次没有可信召回，清掉可能残留的引用，避免前端张冠李戴。
+        _publish_retrieval_meta(ctx, [], None)
         return "知识库暂时不可用，请稍后再试或转人工客服。"
+
+    _publish_retrieval_meta(ctx, hits, meta)
 
     if not hits:
         # ★ 「查不到」是正常业务结果，不是异常：走成功返回，不触发 registry 的

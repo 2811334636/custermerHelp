@@ -3,7 +3,7 @@ import logging
 import pytest
 
 from app.knowledge.chunk import Chunk
-from app.knowledge.retrieval import search
+from app.knowledge.retrieval import search, search_with_metadata
 from app.repositories import knowledge_chunk as repo
 
 
@@ -78,6 +78,40 @@ async def test_pending_rows_are_skipped_and_logged(db_session, caplog):
     assert out == []
     assert "a:0" in caplog.text
     assert "未向量化" in caplog.text
+
+
+async def test_search_with_metadata_returns_chunks_and_strategy_meta(db_session):
+    """Task 7 新入口：chunks 与 meta 一起返回；search() 仍是薄包装。"""
+    await repo.upsert_chunks(db_session, [c("a:0")])
+    await repo.mark_vectorized(db_session, ["a:0"], ["a:0"])
+
+    chunks, meta = await search_with_metadata(
+        db_session, "问题", store=FakeStore(["a:0"]), embed=fake_embed
+    )
+
+    assert [x.chunk_id for x in chunks] == ["a:0"]
+    assert meta["strategy"] == "dense"
+    assert meta["scores"] is None
+
+    # 兼容入口必须返回同一批 chunk（而不是拿到 (chunks, meta) 元组）
+    wrapped = await search(
+        db_session, "问题", store=FakeStore(["a:0"]), embed=fake_embed
+    )
+    assert [x.chunk_id for x in wrapped] == ["a:0"]
+
+
+async def test_search_with_metadata_returns_meta_even_when_refused(db_session):
+    """拒答时仍返回本次策略元数据，方便上层记录/调试；chunks 为空。"""
+    chunks, meta = await search_with_metadata(
+        db_session,
+        "火星移民计划详情",
+        store=FakeStore([]),
+        embed=fake_embed,
+        session_id="sess-meta-refused",
+    )
+
+    assert chunks == []
+    assert meta["strategy"] == "dense"
 
 
 async def test_store_construction_and_search_run_off_the_event_loop(

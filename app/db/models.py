@@ -36,6 +36,10 @@ class Message(Base):
     content: Mapped[str | None] = mapped_column(Text, nullable=True)
     tool_calls: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # ★ 属性名不能叫 metadata：Declarative API 把 `metadata` 保留给
+    # Base.metadata（表注册表），直接声明会抛 InvalidRequestError。
+    # 用 metadata_ 映射到同名列，SQL 侧列名仍是 `metadata`。
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(server_default=func.now())
 
     __table_args__ = (Index("idx_conversation_id", "conversation_id"),)

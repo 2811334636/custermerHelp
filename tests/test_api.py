@@ -39,12 +39,23 @@ class FakeStore:
 
     def __init__(self):
         self._data: dict[str, list] = {}
+        self.metadata: dict[str, dict] = {}
+        self._next_id = 1
 
     async def get(self, session_id: str):
         return list(self._data.get(session_id, []))
 
-    async def append(self, session_id: str, *messages):
-        self._data.setdefault(session_id, []).extend(messages)
+    async def append(self, session_id: str, *messages, metadata=None):
+        msgs = self._data.setdefault(session_id, [])
+        ids = []
+        for m in messages:
+            msgs.append(m)
+            ids.append(self._next_id)
+            self._next_id += 1
+        if metadata is not None and messages:
+            # 与 MySQLSessionStore 语义一致：只属于最后一条（最终 assistant）。
+            self.metadata[session_id] = metadata
+        return ids
 
     async def exists(self, session_id: str) -> bool:
         return session_id in self._data

@@ -24,6 +24,10 @@ class ToolContext:
     # 只做类型标注，不引入 app.db —— AsyncSession 是个纯类型，
     # context.py 不该依赖数据库实现。
     session: AsyncSession | None = None
+    # 本次请求的检索元数据（citations/scores/strategy）。dataclass 是 frozen
+    # 的，但 dict 本身可变：调用方建一个空 dict 传进来，工具在里面原地更新，
+    # registry 执行完后把同一个 dict 挂到 ToolOutcome.metadata 上。
+    retrieval_meta: dict | None = None
 
 
 _ctx: ContextVar[ToolContext] = ContextVar("tool_context")
@@ -31,9 +35,17 @@ _ctx: ContextVar[ToolContext] = ContextVar("tool_context")
 
 @contextmanager
 def tool_context(
-    conversation_id: int, session: AsyncSession | None = None
+    conversation_id: int,
+    session: AsyncSession | None = None,
+    retrieval_meta: dict | None = None,
 ) -> Iterator[None]:
-    token = _ctx.set(ToolContext(conversation_id=conversation_id, session=session))
+    token = _ctx.set(
+        ToolContext(
+            conversation_id=conversation_id,
+            session=session,
+            retrieval_meta=retrieval_meta,
+        )
+    )
     try:
         yield
     finally:

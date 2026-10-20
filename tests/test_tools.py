@@ -92,32 +92,54 @@ def _knowledge_row(questions="运费说明", answer="因商品质量问题导致
 
 
 async def test_query_faq_hit_via_registry(db_session, monkeypatch):
-    """工具只负责取 session、调用 retrieval.search 并把结果排版成问答。"""
+    """工具取 session、调用检索并把结果排版成问答，同时写入 citations 元数据。"""
     from app.knowledge import retrieval
 
-    async def fake_search(session, query, top_k=None, **kw):
-        return [_knowledge_row()]
+    async def fake_search_with_metadata(session, query, top_k=None, **kw):
+        return (
+            [_knowledge_row()],
+            {"strategy": "dense", "scores": None, "top_score": None},
+        )
 
-    monkeypatch.setattr(retrieval, "search", fake_search)
+    monkeypatch.setattr(retrieval, "search_with_metadata", fake_search_with_metadata)
     reg = build_registry(session=db_session)
-    out = await reg.execute("query_faq", {"keyword": "邮费是多少"}, "c1", conversation_id=1)
+    retrieval_meta: dict = {}
+    out = await reg.execute(
+        "query_faq",
+        {"keyword": "邮费是多少"},
+        "c1",
+        conversation_id=1,
+        retrieval_meta=retrieval_meta,
+    )
     assert out.ok is True
     assert "往返运费由平台承担" in out.content
     assert out.content.startswith("问：运费说明\n答：")
+    assert out.metadata is retrieval_meta, "metadata 应是调用方传入的同一个容器"
+    assert out.metadata["citations"] == [
+        {"index": 1, "chunk_id": "policy.md:9", "score": None}
+    ]
 
 
 async def test_query_faq_miss_via_registry(db_session, monkeypatch):
     """★ 验收标准 3：空白检索是业务结果。工具正常返回"没找到"，不是异常。"""
     from app.knowledge import retrieval
 
-    async def fake_search(session, query, top_k=None, **kw):
-        return []
+    async def fake_search_with_metadata(session, query, top_k=None, **kw):
+        return [], {"strategy": "dense", "scores": None, "top_score": None}
 
-    monkeypatch.setattr(retrieval, "search", fake_search)
+    monkeypatch.setattr(retrieval, "search_with_metadata", fake_search_with_metadata)
     reg = build_registry(session=db_session)
-    out = await reg.execute("query_faq", {"keyword": "邮费"}, "c2", conversation_id=1)
+    retrieval_meta: dict = {}
+    out = await reg.execute(
+        "query_faq",
+        {"keyword": "邮费"},
+        "c2",
+        conversation_id=1,
+        retrieval_meta=retrieval_meta,
+    )
     assert out.ok is True, "查不到是业务结果，不是工具故障"
     assert "没有找到" in out.content or "未找到" in out.content
+    assert out.metadata["citations"] == [], "无召回时也要给出空引用（避免残留旧引用）"
 
 
 async def test_query_faq_degrades_when_milvus_down(db_session, monkeypatch):
@@ -128,7 +150,7 @@ async def test_query_faq_degrades_when_milvus_down(db_session, monkeypatch):
     async def boom(session, query, top_k=None, **kw):
         raise VectorStoreUnavailable("down")
 
-    monkeypatch.setattr(retrieval, "search", boom)
+    monkeypatch.setattr(retrieval, "search_with_metadata", boom)
     reg = build_registry(session=db_session)
     out = await reg.execute("query_faq", {"keyword": "邮费"}, "c3", conversation_id=1)
     assert out.ok is True
@@ -274,12 +296,15 @@ async def test_two_registries_built_with_different_sessions_do_not_cross(
 
     from app.knowledge import retrieval
 
-    async def fake_search(session, query, top_k=None, **kw):
+    async def fake_search_with_metadata(session, query, top_k=None, **kw):
         # 打桩不碰 Milvus/embedding，但仍触碰 session：哨兵在这里 TypeError/AttributeError
         await session.execute(select(1))
-        return [_knowledge_row(questions="退货政策", answer="签收后 7 天内可无理由退货。")]
+        return (
+            [_knowledge_row(questions="退货政策", answer="签收后 7 天内可无理由退货。")],
+            {"strategy": "dense", "scores": None, "top_score": None},
+        )
 
-    monkeypatch.setattr(retrieval, "search", fake_search)
+    monkeypatch.setattr(retrieval, "search_with_metadata", fake_search_with_metadata)
     reg_real = build_registry(session=db_session)
     reg_marker = build_registry(session=object())
 
@@ -300,10 +325,13 @@ async def test_tool_session_is_scoped_to_the_registry_that_built_it(
     """不带 session 构造的 registry 里，工具看到的就是 None（未绑定），不会捡到别人的会话。"""
     from app.knowledge import retrieval
 
-    async def fake_search(session, query, top_k=None, **kw):
-        return [_knowledge_row(questions="退货政策", answer="签收后 7 天内可无理由退货。")]
+    async def fake_search_with_metadata(session, query, top_k=None, **kw):
+        return (
+            [_knowledge_row(questions="退货政策", answer="签收后 7 天内可无理由退货。")],
+            {"strategy": "dense", "scores": None, "top_score": None},
+        )
 
-    monkeypatch.setattr(retrieval, "search", fake_search)
+    monkeypatch.setattr(retrieval, "search_with_metadata", fake_search_with_metadata)
     bound = build_registry(session=db_session)
     unbound = build_registry()
 

@@ -11,17 +11,20 @@ async def append(
     content: str | None,
     tool_calls: list[dict] | None = None,
     tool_call_id: str | None = None,
-) -> None:
-    session.add(
-        Message(
-            conversation_id=conversation_id,
-            role=role,
-            content=content,
-            tool_calls=tool_calls,
-            tool_call_id=tool_call_id,
-        )
+    metadata: dict | None = None,
+) -> int:
+    """插入一条消息并返回主键（flush 后可用，事务边界仍归调用方）。"""
+    msg = Message(
+        conversation_id=conversation_id,
+        role=role,
+        content=content,
+        tool_calls=tool_calls,
+        tool_call_id=tool_call_id,
+        metadata_=metadata,
     )
+    session.add(msg)
     await session.flush()
+    return msg.id
 
 
 async def list_by_conversation(session: AsyncSession, conversation_id: int) -> list[Message]:

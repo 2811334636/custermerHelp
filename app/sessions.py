@@ -21,7 +21,12 @@ class SessionStore(ABC):
     async def get(self, session_id: str) -> list[BaseMessage]: ...
 
     @abstractmethod
-    async def append(self, session_id: str, *messages: BaseMessage) -> None: ...
+    async def append(
+        self,
+        session_id: str,
+        *messages: BaseMessage,
+        metadata: dict | None = None,
+    ) -> list[int]: ...
 
     @abstractmethod
     async def exists(self, session_id: str) -> bool: ...
@@ -54,12 +59,32 @@ class MySQLSessionStore(SessionStore):
         rows = await message_repo.list_by_conversation(self._session, cid)
         return from_rows(rows)
 
-    async def append(self, session_id: str, *messages: BaseMessage) -> None:
+    async def append(
+        self,
+        session_id: str,
+        *messages: BaseMessage,
+        metadata: dict | None = None,
+    ) -> list[int]:
+        """追加消息并返回插入的主键列表（与 messages 顺序一致）。
+
+        metadata 只挂到**最后一条**消息上：调用方把整轮序列一次性交进来时，
+        citations 属于最终的 assistant 回答，不属于 user/tool 行。
+        """
         conv = await conversation_repo.get_or_create(
             self._session, session_id, get_settings().default_user_id
         )
-        for row in to_rows(list(messages)):
-            await message_repo.append(self._session, conv.id, **row)
+        rows = to_rows(list(messages))
+        ids: list[int] = []
+        for i, row in enumerate(rows):
+            ids.append(
+                await message_repo.append(
+                    self._session,
+                    conv.id,
+                    **row,
+                    metadata=metadata if i == len(rows) - 1 else None,
+                )
+            )
+        return ids
 
     async def exists(self, session_id: str) -> bool:
         return await self._find(session_id) is not None

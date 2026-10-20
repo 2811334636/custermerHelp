@@ -33,6 +33,9 @@ class ToolOutcome:
     content: str      # 回灌给模型的文本
     summary: str      # 给前端徽章 tooltip 的一句话
     elapsed_ms: int
+    # 成功调用时由工具写入 ToolContext.retrieval_meta 的引用元数据
+    # （citations 等）；失败调用一律为 None，不暴露半成品。
+    metadata: dict | None = None
 
 
 class ToolRegistry:
@@ -84,8 +87,29 @@ class ToolRegistry:
         except LookupError:
             return None
 
+    def _effective_retrieval_meta(
+        self, retrieval_meta: dict | None
+    ) -> dict | None:
+        """本次执行用哪个元数据容器 —— 与 session 的回退规则对称。
+
+        显式传入就用它；没传则沿用外层 context 已有的容器（例如调用方先用
+        `with tool_context(cid, retrieval_meta=d)` 包好）。
+        """
+        if retrieval_meta is not None:
+            return retrieval_meta
+        try:
+            return current_context().retrieval_meta
+        except LookupError:
+            return None
+
     async def execute(
-        self, name: str, raw_args: dict, call_id: str, *, conversation_id: int | None = None
+        self,
+        name: str,
+        raw_args: dict,
+        call_id: str,
+        *,
+        conversation_id: int | None = None,
+        retrieval_meta: dict | None = None,
     ) -> ToolOutcome:
         started = time.monotonic()
 
@@ -116,6 +140,7 @@ class ToolRegistry:
         with tool_context(
             self._effective_conversation_id(conversation_id),
             self._effective_session(self._session),
+            self._effective_retrieval_meta(retrieval_meta),
         ):
             for attempt in range(1, attempts + 1):
                 tried = attempt
@@ -124,7 +149,14 @@ class ToolRegistry:
                         spec.tool.ainvoke(args.model_dump()), timeout=spec.timeout_s
                     )
                     text = result if isinstance(result, str) else str(result)
-                    return ToolOutcome(call_id, True, text, self._summarize(text), elapsed())
+                    return ToolOutcome(
+                        call_id,
+                        True,
+                        text,
+                        self._summarize(text),
+                        elapsed(),
+                        metadata=current_context().retrieval_meta,
+                    )
                 except (TimeoutError, asyncio.TimeoutError) as exc:
                     last_error = exc
                     logger.warning(

@@ -73,7 +73,7 @@ async def _refuse(
     )
 
 
-async def search(
+async def search_with_metadata(
     session: AsyncSession,
     query: str,
     top_k: int | None = None,
@@ -82,14 +82,17 @@ async def search(
     embed: Any | None = None,
     strategy: str = "dense",
     session_id: str = "",
-) -> list[KnowledgeChunk]:
-    """按策略召回知识块，并执行拒答控制。
+) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
+    """按策略召回知识块，并执行拒答控制，返回 ``(chunks, meta)``。
 
     `strategy` 刻意不默认读配置：ch03 的调用方与测试默认期望 dense 行为；
     生产路径（query_faq）显式传 ``settings.retrieval_strategy``。
 
     store / embed 仅用于注入测试替身；生产路径用真实 Milvus 与 embedding。
-    拒答时返回空列表——面向用户的拒答话术由上层（Task 7）负责。
+    拒答时返回空列表 + 本次策略元数据——面向用户的拒答话术由上层负责。
+
+    ★ 拒答判定只在这里做一次；`search()` 是 ch03 兼容薄包装，委托本函数，
+      避免"两条路径各判一次阈值"的分叉。
     """
     s = get_settings()
     if store is None:
@@ -110,7 +113,7 @@ async def search(
 
     if not chunks:
         await _refuse(session, query, session_id, REASON_NO_RESULTS)
-        return []
+        return [], meta
 
     # 只有重排策略有可比较的分数；dense/bm25/hybrid 的 RRF/相似度不可比，
     # 不能拿阈值误杀。
@@ -118,12 +121,38 @@ async def search(
         top_score = meta.get("top_score")
         if top_score is not None and top_score < s.retrieval_rerank_threshold:
             await _refuse(session, query, session_id, REASON_LOW_SCORE)
-            return []
+            return [], meta
 
     logger.info(
         "检索完成 strategy=%s 返回=%d 条 top_score=%s",
         meta.get("strategy"),
         len(chunks),
         meta.get("top_score"),
+    )
+    return chunks, meta
+
+
+async def search(
+    session: AsyncSession,
+    query: str,
+    top_k: int | None = None,
+    *,
+    store: Any | None = None,
+    embed: Any | None = None,
+    strategy: str = "dense",
+    session_id: str = "",
+) -> list[KnowledgeChunk]:
+    """ch03 兼容入口：只返回 chunks，丢弃策略元数据。
+
+    需要 citations / scores 的调用方（query_faq）改用 `search_with_metadata`。
+    """
+    chunks, _ = await search_with_metadata(
+        session,
+        query,
+        top_k,
+        store=store,
+        embed=embed,
+        strategy=strategy,
+        session_id=session_id,
     )
     return chunks

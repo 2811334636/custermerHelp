@@ -89,6 +89,8 @@ class ToolResultEvent:
     summary: str
     content: str          # 回灌给模型的完整文本；落库时用它构造 ToolMessage
     elapsed_ms: int
+    # 工具写入的引用元数据（query_faq 的 citations 等）；失败/无元数据为 None。
+    metadata: dict | None = None
 
 
 DomainEventWithTools = DeltaEvent | DoneEvent | ErrorEvent | ToolCallEvent | ToolResultEvent
@@ -102,6 +104,7 @@ async def stream_reply_with_tools(
     registry,
     token_budget: int,
     conversation_id: int,
+    retrieval_meta: dict | None = None,
 ) -> AsyncIterator[DomainEventWithTools]:
     """带工具轮的一轮对话。
 
@@ -161,14 +164,20 @@ async def stream_reply_with_tools(
         for call in tool_calls:
             yield ToolCallEvent(name=call["name"], arguments=call["args"], call_id=call["id"])
 
+            execute_kwargs: dict = {"conversation_id": conversation_id}
+            # 只在调用方真的带了容器时才传：保持对旧 registry 替身
+            # （测试里只接受 conversation_id）的兼容。
+            if retrieval_meta is not None:
+                execute_kwargs["retrieval_meta"] = retrieval_meta
             outcome = await registry.execute(
-                call["name"], call["args"], call["id"], conversation_id=conversation_id
+                call["name"], call["args"], call["id"], **execute_kwargs
             )
 
             yield ToolResultEvent(
                 call_id=outcome.call_id, ok=outcome.ok,
                 summary=outcome.summary, content=outcome.content,
                 elapsed_ms=outcome.elapsed_ms,
+                metadata=outcome.metadata,
             )
             tool_messages.append(ToolMessage(content=outcome.content, tool_call_id=call["id"]))
     except Exception as exc:  # noqa: BLE001 — 与两个模型流的错误边界同形

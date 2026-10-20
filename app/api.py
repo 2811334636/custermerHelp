@@ -9,6 +9,8 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api_chunks import router as chunks_router
+from app.api_feedback import router as feedback_router
 from app.chat import (
     DeltaEvent,
     DoneEvent,
@@ -22,13 +24,25 @@ from app.db.base import get_db
 from app.extract import ExtractionFailed, extract_ticket
 from app.providers import get_default_chat_model
 from app.repositories import conversation as conv_repo
+from app.repositories import low_confidence_question as lcq_repo
 from app.schemas import AfterSalesTicket, ChatRequest, ExtractRequest
 from app.sessions import MySQLSessionStore, SessionStore
 from app.tools import build_registry
 
 logger = logging.getLogger(__name__)
 
+# spec §3.5.2：模型自评知识不足时输出该标记，后端替换为标准拒答话术。
+INSUFFICIENT_MARKER = "<INSUFFICIENT_KNOWLEDGE>"
+REFUSAL_TEXT = (
+    "抱歉，我暂时没有找到相关信息。您可以：\n"
+    "1. 换个说法再问一次\n"
+    '2. 联系人工客服（输入"转人工"）'
+)
+REASON_MODEL_INSUFFICIENT = "model_insufficient"
+
 router = APIRouter(prefix="/api")
+router.include_router(chunks_router)
+router.include_router(feedback_router)
 
 
 def get_store(db: AsyncSession = Depends(get_db)) -> SessionStore:
@@ -81,6 +95,11 @@ async def chat(
         tool_messages: list[ToolMessage] = []
         in_tool_round = False
         completed = False
+        done_event: DoneEvent | None = None
+        # 请求级可变容器：query_faq 原地写入 citations，registry 把同一个
+        # dict 挂到 ToolOutcome.metadata，工具帧与最终落库都从这里取。
+        retrieval_meta: dict = {}
+        citations: list[dict] = []
 
         try:
             async for event in stream_reply_with_tools(
@@ -90,6 +109,7 @@ async def chat(
                 registry=registry,
                 token_budget=settings.history_token_budget,
                 conversation_id=conv.id,
+                retrieval_meta=retrieval_meta,
             ):
                 if isinstance(event, ToolCallEvent):
                     in_tool_round = True
@@ -107,21 +127,73 @@ async def chat(
                     tool_messages.append(
                         ToolMessage(content=event.content, tool_call_id=event.call_id)
                     )
+                    if event.metadata is not None and "citations" in event.metadata:
+                        citations = list(event.metadata.get("citations") or [])
+                    # 前端没有 message-fetch 接口：citations 只能搭在工具帧
+                    # 与 done 帧上送到浏览器（spec §3.5.1）。
                     yield sse_frame("tool", {
                         "phase": "end", "call_id": event.call_id,
                         "ok": event.ok, "summary": event.summary,
                         "elapsed_ms": event.elapsed_ms,
+                        "citations": citations,
                     })
                 elif isinstance(event, DeltaEvent):
                     (final_answer if in_tool_round else preamble).append(event.text)
                     yield sse_frame("delta", {"text": event.text})
                 elif isinstance(event, DoneEvent):
                     completed = True
-                    yield sse_frame("done", {
-                        "finish_reason": event.finish_reason, "usage": event.usage,
-                    })
+                    # 先不 yield：done 帧要带 message_id，而 id 只有在落库
+                    # flush 之后才存在。持久化放到循环外统一做。
+                    done_event = event
                 elif isinstance(event, ErrorEvent):
                     yield sse_frame("error", {"code": event.code, "message": event.message})
+
+            # ★ 持久化必须在 done 帧之前完成：message_id 是前端反馈
+            # （POST /api/feedback）的唯一凭据，只能在 flush 后拿到。
+            if completed and done_event is not None:
+                answer_parts = final_answer if tool_calls_seen else preamble
+                answer = "".join(answer_parts)
+                if INSUFFICIENT_MARKER in answer:
+                    # spec §3.5.2：模型自评不足 → 替换为标准拒答话术 + 入池。
+                    answer = answer.replace(INSUFFICIENT_MARKER, REFUSAL_TEXT)
+                    await lcq_repo.create(
+                        db,
+                        req.message,
+                        str(conv.id),
+                        REASON_MODEL_INSUFFICIENT,
+                    )
+                    if tool_calls_seen:
+                        final_answer = [answer]
+                    else:
+                        preamble = [answer]
+
+                # ★ 完整序列：user → assistant(带 tool_calls) → tool 结果* → 最终 assistant
+                # 只存 user + 最终 assistant 会让下一轮回放历史时 tool_call_id
+                # 指向一条不存在的申请单，上游会直接报错——而且只在**第二轮**
+                # 才现形，单轮用例看不出来（见 tests/test_api_tools.py）。
+                to_store: list[BaseMessage] = [HumanMessage(req.message)]
+                if tool_calls_seen:
+                    to_store.append(AIMessage(
+                        content="".join(preamble), tool_calls=tool_calls_seen
+                    ))
+                    to_store.extend(tool_messages)
+                    to_store.append(AIMessage("".join(final_answer)))
+                else:
+                    to_store.append(AIMessage("".join(preamble)))
+                ids = await store.append(
+                    session_id,
+                    *to_store,
+                    metadata=retrieval_meta or None,
+                )
+                assistant_message_id = ids[-1] if ids else None
+                citations = list(retrieval_meta.get("citations") or [])
+
+                yield sse_frame("done", {
+                    "finish_reason": done_event.finish_reason,
+                    "usage": done_event.usage,
+                    "message_id": assistant_message_id,
+                    "citations": citations,
+                })
         except (GeneratorExit, asyncio.CancelledError):
             # 客户端中途断开（spec §9）：半截回复不写入历史，但要留痕，
             # 否则"回复莫名少了半截"在服务端完全不可见。
@@ -136,27 +208,12 @@ async def chat(
             )
             raise
         finally:
-            # 只在整轮正常结束时写入历史。客户端断开或上游出错时整轮丢弃，
-            # 否则会留下"两个 human 连排"的畸形历史（spec §7.2.1）。
-            if completed:
-                # ★ 完整序列：user → assistant(带 tool_calls) → tool 结果* → 最终 assistant
-                # 只存 user + 最终 assistant 会让下一轮回放历史时 tool_call_id
-                # 指向一条不存在的申请单，上游会直接报错——而且只在**第二轮**
-                # 才现形，单轮用例看不出来（见 tests/test_api_tools.py）。
-                to_store: list[BaseMessage] = [HumanMessage(req.message)]
-                if tool_calls_seen:
-                    to_store.append(AIMessage(
-                        content="".join(preamble), tool_calls=tool_calls_seen
-                    ))
-                    to_store.extend(tool_messages)
-                    to_store.append(AIMessage("".join(final_answer)))
-                else:
-                    to_store.append(AIMessage("".join(preamble)))
-                await store.append(session_id, *to_store)
-            # ★ 无条件提交，两件事分开看：get_or_create 产生的**会话行**即使
-            # 这一轮失败也要保留（否则下次请求又要重建，工具的外键还得先有），
-            # 而业务消息只在 completed 时才写。get_db 是 `async with` 形式，
-            # 不提交则未提交的写入在退出时被回滚——消息永远不落库。
+            # ★ 只提交、不再在 finally 里写消息：持久化已经挪到 done 帧
+            # 之前（message_id 需要 flush 后的 id）。客户端断开或上游出错时
+            # completed=False，上面的落库分支根本不会执行，历史仍然零痕迹。
+            # 无条件提交是另一件事：get_or_create 产生的**会话行**即使这一轮
+            # 失败也要保留（否则下次请求又要重建，工具的外键还得先有）。
+            # get_db 是 `async with` 形式，不提交则未提交的写入在退出时被回滚。
             await db.commit()
 
     return StreamingResponse(

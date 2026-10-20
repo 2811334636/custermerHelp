@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS messages (
   content         TEXT            NULL                     COMMENT '消息正文,assistant 纯工具调用时可为空',
   tool_calls      JSON            NULL                     COMMENT 'assistant 消息带的工具调用申请单',
   tool_call_id    VARCHAR(64)     NULL                     COMMENT 'tool 消息对应的申请单 id,回灌时对号入座',
+  metadata        JSON            NULL                     COMMENT '消息附加数据(ch04: citations/retrieval_strategy/top_score)',
   created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '产生时间',
   PRIMARY KEY (id),
   KEY idx_conversation_id (conversation_id),
