@@ -86,6 +86,43 @@ def test_ensure_collection_is_idempotent_when_collection_exists():
     client.create_collection.assert_not_called()
 
 
+def test_ensure_collection_rejects_dense_only_collection_when_bm25_requested():
+    """旧 dense-only 集合不能被静默复用：提示操作员走 --rebuild。"""
+    client = MagicMock()
+    client.has_collection.return_value = True
+    client.describe_collection.return_value = {
+        "fields": [{"name": "id"}, {"name": "vector"}]
+    }
+    store = VectorStore(
+        client=client, collection="knowledge", dim=1024, support_bm25=True
+    )
+
+    with pytest.raises(VectorStoreUnavailable, match="--rebuild"):
+        store.ensure_collection()
+
+
+def test_ensure_collection_accepts_existing_bm25_collection():
+    client = MagicMock()
+    client.has_collection.return_value = True
+    client.describe_collection.return_value = {
+        "fields": [{"name": "id"}, {"name": "vector"}, {"name": "sparse_vector"}]
+    }
+    store = VectorStore(
+        client=client, collection="knowledge", dim=1024, support_bm25=True
+    )
+
+    store.ensure_collection()  # 不抛异常
+
+
+def test_drop_collection_removes_existing_collection():
+    client = MagicMock()
+    client.has_collection.return_value = True
+
+    make_store(client).drop_collection()
+
+    client.drop_collection.assert_called_once_with("knowledge")
+
+
 def test_upsert_sends_rows():
     client = MagicMock()
     make_store(client).upsert(["a", "b"], [[0.0] * 1024, [1.0] * 1024])

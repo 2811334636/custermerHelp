@@ -1,8 +1,11 @@
 """离线建库 CLI。
 
-用法：uv run python -m jobs.build_knowledge
+用法：
+    uv run python -m jobs.build_knowledge            # 增量补建
+    uv run python -m jobs.build_knowledge --rebuild  # 删除集合 + 全量重建
 """
 
+import argparse
 import asyncio
 from pathlib import Path
 
@@ -13,11 +16,22 @@ from app.knowledge.builder import build
 from app.knowledge.sources.faq_table import load_faq_chunks
 from app.knowledge.sources.markdown import load_markdown_dir
 from app.knowledge.vector_store import VectorStore
+from app.repositories import knowledge_chunk as repo
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
 
-async def main() -> None:
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="离线建库")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="删除 Milvus collection 并把所有知识块重置为待向量化后全量重建",
+    )
+    return parser.parse_args()
+
+
+async def main(rebuild: bool = False) -> None:
     s = get_settings()
     try:
         # cron 重叠/手动重跑互斥：拿不到锁就干净退出，不排队、不半途而废。
@@ -41,6 +55,16 @@ async def main() -> None:
 
                 # 创建支持 BM25 的 VectorStore
                 store = VectorStore(support_bm25=True)
+                if rebuild:
+                    # 旧集合可能是 dense-only schema；ensure_collection 会拒绝
+                    # 复用。重建 = 删集合 + 状态全部回退 + 正常 build。
+                    store.drop_collection()
+                    reset = await repo.reset_all_to_pending(session)
+                    await session.commit()
+                    print(
+                        f"--rebuild：已删除 collection「{s.milvus_collection}」，"
+                        f"重置 {reset} 条知识块为待向量化"
+                    )
                 report = await build(session, chunks, store=store)
                 print(
                     f"完成：总数 {report.chunks_total}，本次待办 {report.chunks_pending}，"
@@ -53,4 +77,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(rebuild=_parse_args().rebuild))

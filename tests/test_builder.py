@@ -26,6 +26,23 @@ class FakeStore:
         return len(self.data)
 
 
+class FakeBm25Store(FakeStore):
+    """BM25 store：builder 必须走 dict 形态 upsert，content 非空。"""
+
+    support_bm25 = True
+
+    def __init__(self):
+        super().__init__()
+        self.upserted_data: list[dict] | None = None
+        self.vectors_arg: object = "not-called"
+
+    def upsert(self, ids_or_data, vectors=None):
+        self.vectors_arg = vectors
+        self.upserted_data = ids_or_data
+        for row in ids_or_data:
+            self.data[row["chunk_id"]] = row["vector"]
+
+
 async def fake_embed(texts):
     return [[float(len(t))] * 1024 for t in texts]
 
@@ -91,6 +108,35 @@ async def test_build_writes_mysql_then_vectors(builder_session):
     assert report.vectors_written == 2
     assert store.count() == 2
     assert await _vectorized(builder_session) == 2
+
+
+async def test_build_writes_dict_rows_with_content_for_bm25_store(builder_session):
+    """BM25 模式下必须写 dict + content，否则 sparse_vector 永远为空。"""
+    store = FakeBm25Store()
+    chunks = [
+        chunk(f"{PREFIX}b0", answer="满 99 元包邮。"),
+        chunk(f"{PREFIX}b1", answer="7 天无理由退货。"),
+    ]
+    report = await build(
+        builder_session,
+        chunks,
+        store=store,
+        embed=fake_embed,
+        only_ids=ids(chunks),
+    )
+
+    assert report.vectors_written == 2
+    assert store.vectors_arg is None, "BM25 模式不能走旧 upsert(ids, vectors) 签名"
+    assert store.upserted_data is not None
+    by_id = {row["chunk_id"]: row for row in store.upserted_data}
+    assert set(by_id) == ids(chunks)
+    for c in chunks:
+        row = by_id[c.chunk_id]
+        assert row["content"] == format_embedding_text(
+            c.category, c.questions, c.answer
+        )
+        assert row["content"], "content 不能为空——BM25 Function 靠它生成 sparse_vector"
+        assert len(row["vector"]) == 1024
 
 
 async def test_rerun_is_idempotent(builder_session):

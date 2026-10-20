@@ -18,7 +18,7 @@ def anyio_backend():
 
 
 def _clear_test_tables() -> None:
-    """清空测试库的 messages / tickets / conversations。
+    """清空测试库的 messages / tickets / conversations / low_confidence_questions。
 
     ★ 只对库名以 `_test` 结尾的库动手：哪怕配置被改错指向生产库，这里也绝不
     删真数据。宁可跳过清理（泄漏会以"行数又涨了"的形式暴露出来），也不能
@@ -43,8 +43,15 @@ def _clear_test_tables() -> None:
         engine = create_async_engine(db_url)
         try:
             async with engine.begin() as conn:
-                # tickets 的外键指向 conversations，得先删，否则删会话行撞外键
-                for table in ("messages", "tickets", "conversations"):
+                # tickets 的外键指向 conversations，得先删，否则删会话行撞外键。
+                # low_confidence_questions 无外键，但拒答用例可能 commit，
+                # 不清会跨 run 泄漏。
+                for table in (
+                    "messages",
+                    "tickets",
+                    "conversations",
+                    "low_confidence_questions",
+                ):
                     await conn.execute(text(f"DELETE FROM {table}"))
         finally:
             await engine.dispose()
@@ -54,7 +61,8 @@ def _clear_test_tables() -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def clean_test_db():
-    """整个测试会话开始前清一次库：messages / tickets / conversations。
+    """整个测试会话开始前清一次库：messages / tickets / conversations /
+    low_confidence_questions。
 
     为什么需要它：`/api/chat` 路由会**真提交**本轮写入（commit 不可撤销），
     每个驱动真路由的用例都会往这几张表里留下自己的会话行/消息行。不清的话

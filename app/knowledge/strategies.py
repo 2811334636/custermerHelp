@@ -202,7 +202,8 @@ async def _hybrid_rerank(
         logger.warning("重排不可用，退回混合检索结果：%s", exc)
         meta["rerank_applied"] = False
         meta["top_score"] = None
-        return chunks[:keep], meta
+        # 退回的是未重排的候选池：按调用方要求截断，不要套用重排保留数。
+        return chunks[:top_k], meta
 
     # 不信任上游索引范围：越界索引直接丢弃，避免一个坏响应打断整次检索。
     valid = [

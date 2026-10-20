@@ -175,6 +175,21 @@ async def get_by_ids(
     return list((await session.execute(stmt)).scalars())
 
 
+async def reset_all_to_pending(session: AsyncSession) -> int:
+    """把所有知识块重置为【待向量化】并清空 vector_id（仅供 --rebuild）。
+
+    重建 Milvus collection 后，旧状态全部失效；不清状态的话 build() 会认为
+    没有待办，新集合永远是空的。
+    """
+    result = await session.execute(
+        update(KnowledgeChunk)
+        .values(status=PENDING, vector_id=None)
+        .execution_options(synchronize_session="fetch")
+    )
+    await session.flush()
+    return result.rowcount
+
+
 async def count_all(session: AsyncSession) -> int:
     stmt = select(func.count()).select_from(KnowledgeChunk)
     return (await session.execute(stmt)).scalar_one()

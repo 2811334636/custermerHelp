@@ -209,6 +209,21 @@ async def test_get_by_ids_can_filter_to_vectorized(db_session):
     assert [r.chunk_id for r in rows] == ["a:1"]
 
 
+async def test_reset_all_to_pending_clears_status_and_vector_id(db_session):
+    """--rebuild 后所有块必须回到待向量化，否则新集合永远没有待办。"""
+    await repo.upsert_chunks(db_session, [make_chunk("r:0"), make_chunk("r:1")])
+    await repo.mark_vectorized(db_session, ["r:0"], ["r:0"])
+
+    changed = await repo.reset_all_to_pending(db_session)
+
+    assert changed >= 2
+    rows = await repo.get_by_ids(db_session, ["r:0", "r:1"])
+    assert [(r.status, r.vector_id) for r in rows] == [
+        ("待向量化", None),
+        ("待向量化", None),
+    ]
+
+
 async def test_counts(db_session):
     # 用增量断言，不依赖库里的绝对条数（其他测试可能 commit 过数据）
     before_all = await repo.count_all(db_session)

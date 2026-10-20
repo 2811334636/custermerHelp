@@ -43,13 +43,38 @@ class VectorStore:
         return self._collection
 
     @property
+    def support_bm25(self) -> bool:
+        """当前 store 是否为 BM25 schema（builder 据此决定 upsert 形态）。"""
+        return self._support_bm25
+
+    @property
     def uri(self) -> str:
         """返回 Milvus URI。"""
         return get_settings().milvus_uri
 
+    def _has_sparse_vector(self) -> bool:
+        """已存在的 collection 是否带 BM25 的 sparse_vector 字段。"""
+        try:
+            desc = self._client.describe_collection(self._collection)
+        except Exception as exc:  # noqa: BLE001
+            raise VectorStoreUnavailable(str(exc)) from exc
+        fields = desc.get("fields", []) if isinstance(desc, dict) else []
+        return any(field.get("name") == "sparse_vector" for field in fields)
+
     def ensure_collection(self) -> None:
-        """集合不存在时创建：VARCHAR 主键 + 指定维度的向量列 + COSINE 索引。"""
+        """集合不存在时创建：VARCHAR 主键 + 指定维度的向量列 + COSINE 索引。
+
+        已有的 collection 若与当前模式不匹配（要 BM25 但集合是旧的
+        dense-only schema），直接报错并指出重建命令——静默复用只会让
+        BM25/hybrid 永远召回为空，属于最难排查的一类故障。
+        """
         if self._client.has_collection(self._collection):
+            if self._support_bm25 and not self._has_sparse_vector():
+                raise VectorStoreUnavailable(
+                    f"collection「{self._collection}」是旧的 dense-only schema，"
+                    "缺少 sparse_vector/BM25 字段；请先运行 "
+                    "`uv run python -m jobs.build_knowledge --rebuild` 重建集合。"
+                )
             return
         schema = self._client.create_schema(auto_id=False)
         schema.add_field(
@@ -91,6 +116,14 @@ class VectorStore:
         self._client.create_collection(
             self._collection, schema=schema, index_params=index_params
         )
+
+    def drop_collection(self) -> None:
+        """删除整个 collection（仅 --rebuild 使用）。"""
+        try:
+            if self._client.has_collection(self._collection):
+                self._client.drop_collection(self._collection)
+        except Exception as exc:  # noqa: BLE001
+            raise VectorStoreUnavailable(str(exc)) from exc
 
     def upsert(
         self, ids_or_data: list[str] | list[dict], vectors: list[list[float]] | None = None
