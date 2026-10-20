@@ -51,7 +51,7 @@ uv run python -m evals.run_hybrid_evals   # dense / bm25 / hybrid / hybrid_reran
 | # | 标准 | 结果 / 证据 |
 |---|---|---|
 | 1 | 四策略对比报告能跑出数字 | ✅ `evals.run_hybrid_evals`（n=20）：dense R@3 .975 / R@10 1.000 / MRR .850；bm25 .850 / .950 / .787；hybrid 与 hybrid_rerank 均为 .925 / 1.000 / .796（未配 reranker key，后者=hybrid） |
-| 2 | 问「型号 ABC-123」，BM25 命中含该字符串的 chunk | ✅ `tests/acceptance/test_bm25_literal_match.py`；验收数据见 `knowledge/商品型号.md`（ABC-123 / XYZ-789） |
+| 2 | 问「型号 ABC-123」，BM25 命中含该字符串的 chunk | ✅ 手工演示：重建知识库后使用 `knowledge/商品型号.md`（ABC-123 / XYZ-789）；自动化验收：`tests/acceptance/test_bm25_literal_match.py` 使用临时 collection 中的内联 chunk，不依赖该文件入库 |
 | 3 | 回答中的 `[1]` 可点击，能看到来源原文与章节路径 | ✅ 前端引用弹窗 + `GET /api/chunks/{chunk_id}`；完整链路见 `tests/integration/test_ch04_full_pipeline.py` |
 | 4 | 问知识库没有的内容得到明确拒答，并进入低置信度池 | ✅ `tests/acceptance/test_refusal_and_low_confidence.py`（`reason=no_results`） |
 

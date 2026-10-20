@@ -189,6 +189,9 @@ def parse_sse(raw: str) -> list[tuple[str, dict]]:
 
 def test_hybrid_rerank_full_pipeline(client):
     """完整链路：混合检索 → 重排 → 引用编号 → SSE → 落库 → 原文回查。"""
+    # 路由会真提交会话行：非 *_test 库上直接失败，绝不污染生产库。
+    _assert_test_database()
+
     r = client.post("/api/chat", json={"message": NORMAL_QUESTION})
     assert r.status_code == 200
     events = parse_sse(r.text)
@@ -204,9 +207,11 @@ def test_hybrid_rerank_full_pipeline(client):
     # 2) tool end 帧带非空 citations，首条是真实 chunk_id。
     citations = tool_frames[1]["citations"]
     assert citations, "正常召回必须有引用"
+    # 引用编号必须与召回顺序一一对应（1-based），不能只看首条。
+    for position, citation in enumerate(citations):
+        assert citation["index"] == position + 1
+        assert isinstance(citation["chunk_id"], str) and citation["chunk_id"]
     first = citations[0]
-    assert first["index"] == 1
-    assert isinstance(first["chunk_id"], str) and first["chunk_id"]
 
     # 3) 浏览器看到的流式正文包含引用编号与运费内容。
     deltas = [d["text"] for n, d in events if n == "delta"]
@@ -227,13 +232,15 @@ def test_hybrid_rerank_full_pipeline(client):
     assert client.store.metadata[session_id]["retrieval_strategy"] == "hybrid_rerank"
     assert client.store.metadata[session_id]["top_score"] is not None
 
-    # 6) 引用编号可点：GET /api/chunks/{chunk_id} 返回原文与章节路径。
+    # 6) 引用编号可点：GET /api/chunks/{chunk_id} 返回原文与章节路径，
+    #    且这条引用确实指向运费知识块（不是随便一个 chunk_id）。
     resp = client.get(f"/api/chunks/{first['chunk_id']}")
     assert resp.status_code == 200
     body = resp.json()
     assert body["chunk_id"] == first["chunk_id"]
     assert body["content"]
     assert body["section_path"]
+    assert "运费" in (body["content"] or "") or "运费" in (body["questions"] or "")
 
 
 def _assert_test_database() -> str:
