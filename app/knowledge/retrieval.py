@@ -1,7 +1,14 @@
-"""在线语义检索：query → embedding → Milvus ids → MySQL 行。"""
+"""在线检索入口：query → 检索策略 → Milvus ids → MySQL 行 + 拒答控制。
+
+策略本身在 `app.knowledge.strategies`；本模块负责：
+- 构造/注入基础设施（VectorStore、embedding）；
+- 把 Milvus 返回的 id 还原成 MySQL 行（跳过孤儿/过期行并留痕）；
+- 拒答机制（空结果 / 重排低分）与低置信度问题入池。
+"""
 
 import asyncio
 import logging
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,36 +17,23 @@ from app.db.models import KnowledgeChunk
 from app.knowledge.embedding import embed_texts
 from app.knowledge.vector_store import VectorStore
 from app.repositories import knowledge_chunk as repo
+from app.repositories import low_confidence_question as lcq_repo
 
 logger = logging.getLogger(__name__)
 
+# 拒答原因：与 low_confidence_questions.reason 的取值一致。
+REASON_NO_RESULTS = "no_results"
+REASON_LOW_SCORE = "low_score"
 
-async def search(
-    session: AsyncSession,
-    query: str,
-    top_k: int | None = None,
-    *,
-    store=None,
-    embed=None,
+
+async def _load_chunks(
+    session: AsyncSession, ids: list[str]
 ) -> list[KnowledgeChunk]:
-    """按语义召回知识块，顺序严格跟随 Milvus 的相似度排名。
+    """把 Milvus 的 chunk id 还原成 MySQL 行，严格保持传入顺序。
 
-    store / embed 仅用于注入测试替身；生产路径用真实 Milvus 与 embedding。
     孤儿向量（Milvus 有、MySQL 无）会被跳过并记一条警告——它意味着双写
     不一致，静默吞掉会让缺口永远发现不了。
     """
-    s = get_settings()
-    if store is None:
-        # 构造 MilvusClient 是同步阻塞调用（不可达时会等约 10s）。放进线程，
-        # 才能让 ToolRegistry 的 asyncio.wait_for(3s) 真正打断它（final review C1）。
-        store = await asyncio.to_thread(VectorStore)
-    if embed is None:
-        embed = embed_texts
-
-    query_vector = (await embed([query]))[0]
-    limit = top_k if top_k is not None else s.retrieval_top_k
-    # 同理：pymilvus 的 search 也是同步网络调用，必须离开事件循环。
-    ids = await asyncio.to_thread(store.search, query_vector, limit)
     if not ids:
         return []
 
@@ -65,5 +59,71 @@ async def search(
                 len(orphan_ids),
                 ", ".join(orphan_ids),
             )
-    # 严格保持 Milvus 顺序，不能用 get_by_ids 的 chunk_id 排序。
+    # 严格保持检索顺序，不能用 get_by_ids 的 chunk_id 排序。
     return [by_id[i] for i in ids if i in by_id]
+
+
+async def _refuse(
+    session: AsyncSession, query: str, session_id: str, reason: str
+) -> None:
+    """拒答：问题入低置信度池，供后续知识盲区分析。"""
+    await lcq_repo.create(session, query, session_id, reason)
+    logger.warning(
+        "检索拒答（reason=%s），问题已入低置信度问题池：%s", reason, query
+    )
+
+
+async def search(
+    session: AsyncSession,
+    query: str,
+    top_k: int | None = None,
+    *,
+    store: Any | None = None,
+    embed: Any | None = None,
+    strategy: str = "dense",
+    session_id: str = "",
+) -> list[KnowledgeChunk]:
+    """按策略召回知识块，并执行拒答控制。
+
+    `strategy` 刻意不默认读配置：ch03 的调用方与测试默认期望 dense 行为；
+    生产路径（query_faq）显式传 ``settings.retrieval_strategy``。
+
+    store / embed 仅用于注入测试替身；生产路径用真实 Milvus 与 embedding。
+    拒答时返回空列表——面向用户的拒答话术由上层（Task 7）负责。
+    """
+    s = get_settings()
+    if store is None:
+        # 构造 MilvusClient 是同步阻塞调用（不可达时会等约 10s）。放进线程，
+        # 才能让 ToolRegistry 的 asyncio.wait_for(3s) 真正打断它（final review C1）。
+        store = await asyncio.to_thread(VectorStore)
+    if embed is None:
+        embed = embed_texts
+
+    limit = top_k if top_k is not None else s.retrieval_top_k
+
+    # 延迟导入：strategies 复用本模块的 _load_chunks，模块级互相导入会成环。
+    from app.knowledge.strategies import retrieve_with_strategy
+
+    chunks, meta = await retrieve_with_strategy(
+        session, query, strategy, limit, store=store, embed=embed
+    )
+
+    if not chunks:
+        await _refuse(session, query, session_id, REASON_NO_RESULTS)
+        return []
+
+    # 只有重排策略有可比较的分数；dense/bm25/hybrid 的 RRF/相似度不可比，
+    # 不能拿阈值误杀。
+    if meta.get("strategy") == "hybrid_rerank" and meta.get("rerank_applied"):
+        top_score = meta.get("top_score")
+        if top_score is not None and top_score < s.retrieval_rerank_threshold:
+            await _refuse(session, query, session_id, REASON_LOW_SCORE)
+            return []
+
+    logger.info(
+        "检索完成 strategy=%s 返回=%d 条 top_score=%s",
+        meta.get("strategy"),
+        len(chunks),
+        meta.get("top_score"),
+    )
+    return chunks

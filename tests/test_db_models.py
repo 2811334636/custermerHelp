@@ -8,6 +8,7 @@ def test_all_tables_registered():
     assert set(Base.metadata.tables) == {
         "conversations", "messages", "faq", "tickets",
         "knowledge_chunks", "mined_qa_staging",
+        "low_confidence_questions",
     }
 
 

@@ -117,6 +117,36 @@ def test_upsert_failure_is_wrapped():
         make_store(client).upsert(["a"], [[0.0] * 1024])
 
 
+def test_bm25_search_queries_sparse_field():
+    """纯 BM25 走 sparse_vector + BM25 metric，不能退回 dense。"""
+    client = MagicMock()
+    client.search.return_value = [[{"id": "a"}, {"id": "b"}]]
+    ids = make_store(client).bm25_search("运费", top_k=2)
+
+    assert ids == ["a", "b"]
+    client.search.assert_called_once_with(
+        collection_name="knowledge",
+        data=["运费"],
+        anns_field="sparse_vector",
+        search_params={"metric_type": "BM25"},
+        limit=2,
+        output_fields=["id"],
+    )
+
+
+def test_bm25_search_empty_result_is_empty_list():
+    client = MagicMock()
+    client.search.return_value = [[]]
+    assert make_store(client).bm25_search("运费", top_k=3) == []
+
+
+def test_bm25_search_failure_is_wrapped():
+    client = MagicMock()
+    client.search.side_effect = RuntimeError("connection refused")
+    with pytest.raises(VectorStoreUnavailable):
+        make_store(client).bm25_search("运费", top_k=3)
+
+
 def test_count_uses_count_star():
     client = MagicMock()
     client.query.return_value = [{"count(*)": 42}]

@@ -151,6 +151,27 @@ class VectorStore:
             return []
         return [hit["id"] for hit in res[0]]
 
+    def bm25_search(self, query_text: str, top_k: int) -> list[str]:
+        """纯 BM25 全文检索：返回匹配度从高到低的 chunk id。
+
+        BM25 是 hybrid_search 的稀疏分支；单独抽出来供 `bm25` 策略与
+        四策略评估使用（评估必须能单独观测 BM25 这一路）。
+        """
+        try:
+            res = self._client.search(
+                collection_name=self._collection,
+                data=[query_text],
+                anns_field="sparse_vector",
+                search_params={"metric_type": "BM25"},
+                limit=top_k,
+                output_fields=["id"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise VectorStoreUnavailable(str(exc)) from exc
+        if not res:
+            return []
+        return [hit["id"] for hit in res[0]]
+
     def count(self) -> int:
         try:
             rows = self._client.query(

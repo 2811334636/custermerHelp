@@ -100,6 +100,20 @@ class KnowledgeChunk(Base):
     )
 
 
+class LowConfidenceQuestion(Base):
+    """低置信度问题池：检索为空、重排低分或模型自评不足时入池。"""
+
+    __tablename__ = "low_confidence_questions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    question: Mapped[str] = mapped_column(Text)
+    session_id: Mapped[str] = mapped_column(String(255), index=True)
+    reason: Mapped[str] = mapped_column(String(50))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        server_default=func.current_timestamp()
+    )
+
+
 class MinedQaStaging(Base):
     __tablename__ = "mined_qa_staging"
 
