@@ -1,6 +1,95 @@
-# 电商智能客服 · ch01 纯对话 → ch02 Function Calling → ch03 知识库与向量检索
+# 电商智能客服 · ch01 纯对话 → ch02 Function Calling → ch03 知识库与向量检索 → ch04 混合检索与重排
 
-## ch03 · 知识库与向量检索（当前章节）
+## ch04 · 混合检索与重排（当前章节）
+
+检索从纯向量升级为「稠密 + BM25 → RRF 融合 → 重排」，并补上引用溯源、
+拒答与低置信度问题池。
+
+### 新增配置
+
+`.env` 中新增（完整清单见 `.env.example`）：
+
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `APP_RETRIEVAL_STRATEGY` | `hybrid_rerank` | `dense` / `bm25` / `hybrid` / `hybrid_rerank` |
+| `APP_RERANKER_API_KEY` | 空 | 留空时 `hybrid_rerank` 自动退化为 `hybrid` |
+| `APP_RERANKER_MODEL` | `bge-reranker-v2-m3` | 重排模型 |
+| `APP_RETRIEVAL_DENSE_TOP_K` | `50` | 稠密候选数 |
+| `APP_RETRIEVAL_BM25_TOP_K` | `50` | BM25 候选数 |
+| `APP_RETRIEVAL_RERANK_TOP_K` | `10` | 重排后保留数 |
+| `APP_RETRIEVAL_RERANK_THRESHOLD` | `0.5` | 重排最高分低于该值 → 拒答入池 |
+| `APP_RERANK_ARRANGEMENT_STRATEGY` | `first_last` | `first_last` / `score_desc` |
+
+`APP_RERANKER_BASE_URL` / `APP_RERANKER_TIMEOUT` 也可按需覆盖。
+
+### 启动
+
+```bash
+docker compose up -d
+uv run python -m scripts.seed          # 首次：建库 + 灌 FAQ 种子
+uv run python -m jobs.build_knowledge  # 切分 + 向量化（含 BM25 字段）
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+> **从 ch03 升级必须重建集合。** ch03 建的是 dense-only collection，缺少
+> `sparse_vector`/BM25 字段；直接建库会明确报错。先执行
+> `uv run python -m jobs.build_knowledge --rebuild`（删除旧集合 + 全量重嵌入，
+> 会重新调用 embedding 上游），不要手工删除 collection。
+
+### 评估
+
+```bash
+uv run python -m evals.run_hybrid_evals   # dense / bm25 / hybrid / hybrid_rerank 四策略对比
+```
+
+报告输出 Recall@3 / Recall@10 / MRR（总体 + 按 query_type 分桶）。若未配置
+`APP_RERANKER_API_KEY`，`hybrid_rerank` 行实际退化为 `hybrid`（脚本会打印
+`hybrid_rerank 实际启用重排：0/20 条`）——这一行**不代表**重排效果。
+
+### 验收结果
+
+| # | 标准 | 结果 / 证据 |
+|---|---|---|
+| 1 | 四策略对比报告能跑出数字 | ✅ `evals.run_hybrid_evals`（n=20）：dense R@3 .975 / R@10 1.000 / MRR .850；bm25 .850 / .950 / .787；hybrid 与 hybrid_rerank 均为 .925 / 1.000 / .796（未配 reranker key，后者=hybrid） |
+| 2 | 问「型号 ABC-123」，BM25 命中含该字符串的 chunk | ✅ `tests/acceptance/test_bm25_literal_match.py`；验收数据见 `knowledge/商品型号.md`（ABC-123 / XYZ-789） |
+| 3 | 回答中的 `[1]` 可点击，能看到来源原文与章节路径 | ✅ 前端引用弹窗 + `GET /api/chunks/{chunk_id}`；完整链路见 `tests/integration/test_ch04_full_pipeline.py` |
+| 4 | 问知识库没有的内容得到明确拒答，并进入低置信度池 | ✅ `tests/acceptance/test_refusal_and_low_confidence.py`（`reason=no_results`） |
+
+### 新增功能
+
+- **混合检索**：Dense + BM25 → RRF（k=60）融合
+- **重排**：`bge-reranker-v2-m3` Top-10；上游故障自动退回未重排的混合结果
+- **引用溯源**：tool end / done 帧携带 citations，随最终 assistant 消息落库 `messages.metadata`
+- **拒答**：检索为空（`no_results`）、重排低分（`low_score`）、模型自评不足（`model_insufficient`）
+- **低置信度问题池**：`low_confidence_questions` 表（本章无 HTTP 接口，用 SQL 查询）
+- **满意度反馈**：前端 👍👎 调 `POST /api/feedback`；本章只校验并返回 `{"status": "ok"}`，**尚未落库**
+
+### 查询引用与低置信度池
+
+```sql
+-- 最近回答的引用（最终 assistant 行的 messages.metadata）
+SELECT id, conversation_id, JSON_EXTRACT(metadata, '$.citations') AS citations
+FROM messages
+WHERE role = 'assistant' AND metadata IS NOT NULL
+ORDER BY id DESC LIMIT 5;
+
+-- 低置信度问题池：按原因统计
+SELECT reason, COUNT(*) AS n
+FROM low_confidence_questions
+GROUP BY reason;
+
+-- 最新入池的原话
+SELECT question, reason, session_id, created_at
+FROM low_confidence_questions
+ORDER BY created_at DESC LIMIT 20;
+```
+
+```bash
+docker exec -i custermerhelp-mysql mysql -uapp -papppw customer_service \
+  -e "SELECT question, reason, created_at FROM low_confidence_questions ORDER BY created_at DESC LIMIT 20;"
+```
+
+## ch03 · 知识库与向量检索（上一章）
 
 `query_faq` 的内部实现从关键词查表升级为 Milvus dense 向量语义检索，工具的
 名称、入参、出参契约保持不变。知识来自 Markdown 手册、存量 FAQ 表与从历史
@@ -192,6 +281,8 @@ EVAL_PROMPT_FILE=/tmp/old_prompts.py uv run python -m evals.run_evals   # 期望
 |---|---|---|
 | POST | `/api/chat` | SSE 流式对话。事件序列 `meta? → (tool* → delta*)? → (done \| error)`；`tool` 帧成对出现（`phase:start` 声明调了谁，`phase:end` 声明结果如何） |
 | POST | `/api/extract` | 售后描述 → 结构化工单 JSON |
+| GET | `/api/chunks/{chunk_id}` | 引用溯源：返回 chunk 原文、章节路径与来源 |
+| POST | `/api/feedback` | 满意度反馈（本章只校验并返回 ok，不落库） |
 | GET | `/healthz` | 健康检查 |
 
 ## 关键约束（改代码前必读）
