@@ -25,6 +25,7 @@ import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessageChunk
 from sqlalchemy import select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api import get_store
@@ -97,6 +98,24 @@ class RefusalModel:
 
 
 @pytest.fixture(autouse=True)
+def _fake_embedding(monkeypatch):
+    """固定 1024 维单位向量，移除验收对在线 embedding API 的依赖。
+
+    生产路径在 ``retrieval.search_with_metadata`` 里解析 ``embed_texts``
+    （模块级导入），所以补丁打在该模块的引用上即可；strategies 收到的是
+    这里显式传入的函数，不会再回落到自己的默认值。Milvus + MySQL 仍是真实的。
+    """
+    from app.knowledge import retrieval
+
+    dim = get_settings().embedding_dim
+
+    async def _unit_embeddings(texts: list[str]) -> list[list[float]]:
+        return [[1.0] + [0.0] * (dim - 1) for _ in texts]
+
+    monkeypatch.setattr(retrieval, "embed_texts", _unit_embeddings)
+
+
+@pytest.fixture(autouse=True)
 def _identity_rewrite(monkeypatch):
     """query 改写是可选的 LLM 增强；验收只关心检索与拒答，不依赖在线 LLM。
 
@@ -162,11 +181,25 @@ def parse_sse(raw: str) -> list[tuple[str, dict]]:
     return out
 
 
+def _assert_test_database() -> str:
+    """只允许清理 *_test 库，行为与 tests/conftest.py::_clear_test_tables 一致。
+
+    `DELETE` 会随路由的 commit 变成不可撤销的写入；库名配错指向生产库时，
+    宁可让用例失败，也不能清掉真实数据。
+    """
+    db_name = make_url(get_settings().db_url).database or ""
+    assert db_name.endswith("_test"), (
+        f"拒绝在非 *_test 库上清理低置信度池（当前库：{db_name!r}）"
+    )
+    return db_name
+
+
 async def _fetch_pool(session_id: str):
     """另起引擎读已提交行，并顺带取会话主键。
 
     路由在 portal 循环里提交；外层测试循环复用原 session/连接会撞上
     “got Future attached to a different loop”（见 tests/test_api.py 注释）。
+    只选本用例自己的行：question + 会话主键双重限定。
     """
     engine = create_async_engine(get_settings().db_url)
     try:
@@ -179,7 +212,14 @@ async def _fetch_pool(session_id: str):
                 )
             ).scalar_one()
             rows = list(
-                (await other.execute(select(LowConfidenceQuestion))).scalars()
+                (
+                    await other.execute(
+                        select(LowConfidenceQuestion).where(
+                            LowConfidenceQuestion.question == QUESTION,
+                            LowConfidenceQuestion.session_id == str(conv.id),
+                        )
+                    )
+                ).scalars()
             )
             return conv.id, [
                 (row.question, row.reason, row.session_id) for row in rows
@@ -189,10 +229,18 @@ async def _fetch_pool(session_id: str):
 
 
 async def test_refusal_and_low_confidence_pool(client, db_session, empty_kb):
+    _assert_test_database()
+
     # 不用 TRUNCATE：TRUNCATE 隐式提交，会破坏 db_session fixture 的事务边界。
+    # 只清本用例的 question，绝不做无 WHERE 的全表 DELETE。
     # 通过 portal 在应用所在循环里执行，连接才不会跨事件循环串用。
     async def _clear_pool():
-        await db_session.execute(text("DELETE FROM low_confidence_questions"))
+        await db_session.execute(
+            text(
+                "DELETE FROM low_confidence_questions WHERE question = :question"
+            ),
+            {"question": QUESTION},
+        )
 
     client.portal.call(_clear_pool)
 
