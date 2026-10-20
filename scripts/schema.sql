@@ -78,6 +78,19 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
   KEY idx_content_type (content_type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ch04 · 低置信度问题池
+-- 与 scripts/add_low_confidence_table.sql（历史迁移）保持同一份 DDL；
+-- 新装库由本文件建表，已有库用 scripts/alter_ch04.sql 补齐。
+CREATE TABLE IF NOT EXISTS low_confidence_questions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    question TEXT NOT NULL,
+    session_id VARCHAR(255) NOT NULL,
+    reason VARCHAR(50) NOT NULL COMMENT 'no_results/low_score/model_insufficient',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_session (session_id),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- 挖掘暂存区:LLM 从会话中抽出的问答候选,人审/去重后进 knowledge_chunks
 CREATE TABLE IF NOT EXISTS mined_qa_staging (
   id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

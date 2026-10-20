@@ -65,6 +65,7 @@ async def _dense_only(
     *,
     store: Any | None = None,
     embed: Any | None = None,
+    filter_expr: str | None = None,
 ) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
     """纯向量检索（ch03 模式）。"""
     if store is None:
@@ -73,7 +74,9 @@ async def _dense_only(
         embed = embed_texts
 
     query_vector = (await embed([query]))[0]
-    ids = await asyncio.to_thread(store.search, query_vector, top_k)
+    ids = await asyncio.to_thread(
+        store.search, query_vector, top_k, filter_expr=filter_expr
+    )
     chunks = await _load_chunks(session, ids)
     meta: dict[str, Any] = {
         "strategy": "dense",
@@ -92,12 +95,15 @@ async def _bm25_only(
     top_k: int,
     *,
     store: Any | None = None,
+    filter_expr: str | None = None,
 ) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
     """纯 BM25 全文检索。"""
     if store is None:
         store = await _default_store()
 
-    ids = await asyncio.to_thread(store.bm25_search, query, top_k)
+    ids = await asyncio.to_thread(
+        store.bm25_search, query, top_k, filter_expr=filter_expr
+    )
     chunks = await _load_chunks(session, ids)
     meta: dict[str, Any] = {
         "strategy": "bm25",
@@ -116,6 +122,7 @@ async def _hybrid_ids(
     *,
     store: Any | None,
     embed: Any | None,
+    filter_expr: str | None = None,
 ) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
     """混合召回公共部分：embedding → hybrid_search → MySQL 行 + 计数。"""
     if store is None:
@@ -135,6 +142,7 @@ async def _hybrid_ids(
         dense_limit,
         bm25_limit,
         final_limit,
+        filter_expr=filter_expr,
     )
     chunks = await _load_chunks(session, ids)
 
@@ -165,10 +173,16 @@ async def _hybrid(
     *,
     store: Any | None = None,
     embed: Any | None = None,
+    filter_expr: str | None = None,
 ) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
     """混合检索 + RRF 融合，不重排。"""
     return await _hybrid_ids(
-        session, query, top_k, store=store, embed=embed
+        session,
+        query,
+        top_k,
+        store=store,
+        embed=embed,
+        filter_expr=filter_expr,
     )
 
 
@@ -180,6 +194,7 @@ async def _hybrid_rerank(
     store: Any | None = None,
     embed: Any | None = None,
     rerank_fn: RerankFn | None = None,
+    filter_expr: str | None = None,
 ) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
     """混合检索 → 重排 → 按配置排列。"""
     s = get_settings()
@@ -187,7 +202,12 @@ async def _hybrid_rerank(
     # 输出保留 retrieval_rerank_top_k 条且不超过调用方要求。
     candidate_limit = max(top_k, s.retrieval_dense_top_k, s.retrieval_bm25_top_k)
     chunks, meta = await _hybrid_ids(
-        session, query, candidate_limit, store=store, embed=embed
+        session,
+        query,
+        candidate_limit,
+        store=store,
+        embed=embed,
+        filter_expr=filter_expr,
     )
     meta["strategy"] = "hybrid_rerank"
 
@@ -210,6 +230,14 @@ async def _hybrid_rerank(
         meta["rerank_applied"] = False
         meta["top_score"] = None
         # 退回的是未重排的候选池：按调用方要求截断，不要套用重排保留数。
+        return chunks[:top_k], meta
+
+    if not ranked:
+        # 上游返回空列表（而非抛错）同样是"重排不可用"，不是"没有相关知识"：
+        # 若当成低分/空结果会误触发拒答。按不可用降级处理。
+        logger.warning("重排返回空结果，退回混合检索结果")
+        meta["rerank_applied"] = False
+        meta["top_score"] = None
         return chunks[:top_k], meta
 
     # 不信任上游索引范围：越界索引直接丢弃，避免一个坏响应打断整次检索。
@@ -249,17 +277,24 @@ async def retrieve_with_strategy(
     embed: Any | None = None,
     rerank_fn: RerankFn | None = None,
     rewrite_fn: RewriteFn | None = None,
+    filter_expr: str | None = None,
 ) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
     """按策略检索，返回 (chunks, metadata)。
 
     除 dense 外都会先做 query 改写（失败时 rewrite_query 自身回退原 query）。
+    ``filter_expr`` 透传给底层的 Milvus 检索（spec §3.3），四种策略一致。
     """
     if strategy not in STRATEGIES:
         raise ValueError(f"Unknown strategy: {strategy}")
 
     if strategy == "dense":
         return await _dense_only(
-            session, query, top_k, store=store, embed=embed
+            session,
+            query,
+            top_k,
+            store=store,
+            embed=embed,
+            filter_expr=filter_expr,
         )
 
     rewrite = rewrite_fn or query_rewrite.rewrite_query
@@ -267,11 +302,16 @@ async def retrieve_with_strategy(
 
     if strategy == "bm25":
         return await _bm25_only(
-            session, rewritten, top_k, store=store
+            session, rewritten, top_k, store=store, filter_expr=filter_expr
         )
     if strategy == "hybrid":
         return await _hybrid(
-            session, rewritten, top_k, store=store, embed=embed
+            session,
+            rewritten,
+            top_k,
+            store=store,
+            embed=embed,
+            filter_expr=filter_expr,
         )
     return await _hybrid_rerank(
         session,
@@ -280,4 +320,5 @@ async def retrieve_with_strategy(
         store=store,
         embed=embed,
         rerank_fn=rerank_fn,
+        filter_expr=filter_expr,
     )

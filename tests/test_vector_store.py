@@ -43,9 +43,20 @@ def test_search_passes_top_k_and_explicit_retrieval_params():
         search_params={"metric_type": "COSINE"},
         limit=7,
         output_fields=["id"],
+        filter="",
     )
     # 裸 metric_type= 会被 pymilvus 3.0.2 接受但静默忽略，不能出现。
     assert "metric_type" not in client.search.call_args.kwargs
+
+
+def test_search_passes_filter_expr_to_milvus():
+    """过滤必须下推到 Milvus（spec §3.3），不是 Python 侧过滤。"""
+    client = MagicMock()
+    client.search.return_value = []
+    make_store(client).search(
+        [0.0] * 1024, top_k=3, filter_expr='category == "售后政策"'
+    )
+    assert client.search.call_args.kwargs["filter"] == 'category == "售后政策"'
 
 
 def test_ensure_collection_creates_schema_and_cosine_index():
@@ -67,6 +78,13 @@ def test_ensure_collection_creates_schema_and_cosine_index():
         "id", DataType.VARCHAR, is_primary=True, max_length=512
     )
     schema.add_field.assert_any_call("vector", DataType.FLOAT_VECTOR, dim=1024)
+    # spec §3.3：元数据字段必须进 Milvus schema，供服务端 filter 使用。
+    schema.add_field.assert_any_call(
+        "category", DataType.VARCHAR, max_length=255, nullable=True
+    )
+    schema.add_field.assert_any_call(
+        "section_path", DataType.VARCHAR, max_length=512, nullable=True
+    )
     # Task 0 实测：pymilvus 3.0.2 顶层没有 IndexParams，必须用公开工厂。
     client.prepare_index_params.assert_called_once_with()
     index_params.add_index.assert_called_once_with(
@@ -105,13 +123,34 @@ def test_ensure_collection_accepts_existing_bm25_collection():
     client = MagicMock()
     client.has_collection.return_value = True
     client.describe_collection.return_value = {
-        "fields": [{"name": "id"}, {"name": "vector"}, {"name": "sparse_vector"}]
+        "fields": [
+            {"name": "id"},
+            {"name": "vector"},
+            {"name": "sparse_vector"},
+            {"name": "category"},
+        ]
     }
     store = VectorStore(
         client=client, collection="knowledge", dim=1024, support_bm25=True
     )
 
     store.ensure_collection()  # 不抛异常
+
+
+def test_ensure_collection_rejects_bm25_collection_without_category():
+    """旧 BM25 集合缺 category：过滤无法下推，必须 --rebuild。"""
+    client = MagicMock()
+    client.has_collection.return_value = True
+    client.describe_collection.return_value = {
+        "fields": [{"name": "id"}, {"name": "vector"}, {"name": "sparse_vector"}]
+    }
+    store = VectorStore(
+        client=client, collection="knowledge", dim=1024, support_bm25=True
+    )
+
+    with pytest.raises(VectorStoreUnavailable, match="category") as exc:
+        store.ensure_collection()
+    assert "--rebuild" in str(exc.value)
 
 
 def test_drop_collection_removes_existing_collection():
@@ -129,6 +168,70 @@ def test_upsert_sends_rows():
     client.upsert.assert_called_once_with(
         "knowledge",
         [{"id": "a", "vector": [0.0] * 1024}, {"id": "b", "vector": [1.0] * 1024}],
+    )
+
+
+def test_upsert_dict_mode_includes_metadata_without_bm25():
+    """非 BM25 模式也走字典行，category/section_path 必须写入。"""
+    client = MagicMock()
+    make_store(client).upsert([
+        {
+            "chunk_id": "a",
+            "vector": [0.0] * 1024,
+            "category": "售后政策",
+            "section_path": "售后政策 > 退货",
+        }
+    ])
+    client.upsert.assert_called_once_with(
+        "knowledge",
+        [
+            {
+                "id": "a",
+                "vector": [0.0] * 1024,
+                "category": "售后政策",
+                "section_path": "售后政策 > 退货",
+            }
+        ],
+    )
+
+
+def test_upsert_dict_mode_includes_content_and_metadata_for_bm25():
+    client = MagicMock()
+    store = VectorStore(
+        client=client, collection="knowledge", dim=1024, support_bm25=True
+    )
+    store.upsert([
+        {
+            "chunk_id": "a",
+            "content": "退货文本",
+            "vector": [0.0] * 1024,
+            "category": "售后政策",
+            "section_path": "售后政策 > 退货",
+        }
+    ])
+    client.upsert.assert_called_once_with(
+        "knowledge",
+        [
+            {
+                "id": "a",
+                "vector": [0.0] * 1024,
+                "content": "退货文本",
+                "category": "售后政策",
+                "section_path": "售后政策 > 退货",
+            }
+        ],
+    )
+
+
+def test_legacy_upsert_keeps_working_and_leaves_metadata_null():
+    """旧签名仍可用；没有元数据的行由 nullable 字段留空。"""
+    client = MagicMock()
+    store = VectorStore(
+        client=client, collection="knowledge", dim=1024, support_bm25=True
+    )
+    store.upsert(["a"], [[0.0] * 1024])
+    client.upsert.assert_called_once_with(
+        "knowledge", [{"id": "a", "vector": [0.0] * 1024, "content": None}]
     )
 
 
@@ -168,7 +271,17 @@ def test_bm25_search_queries_sparse_field():
         search_params={"metric_type": "BM25"},
         limit=2,
         output_fields=["id"],
+        filter="",
     )
+
+
+def test_bm25_search_passes_filter_expr_to_milvus():
+    client = MagicMock()
+    client.search.return_value = []
+    make_store(client).bm25_search(
+        "运费", top_k=2, filter_expr='category == "A"'
+    )
+    assert client.search.call_args.kwargs["filter"] == 'category == "A"'
 
 
 def test_bm25_search_empty_result_is_empty_list():

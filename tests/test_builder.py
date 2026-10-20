@@ -12,14 +12,22 @@ PREFIX = "testbuilder:"
 
 
 class FakeStore:
+    """非 BM25 替身：ch04 起 builder 也会传字典行（携带元数据）。"""
+
     def __init__(self):
         self.data: dict[str, list[float]] = {}
+        self.upserted_data: list[dict] | None = None
 
     def ensure_collection(self):
         pass
 
-    def upsert(self, ids, vectors):
-        for i, v in zip(ids, vectors):
+    def upsert(self, ids_or_data, vectors=None):
+        self.upserted_data = ids_or_data
+        if ids_or_data and isinstance(ids_or_data[0], dict):
+            for row in ids_or_data:
+                self.data[row["chunk_id"]] = row["vector"]
+            return
+        for i, v in zip(ids_or_data, vectors):
             self.data[i] = v
 
     def count(self):
@@ -137,6 +145,27 @@ async def test_build_writes_dict_rows_with_content_for_bm25_store(builder_sessio
         )
         assert row["content"], "content 不能为空——BM25 Function 靠它生成 sparse_vector"
         assert len(row["vector"]) == 1024
+        # spec §3.3：元数据必须进 Milvus，过滤才能下推。
+        assert row["category"] == c.category
+        assert row["section_path"] == c.section_path
+
+
+async def test_build_writes_dict_rows_with_metadata_for_dense_store(builder_session):
+    """非 BM25 模式也要写字典行（含元数据），但不能带 content 字段。"""
+    store = FakeStore()
+    c = chunk(f"{PREFIX}d0")
+    await build(
+        builder_session, [c], store=store, embed=fake_embed, only_ids=ids([c])
+    )
+
+    assert store.upserted_data == [
+        {
+            "chunk_id": c.chunk_id,
+            "vector": store.data[c.chunk_id],
+            "category": c.category,
+            "section_path": c.section_path,
+        }
+    ]
 
 
 async def test_rerun_is_idempotent(builder_session):

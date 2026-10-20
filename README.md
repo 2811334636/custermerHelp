@@ -31,10 +31,21 @@ uv run python -m jobs.build_knowledge  # 切分 + 向量化（含 BM25 字段）
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
+> **从 ch03 升级的已有数据库要先补结构。** `scripts/schema.sql` 只对全新安装
+> 生效；已存在的 ch03 库需执行一次（幂等，可重复执行）：
+>
+> ```bash
+> docker exec -i custermerhelp-mysql mysql -uapp -papppw customer_service \
+>   < scripts/alter_ch04.sql
+> ```
+>
+> 脚本会补 `messages.metadata` 列与 `low_confidence_questions` 表；测试库
+> `customer_service_test` 用同样命令替换库名即可。
+>
 > **从 ch03 升级必须重建集合。** ch03 建的是 dense-only collection，缺少
-> `sparse_vector`/BM25 字段；直接建库会明确报错。先执行
-> `uv run python -m jobs.build_knowledge --rebuild`（删除旧集合 + 全量重嵌入，
-> 会重新调用 embedding 上游），不要手工删除 collection。
+> `sparse_vector`/BM25 和 `category`/`section_path` 字段；直接建库会明确报错。
+> 先执行 `uv run python -m jobs.build_knowledge --rebuild`（删除旧集合 + 全量
+> 重嵌入，会重新调用 embedding 上游），不要手工删除 collection。
 
 ### 评估
 

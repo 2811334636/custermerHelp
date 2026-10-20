@@ -18,8 +18,12 @@ from app.api import get_store
 from app.config import get_settings
 from app.db.base import get_db
 from app.db.models import Conversation, LowConfidenceQuestion
+from app.knowledge import retrieval as retrieval_module
 from app.main import app
 from app.providers import get_default_chat_model
+
+# 在 autouse fixture 替换模块属性之前保存真实入口，供"重复入池"用例恢复。
+_REAL_SEARCH_WITH_METADATA = retrieval_module.search_with_metadata
 
 
 class FakeStore:
@@ -85,6 +89,33 @@ class InsufficientModel:
 
     async def astream(self, messages):
         yield AIMessageChunk(content="<INSUFFICIENT_KNOWLEDGE>")
+
+
+class ToolThenInsufficientModel:
+    """先申请 query_faq（触发真实检索拒答），再自评知识不足。"""
+
+    def __init__(self, keyword: str = "火星天气怎么样"):
+        self._keyword = keyword
+        self._bound = []
+
+    def bind_tools(self, tools):
+        self._bound = list(tools)
+        return self
+
+    async def astream(self, messages):
+        if self._bound:
+            yield AIMessageChunk(
+                content="",
+                tool_call_chunks=[{
+                    "name": "query_faq",
+                    "args": json.dumps({"keyword": self._keyword}),
+                    "id": "call_refuse",
+                    "index": 0,
+                    "type": "tool_call_chunk",
+                }],
+            )
+        else:
+            yield AIMessageChunk(content="<INSUFFICIENT_KNOWLEDGE>")
 
 
 class SplitMarkerModel:
@@ -312,6 +343,66 @@ def test_model_insufficient_marker_is_replaced_and_pooled(client):
 
     conv_id, pooled = client.portal.call(_fetch)
     assert pooled == [("model_insufficient", str(conv_id))]
+
+
+def test_retrieval_refusal_does_not_double_pool_when_model_marks_insufficient(
+    client, monkeypatch
+):
+    """检索已 no_results 入池后，模型再吐标记不能写第二条 model_insufficient。"""
+    from app.api import REFUSAL_TEXT
+
+    question = "火星天气怎么样（重复入池用例）"
+
+    class EmptyVectorStore:
+        def search(self, vector, top_k, *, filter_expr=None):
+            return []
+
+    async def fake_embed(texts):
+        return [[0.0] * 1024 for _ in texts]
+
+    # 恢复真实检索入口，只把基础设施替换成"零命中"。
+    monkeypatch.setattr(
+        retrieval_module, "search_with_metadata", _REAL_SEARCH_WITH_METADATA
+    )
+    monkeypatch.setattr(retrieval_module, "VectorStore", EmptyVectorStore)
+    monkeypatch.setattr(retrieval_module, "embed_texts", fake_embed)
+    # 本用例只关心拒答→重复入池，不需要 hybrid/rerank；固定 dense 消除
+    # 对 query 改写与重排上游的依赖。
+    monkeypatch.setattr(get_settings(), "retrieval_strategy", "dense")
+
+    app.dependency_overrides[get_default_chat_model] = lambda: (
+        ToolThenInsufficientModel(question)
+    )
+    r = client.post("/api/chat", json={"message": question})
+    assert r.status_code == 200
+    events = parse_sse(r.text)
+    sid = events[0][1]["session_id"]
+
+    # 标记仍被替换成标准拒答话术。
+    assert client.store._data[sid][-1].content == REFUSAL_TEXT
+    deltas = [d["text"] for n, d in events if n == "delta"]
+    assert all("<INSUFFICIENT_KNOWLEDGE>" not in text for text in deltas)
+
+    async def _fetch() -> list[str]:
+        engine = create_async_engine(get_settings().db_url)
+        try:
+            async with async_sessionmaker(engine)() as other:
+                rows = list(
+                    (
+                        await other.execute(
+                            select(LowConfidenceQuestion).where(
+                                LowConfidenceQuestion.question == question
+                            )
+                        )
+                    ).scalars()
+                )
+                return [row.reason for row in rows]
+        finally:
+            await engine.dispose()
+
+    assert client.portal.call(_fetch) == ["no_results"], (
+        "检索已入池时 api 不应再写 model_insufficient"
+    )
 
 
 def test_split_marker_is_filtered_across_delta_frames(client):

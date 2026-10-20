@@ -42,6 +42,11 @@ def _publish_retrieval_meta(
         "retrieval_strategy": meta.get("strategy"),
         "top_score": meta.get("top_score"),
     })
+    # 检索层已经拒答并入池时才记录原因；api.py 据此避免模型再吐
+    # <INSUFFICIENT_KNOWLEDGE> 时对同一问题重复入池。成功检索不写 null，
+    # 避免污染 messages.metadata。
+    if meta.get("refusal_reason"):
+        container["refusal_reason"] = meta["refusal_reason"]
 
 
 @tool

@@ -268,7 +268,10 @@ async def chat(
                 # 一轮会落库；回滚到保存点则只丢弃本轮业务写入，先前建好的
                 # 会话行仍然保留。
                 async with db.begin_nested():
-                    if insufficient:
+                    # ★ 检索层已经拒答（no_results / low_score）时，同一问题
+                    # 已经入过池；模型随后再吐 <INSUFFICIENT_KNOWLEDGE> 不能
+                    # 再写一条 model_insufficient，否则同一轮出现两行。
+                    if insufficient and not retrieval_meta.get("refusal_reason"):
                         await lcq_repo.create(
                             db,
                             req.message,

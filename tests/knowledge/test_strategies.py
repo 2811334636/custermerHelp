@@ -33,13 +33,23 @@ class FakeStore:
         self.search_calls: list[tuple[list[float], int]] = []
         self.bm25_calls: list[tuple[str, int]] = []
         self.hybrid_calls: list[tuple[str, int, int, int]] = []
+        # 过滤表达式单独记录，避免改坏既有调用形态断言。
+        self.search_filters: list[str | None] = []
+        self.bm25_filters: list[str | None] = []
+        self.hybrid_filters: list[str | None] = []
 
-    def search(self, vector: list[float], top_k: int) -> list[str]:
+    def search(
+        self, vector: list[float], top_k: int, *, filter_expr: str | None = None
+    ) -> list[str]:
         self.search_calls.append((vector, top_k))
+        self.search_filters.append(filter_expr)
         return self.dense_ids[:top_k]
 
-    def bm25_search(self, query_text: str, top_k: int) -> list[str]:
+    def bm25_search(
+        self, query_text: str, top_k: int, *, filter_expr: str | None = None
+    ) -> list[str]:
         self.bm25_calls.append((query_text, top_k))
+        self.bm25_filters.append(filter_expr)
         return self.bm25_ids[:top_k]
 
     def hybrid_search(
@@ -49,10 +59,13 @@ class FakeStore:
         dense_limit: int,
         bm25_limit: int,
         final_limit: int,
+        *,
+        filter_expr: str | None = None,
     ) -> list[str]:
         self.hybrid_calls.append(
             (query_text, dense_limit, bm25_limit, final_limit)
         )
+        self.hybrid_filters.append(filter_expr)
         return self.fused_ids[:final_limit]
 
 
@@ -248,6 +261,91 @@ async def test_hybrid_rerank_falls_back_when_reranker_unavailable(
     assert meta["top_score"] is None
     assert meta["scores"] is None, "降级重排没有分数，不能编造"
     assert "重排不可用" in caplog.text
+
+
+@pytest.mark.parametrize("strategy", ["dense", "bm25", "hybrid", "hybrid_rerank"])
+async def test_filter_expr_is_threaded_to_every_strategy(db_session, strategy):
+    """spec §3.3：四种策略都必须把 filter_expr 传到 store 调用。"""
+    await seed_chunks(db_session, ["a:0"])
+    store = FakeStore(
+        dense_ids=["a:0"], bm25_ids=["a:0"], fused_ids=["a:0"]
+    )
+    expr = 'category == "售后政策"'
+
+    async def fake_rerank(query, passages, top_k: int = 10):
+        return [(0, 0.9)]
+
+    chunks, _ = await retrieve_with_strategy(
+        db_session,
+        "邮费咋算",
+        strategy,
+        top_k=3,
+        store=store,
+        embed=fake_embed,
+        rerank_fn=fake_rerank,
+        rewrite_fn=make_rewrite(),
+        filter_expr=expr,
+    )
+
+    assert [c.chunk_id for c in chunks] == ["a:0"]
+    if strategy == "dense":
+        assert store.search_filters == [expr]
+    elif strategy == "bm25":
+        assert store.bm25_filters == [expr]
+    else:
+        assert store.hybrid_filters == [expr]
+
+
+async def test_hybrid_rerank_falls_back_when_rerank_returns_empty(
+    db_session, caplog
+):
+    """重排返回 [] 是上游异常，应降级到混合结果而不是当作"没有知识"。"""
+    await seed_chunks(db_session, ["a:0", "a:1"])
+    store = FakeStore(fused_ids=["a:0", "a:1"])
+
+    async def empty_rerank(query, passages, top_k: int = 10):
+        return []
+
+    with caplog.at_level(logging.WARNING, logger="app.knowledge.strategies"):
+        chunks, meta = await retrieve_with_strategy(
+            db_session,
+            "问题",
+            "hybrid_rerank",
+            top_k=3,
+            store=store,
+            embed=fake_embed,
+            rerank_fn=empty_rerank,
+            rewrite_fn=make_rewrite(),
+        )
+
+    assert [c.chunk_id for c in chunks] == ["a:0", "a:1"]
+    assert meta["rerank_applied"] is False
+    assert meta["top_score"] is None
+    assert meta["scores"] is None
+    assert "重排返回空结果" in caplog.text
+
+
+async def test_empty_after_filter_triggers_no_results_pooling(db_session):
+    """过滤后为空 → no_results 入池，不放宽过滤（spec §3.3）。"""
+    from app.knowledge.retrieval import search_with_metadata
+
+    chunks, meta = await search_with_metadata(
+        db_session,
+        "过滤后为空的问题",
+        top_k=3,
+        store=FakeStore(),  # 模拟 Milvus 侧过滤后零命中
+        embed=fake_embed,
+        session_id="sess-filter-empty",
+        filter_expr='category == "不存在的分类"',
+    )
+
+    assert chunks == []
+    assert meta["refusal_reason"] == "no_results"
+
+    questions = await lcq_repo.get_recent(db_session, limit=1)
+    assert len(questions) == 1
+    assert questions[0].question == "过滤后为空的问题"
+    assert questions[0].reason == "no_results"
 
 
 async def test_unknown_strategy_raises(db_session):

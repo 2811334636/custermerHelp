@@ -12,7 +12,7 @@ class FakeStore:
         self.ids = ids
         self.calls = []
 
-    def search(self, vector, top_k):
+    def search(self, vector, top_k, *, filter_expr=None):
         self.calls.append((vector, top_k))
         return self.ids[:top_k]
 
@@ -45,7 +45,7 @@ async def test_vector_store_unavailable_propagates(db_session):
     from app.knowledge.vector_store import VectorStoreUnavailable
 
     class Boom:
-        def search(self, v, k):
+        def search(self, v, k, *, filter_expr=None):
             raise VectorStoreUnavailable("down")
 
     with pytest.raises(VectorStoreUnavailable):
@@ -133,7 +133,7 @@ async def test_store_construction_and_search_run_off_the_event_loop(
         def __init__(self):
             seen["construct"] = threading.current_thread()
 
-        def search(self, vector, top_k):
+        def search(self, vector, top_k, *, filter_expr=None):
             seen["search"] = threading.current_thread()
             return []
 

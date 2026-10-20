@@ -216,7 +216,7 @@ async def test_query_faq_degrades_when_embedding_upstream_fails(
     import app.knowledge.retrieval as retrieval
 
     class FakeStore:
-        def search(self, vector, top_k):
+        def search(self, vector, top_k, *, filter_expr=None):
             return []
 
     class BoomClient:

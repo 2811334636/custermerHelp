@@ -71,17 +71,24 @@ async def build(
         # 传本次实际读到的 hash：若另一个进程在建库期间改了文本，
         # mark_vectorized 会命中 0 行并让该块保持待向量化（final review I3）。
         hashes = [c.content_hash for c in batch]
-        if getattr(store, "support_bm25", False):
-            # BM25 Function 从 content 字段生成 sparse_vector；走旧签名会把
-            # content 写成 NULL，BM25/hybrid 将永远召回为空。
-            store.upsert(
-                [
-                    {"chunk_id": cid, "content": text, "vector": vector}
-                    for cid, text, vector in zip(ids, texts, vectors)
-                ]
-            )
-        else:
-            store.upsert(ids, vectors)
+        # 两种模式都走字典形态：category / section_path 必须写进 Milvus，
+        # 过滤（spec §3.3）才能下推到检索层。BM25 的 content 字段只存在于
+        # BM25 schema，非 BM25 collection 不能带这个 key。
+        bm25 = getattr(store, "support_bm25", False)
+        rows = []
+        for chunk, text, vector in zip(batch, texts, vectors):
+            row = {
+                "chunk_id": chunk.chunk_id,
+                "vector": vector,
+                "category": chunk.category,
+                "section_path": chunk.section_path,
+            }
+            if bm25:
+                # BM25 Function 从 content 字段生成 sparse_vector；缺了它
+                # BM25/hybrid 将永远召回为空。
+                row["content"] = text
+            rows.append(row)
+        store.upsert(rows)
         # vector_id == chunk_id：Milvus 主键就是 chunk_id。
         await repo.mark_vectorized(session, ids, ids, expected_hashes=hashes)
         await session.commit()

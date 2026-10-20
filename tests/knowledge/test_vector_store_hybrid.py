@@ -32,6 +32,10 @@ def test_vector_store_create_with_bm25(test_collection_bm25):
     assert functions[0]["input_field_names"] == ["content"]
     assert functions[0]["output_field_names"] == ["sparse_vector"]
 
+    # spec §3.3：元数据字段必须在 schema 里，才能用 filter= 下推过滤。
+    assert "category" in field_names
+    assert "section_path" in field_names
+
 
 def test_hybrid_search(test_collection_bm25):
     """hybrid_search 返回 RRF 融合后的结果。"""
@@ -68,6 +72,40 @@ def test_hybrid_search(test_collection_bm25):
 
     # 随机 dense vector + RRF 融合不保证固定排序，只验证返回有效结果
     assert len(ids) > 0 and all(id in ["test1", "test2"] for id in ids)
+
+
+def test_bm25_search_applies_category_filter_on_milvus(test_collection_bm25):
+    """真实 Milvus：filter_expr 在检索层排除其他分类，不是回表后过滤。"""
+    store = VectorStore(support_bm25=True, collection=test_collection_bm25)
+    store.ensure_collection()
+
+    vector = np.zeros(1024).tolist()
+    store.upsert([
+        {
+            "chunk_id": "cat-a",
+            "content": "退款政策说明",
+            "vector": vector,
+            "category": "A",
+            "section_path": "A > 退款",
+        },
+        {
+            "chunk_id": "cat-b",
+            "content": "退款政策说明",
+            "vector": vector,
+            "category": "B",
+            "section_path": "B > 退款",
+        },
+    ])
+    time.sleep(0.5)
+
+    all_ids = store.bm25_search("退款", top_k=10)
+    filtered = store.bm25_search(
+        "退款", top_k=10, filter_expr='category == "A"'
+    )
+
+    assert {"cat-a", "cat-b"} <= set(all_ids), "不过滤时应两路都能命中"
+    assert "cat-a" in filtered
+    assert "cat-b" not in filtered, "filter 必须排除 B 分类"
 
 
 def test_upsert_backward_compat_with_bm25(test_collection_bm25):

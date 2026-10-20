@@ -82,6 +82,7 @@ async def search_with_metadata(
     embed: Any | None = None,
     strategy: str = "dense",
     session_id: str = "",
+    filter_expr: str | None = None,
 ) -> tuple[list[KnowledgeChunk], dict[str, Any]]:
     """按策略召回知识块，并执行拒答控制，返回 ``(chunks, meta)``。
 
@@ -90,6 +91,9 @@ async def search_with_metadata(
 
     store / embed 仅用于注入测试替身；生产路径用真实 Milvus 与 embedding。
     拒答时返回空列表 + 本次策略元数据——面向用户的拒答话术由上层负责。
+
+    ``filter_expr`` 原样透传给 Milvus；过滤后为空直接走 ``no_results``，
+    **不放宽过滤**（spec §3.3）。
 
     ★ 拒答判定只在这里做一次；`search()` 是 ch03 兼容薄包装，委托本函数，
       避免"两条路径各判一次阈值"的分叉。
@@ -108,11 +112,20 @@ async def search_with_metadata(
     from app.knowledge.strategies import retrieve_with_strategy
 
     chunks, meta = await retrieve_with_strategy(
-        session, query, strategy, limit, store=store, embed=embed
+        session,
+        query,
+        strategy,
+        limit,
+        store=store,
+        embed=embed,
+        filter_expr=filter_expr,
     )
 
     if not chunks:
         await _refuse(session, query, session_id, REASON_NO_RESULTS)
+        # ★ 记录拒答原因：上层据此避免对同一问题重复入池（模型再吐
+        # <INSUFFICIENT_KNOWLEDGE> 时不应再写一条 model_insufficient）。
+        meta["refusal_reason"] = REASON_NO_RESULTS
         return [], meta
 
     # 只有重排策略有可比较的分数；dense/bm25/hybrid 的 RRF/相似度不可比，
@@ -121,6 +134,7 @@ async def search_with_metadata(
         top_score = meta.get("top_score")
         if top_score is not None and top_score < s.retrieval_rerank_threshold:
             await _refuse(session, query, session_id, REASON_LOW_SCORE)
+            meta["refusal_reason"] = REASON_LOW_SCORE
             return [], meta
 
     logger.info(
@@ -141,6 +155,7 @@ async def search(
     embed: Any | None = None,
     strategy: str = "dense",
     session_id: str = "",
+    filter_expr: str | None = None,
 ) -> list[KnowledgeChunk]:
     """ch03 兼容入口：只返回 chunks，丢弃策略元数据。
 
@@ -154,5 +169,6 @@ async def search(
         embed=embed,
         strategy=strategy,
         session_id=session_id,
+        filter_expr=filter_expr,
     )
     return chunks
