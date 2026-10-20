@@ -13,7 +13,9 @@ Task 5 的检索策略在召回前调用 `rewrite_query`，把「邮费咋算」
 
 import asyncio
 import logging
+from functools import lru_cache
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 
 from app.providers import get_chat_model
@@ -42,10 +44,20 @@ REWRITE_PROMPT = """将用户的口语化问题改写为标准问法，保留核
 只返回改写后的问题，不要解释。"""
 
 
+@lru_cache(maxsize=1)
+def _get_rewrite_model() -> BaseChatModel:
+    """进程内复用的改写模型（temperature=0）。
+
+    改写是每次检索都会走的路径，不能每次调用都新建 ChatOpenAI / httpx 客户端
+    ——那会重复 TLS 握手，且旧客户端无人关闭。temperature 固定为 0，因此不能
+    直接复用 providers.get_default_chat_model()（它用配置里的默认温度）。
+    """
+    return get_chat_model(temperature=0)
+
+
 async def _call_llm(query: str) -> str:
     """调用 LLM 改写 query。返回去掉首尾空白的结果。"""
-    model = get_chat_model(temperature=0)
-    resp = await model.ainvoke(
+    resp = await _get_rewrite_model().ainvoke(
         [HumanMessage(content=REWRITE_PROMPT.format(query=query))]
     )
     return resp.text.strip()

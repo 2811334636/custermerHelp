@@ -4,6 +4,8 @@ LLM 调用通过替换模块内的 `_call_llm` 注入替身，测试不依赖真
 或外网，因此可在基础设施未启动时用 `--noconftest` 运行。
 """
 
+import asyncio
+
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 
@@ -55,12 +57,44 @@ async def test_call_llm_uses_shared_chat_model(monkeypatch):
         return _FakeModel()
 
     monkeypatch.setattr(qr_module, "get_chat_model", _fake_get_chat_model)
-
-    result = await qr_module._call_llm("邮费咋算")
+    # lru_cache 跨用例存活，先清掉上一个用例可能缓存的真实/替身模型。
+    qr_module._get_rewrite_model.cache_clear()
+    try:
+        result = await qr_module._call_llm("邮费咋算")
+    finally:
+        qr_module._get_rewrite_model.cache_clear()
 
     assert result == "邮费如何计算"
     assert constructor_kwargs == [{"temperature": 0}]
     assert "邮费咋算" in received_messages[0][0].content
+
+
+@pytest.mark.asyncio
+async def test_rewrite_query_timeout_fallback(monkeypatch):
+    """LLM 卡住超时时返回原 query，不能拖住检索。"""
+
+    async def _slow_call_llm(query: str) -> str:
+        await asyncio.sleep(1)
+        return "邮费如何计算"
+
+    monkeypatch.setattr(qr_module, "_call_llm", _slow_call_llm)
+    monkeypatch.setattr(qr_module, "_REWRITE_TIMEOUT_S", 0.01)
+
+    result = await rewrite_query("邮费咋算")
+    assert result == "邮费咋算"
+
+
+@pytest.mark.asyncio
+async def test_rewrite_query_empty_output_fallback(monkeypatch):
+    """模型返回空串时回退到原 query。"""
+
+    async def _empty_call_llm(query: str) -> str:
+        return ""
+
+    monkeypatch.setattr(qr_module, "_call_llm", _empty_call_llm)
+
+    result = await rewrite_query("邮费咋算")
+    assert result == "邮费咋算"
 
 
 @pytest.mark.asyncio
