@@ -1,0 +1,113 @@
+# Task 6 混合检索评估集：20 条人工标注 query。
+#
+# 标注依据：2026-10-20 直接查询 customer_service.knowledge_chunks 的 28 个
+# 「已向量化」知识块（chunk_id / questions / answer），ground_truth_ids 全部
+# 是库中真实存在的 chunk_id，不是凭文档结构猜测的编号。
+#
+# 字段：
+#   query             用户原话
+#   ground_truth_ids  回答该问题所必需的知识块（可多个；Recall 的分母）
+#   difficulty        easy | medium | hard
+#   query_type        fact | procedure | comparison（报告按此分桶）
+#
+# 注意：faq:* 与 售后政策.md:* / 商品FAQ.md:* 存在内容重复（FAQ 是 policy
+# 知识的短问法版本），两者都能回答时一并标为答案，避免把等价召回判成漏召。
+- query: 邮费是多少
+  ground_truth_ids: ["售后政策.md:1"]
+  difficulty: easy
+  query_type: fact
+
+- query: 满多少包邮
+  ground_truth_ids: ["售后政策.md:1"]
+  difficulty: easy
+  query_type: fact
+
+- query: 多久发货
+  ground_truth_ids: ["售后政策.md:3", "faq:116"]
+  difficulty: easy
+  query_type: fact
+
+- query: 发什么快递
+  ground_truth_ids: ["售后政策.md:4", "faq:117"]
+  difficulty: easy
+  query_type: fact
+
+- query: 秒杀商品限购几件
+  ground_truth_ids: ["平台规则.md:2"]
+  difficulty: easy
+  query_type: fact
+
+- query: 鞋子是什么材质
+  ground_truth_ids: ["商品FAQ.md:2"]
+  difficulty: easy
+  query_type: fact
+
+- query: 有价保吗
+  ground_truth_ids: ["平台规则.md:0", "faq:119"]
+  difficulty: easy
+  query_type: fact
+
+- query: 怎么申请退货
+  ground_truth_ids: ["faq:110"]
+  difficulty: easy
+  query_type: procedure
+
+- query: 怎么换货
+  ground_truth_ids: ["售后政策.md:2", "faq:112"]
+  difficulty: easy
+  query_type: procedure
+
+- query: 怎么开发票
+  ground_truth_ids: ["售后政策.md:5", "faq:114"]
+  difficulty: easy
+  query_type: procedure
+
+- query: 怎么查物流
+  ground_truth_ids: ["faq:118"]
+  difficulty: medium
+  query_type: procedure
+
+- query: 我买了个手机壳但是颜色不喜欢能退吗
+  ground_truth_ids: ["售后政策.md:0", "faq:109"]
+  difficulty: medium
+  query_type: procedure
+
+- query: 发票抬头写错了怎么办
+  ground_truth_ids: ["售后政策.md:6", "faq:115"]
+  difficulty: medium
+  query_type: procedure
+
+- query: 鞋子尺码和衣服尺码怎么选
+  ground_truth_ids: ["商品FAQ.md:0", "商品FAQ.md:1", "faq:120"]
+  difficulty: medium
+  query_type: comparison
+
+- query: 质量问题退货运费和个人原因退货运费有什么区别
+  ground_truth_ids: ["售后政策.md:1"]
+  difficulty: hard
+  query_type: comparison
+
+- query: 退货和换货的流程有什么不同
+  ground_truth_ids: ["售后政策.md:0", "售后政策.md:2", "faq:110", "faq:112"]
+  difficulty: hard
+  query_type: comparison
+
+- query: 尺码介于两个码之间该选哪个
+  ground_truth_ids: ["商品FAQ.md:0", "faq:120"]
+  difficulty: hard
+  query_type: fact
+
+- query: 价保过期了还能申请吗
+  ground_truth_ids: ["平台规则.md:1", "平台规则.md:0"]
+  difficulty: hard
+  query_type: fact
+
+- query: 跑步鞋43码还有库存吗
+  ground_truth_ids: ["商品FAQ.md:4"]
+  difficulty: hard
+  query_type: fact
+
+- query: 退货后多久退款
+  ground_truth_ids: ["faq:111"]
+  difficulty: medium
+  query_type: fact
