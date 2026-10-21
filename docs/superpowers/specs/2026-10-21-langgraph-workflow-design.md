@@ -96,7 +96,7 @@ class WorkflowState(TypedDict, total=False):
     max_steps: int
     token_budget: int
     # 观测
-    node_trace: Annotated[list[str], operator.add]  # 走过的节点名
+    node_trace: list[str]            # 走过的节点名（覆盖式，每轮由 begin_turn 清空）
     turn_started_at: float
 ```
 
