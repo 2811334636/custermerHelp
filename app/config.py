@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     retrieval_strategy: str = Field(default="hybrid_rerank", pattern="^(dense|bm25|hybrid|hybrid_rerank)$")
     rerank_arrangement_strategy: str = Field(default="first_last", pattern="^(score_desc|first_last)$")
 
+    # ---- ch05 · LangGraph 工作流 ----
+    checkpoint_db: str = Field(default="./data/langgraph_checkpoints.sqlite")
+    confidence_min_coverage: float = Field(default=0.30, ge=0, le=1)
+    agent_max_steps: int = Field(default=6, gt=0)
+    agent_token_budget: int = Field(default=6000, gt=0)
+    intent_model_temperature: float = Field(default=0.0, ge=0, le=2)
+    workflow_log_enabled: bool = Field(default=True)
+
     @field_validator("llm_extra_body")
     @classmethod
     def _validate_extra_body(cls, v: str) -> str:
