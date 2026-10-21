@@ -218,9 +218,9 @@ async def _hybrid_rerank(
         return [], meta
 
     fn = rerank_fn or reranker.rerank
-    passages = [
-        format_embedding_text(c.category, c.questions, c.answer) for c in chunks
-    ]
+    # 重排只看“问题 + 答案”：实测把 category 路径拼进去会显著拉低 bge-reranker
+    # 的排序质量（同一评估集 MRR 0.900 → 0.758），因此不能复用 embedding 文本。
+    passages = [f"{c.questions}\n{c.answer}" for c in chunks]
     try:
         ranked = await _maybe_await(fn(query, passages, top_k=keep))
     except RerankerUnavailable as exc:

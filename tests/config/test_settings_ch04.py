@@ -13,7 +13,7 @@ def test_ch04_config_fields(monkeypatch):
     s = Settings(_env_file=None)
     assert s.reranker_base_url == "https://api.siliconflow.cn/v1"
     assert s.reranker_api_key == ""
-    assert s.reranker_model == "bge-reranker-v2-m3"
+    assert s.reranker_model == "BAAI/bge-reranker-v2-m3"
     assert s.retrieval_dense_top_k == 50
     assert s.retrieval_bm25_top_k == 50
     assert s.retrieval_rerank_top_k == 10

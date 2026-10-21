@@ -48,7 +48,8 @@ class Settings(BaseSettings):
 
     reranker_base_url: str = "https://api.siliconflow.cn/v1"
     reranker_api_key: str = ""
-    reranker_model: str = "bge-reranker-v2-m3"
+    # SiliconFlow 的模型 id 带组织前缀；少写前缀会 400 "Model does not exist"。
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
     # 重排是检索链路里的可选增强：上游慢时应在几秒内放弃并退回混合结果，
     # 不能拖住整个 query_faq（工具层只有 3s 的 wait_for）。
     reranker_timeout: int = Field(default=5, gt=0)
