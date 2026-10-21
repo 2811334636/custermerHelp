@@ -42,6 +42,19 @@
                               cursor: not-allowed; }
   .feedback button.active:disabled { background: #1677ff; border-color: #1677ff; color: #fff; }
 
+  /* done 之后追加的动作按钮：紧凑 pill，转人工与建工单用颜色区分 */
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+             margin-top: 6px; }
+  .actions button { padding: 4px 12px; font-size: 12px; line-height: 18px;
+                    border: 1px solid #91caff; border-radius: 999px;
+                    background: #e6f4ff; color: #1677ff; cursor: pointer; }
+  .actions button:hover:not(:disabled) { background: #bae0ff; }
+  .actions button.ticket { border-color: #ffd591; background: #fff7e6; color: #d46b08; }
+  .actions button.ticket:hover:not(:disabled) { background: #ffe7ba; }
+  .actions button:disabled { border-color: #eee; background: #f5f5f5; color: #bbb;
+                             cursor: not-allowed; }
+  .action-status { font-size: 12px; color: #cf1322; }
+
   /* 引用原文弹窗：移动端收窄，正文区域可滚动 */
   .modal-overlay { position: fixed; inset: 0; z-index: 100; display: flex;
                    align-items: center; justify-content: center; padding: 16px;
@@ -290,6 +303,84 @@ function addFeedback(wrap, messageId) {
   wrap.appendChild(box);
 }
 
+// ---------- 动作按钮（转人工 / 建工单） ----------
+// 按钮只属于产生它的那条助手消息；两个按钮互不绑定，各自点击后各自锁定。
+// 所有文案用 textContent，避免把模型或后端文本当 HTML 注入。
+function addLocalBotMessage(text) {
+  return addBubble(addRow("bot"), text);
+}
+
+function lockAction(btn) {
+  btn.disabled = true;
+  btn.classList.add("locked");
+}
+
+function addActions(wrap, actions) {
+  if (!Array.isArray(actions)) return;
+  const valid = actions.filter(
+    (a) => a && (a.type === "handoff" || a.type === "ticket")
+  );
+  if (!valid.length) return;
+
+  const box = document.createElement("div");
+  box.className = "actions";
+
+  for (const action of valid) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.setAttribute("data-action", action.type);
+    btn.className = action.type === "ticket" ? "ticket" : "handoff";
+
+    if (action.type === "handoff") {
+      btn.textContent = action.label || "转人工";
+      btn.addEventListener("click", () => {
+        if (btn.disabled) return;
+        lockAction(btn);   // 不发请求；建工单按钮不受影响
+        addLocalBotMessage("已转接人工客服");
+        addLocalBotMessage("您好，我是客服小猫，请问有什么可以帮您的");
+      });
+    } else {
+      btn.textContent = action.label || "建工单";
+      let statusEl = null;
+      const setStatus = (text) => {
+        if (!statusEl) {
+          statusEl = document.createElement("span");
+          statusEl.className = "action-status";
+          btn.insertAdjacentElement("afterend", statusEl);
+        }
+        statusEl.textContent = text;
+        statusEl.hidden = !text;
+      };
+      btn.addEventListener("click", async () => {
+        if (btn.disabled) return;
+        btn.disabled = true;
+        try {
+          const resp = await fetch("/api/tickets", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: sessionId,
+              description: action.description,
+              ticket_type: action.ticket_type,
+            }),
+          });
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          const data = await resp.json();
+          setStatus("");
+          addLocalBotMessage("已为您创建工单，工单号 " + (data.ticket_no || ""));
+          // 成功后保持 disabled：同一动作不重复建单。
+        } catch (err) {
+          btn.disabled = false;   // 失败保留按钮可重试
+          setStatus("建工单失败，请重试");
+        }
+      });
+    }
+    box.appendChild(btn);
+  }
+
+  wrap.appendChild(box);
+}
+
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = input.value.trim();
@@ -359,6 +450,8 @@ form.addEventListener("submit", async (e) => {
           // 流式期间保持纯文本追加；收尾时一次性换成带引用小蓝标的版本。
           const citations = Array.isArray(data.citations) ? data.citations : [];
           if (bubble) renderAnswer(bubble, bubble.textContent, citations);
+          // 动作按钮排在正文/引用之后、反馈行之前，且只挂在这条消息上。
+          addActions(wrap, data.actions);
           addFeedback(wrap, data.message_id == null ? null : data.message_id);
         } else if (name === "error") {
           addBadge(wrap, "出错：" + data.message, true);
