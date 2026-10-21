@@ -322,6 +322,8 @@ async def chat(
                 for entry in values.get("evidence") or []
                 if entry.get("score") is not None
             ] + [
+                # 当前 assign_citations 固定写 score=None；保留这一半是为了
+                # 将来工具/检索回填真实分数时 top_score 自动跟上。
                 citation.get("score")
                 for citation in citations
                 if citation.get("score") is not None

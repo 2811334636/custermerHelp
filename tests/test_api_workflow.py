@@ -94,6 +94,10 @@ class GraphModel:
             raise reply
         steps = reply if isinstance(reply, list) else [reply]
         for step in steps:
+            if isinstance(step, BaseException):
+                # 列表里的异常必须真的从 astream 抛出去，而不是被当成消息
+                # 解引用（那样只会得到 AttributeError，测错错误路径）。
+                raise step
             if isinstance(step, AIMessageChunk):
                 yield step
             else:
@@ -683,22 +687,26 @@ def test_agent_faq_refusal_pools_once_and_not_model_insufficient(
                         select(Conversation).where(Conversation.session_uuid == sid)
                     )
                 ).scalar_one()
+                # ★ 必须按会话主键过滤，不能按工具关键词过滤：model_insufficient
+                # 行的 question 是 req.message（带“订单 1001”前缀），用关键词
+                # 查会把这条多余的行藏起来，令“去重守卫”测试永远通过。
                 rows = list(
                     (
                         await other.execute(
                             select(LowConfidenceQuestion).where(
-                                LowConfidenceQuestion.question == question
+                                LowConfidenceQuestion.session_id == str(conv.id)
                             )
                         )
                     ).scalars()
                 )
-                return conv.id, [(row.reason, row.session_id) for row in rows]
+                return conv.id, [(row.question, row.reason) for row in rows]
         finally:
             await engine.dispose()
 
     conv_id, pooled = client.portal.call(_fetch_pool)
-    assert pooled == [("no_results", str(conv_id))]
-    assert "model_insufficient" not in [reason for reason, _ in pooled]
+    assert pooled == [(question, "no_results")], (
+        f"同一会话只允许一条 no_results；实际：{pooled}"
+    )
 
     # Minor 3：标记不能留在 checkpoint 里（否则下一轮会被自己的拒答标记污染）。
     async def _state():
@@ -816,6 +824,9 @@ def test_error_after_partial_deltas_is_terminal(client):
     assert names[0] == "delta"
     assert names[-1] == "error"
     assert "done" not in names
+    # 必须是上游的 RuntimeError，而不是把异常对象当消息解引用得到的
+    # AttributeError（否则这条用例测的就不是预期路径）。
+    assert events[-1][1]["message"] == "上游炸了"
     assert "".join(
         data["text"] for name, data in events if name == "delta"
     ) == "部分回答"
