@@ -111,6 +111,23 @@ async def retrieve_node(
         }
         for i, chunk in enumerate(chunks)
     ]
+    # assign_citations 只负责编号；把重排分数回填到 citation，done 帧与审计
+    # metadata 才能给出可解释的引用分数。
+    if scores is not None:
+        score_by_index = {
+            index_map[chunk.chunk_id]: scores[i]
+            for i, chunk in enumerate(chunks)
+            if i < len(scores) and scores[i] is not None
+        }
+        citations = [
+            {
+                **citation,
+                "score": score_by_index.get(
+                    citation.get("index"), citation.get("score")
+                ),
+            }
+            for citation in citations
+        ]
 
     logger.info(
         "node=retrieve chunks=%d strategy=%s",

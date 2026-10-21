@@ -207,7 +207,7 @@ def test_knowledge_turn_has_no_tool_and_audits_user_plus_answer(client):
     assert done["usage"] is None
     assert done["actions"] == []
     assert done["citations"] == [
-        {"index": 1, "chunk_id": "policy.md:9", "score": None}
+        {"index": 1, "chunk_id": "policy.md:9", "score": 0.88}
     ]
     assert isinstance(done["message_id"], int)
 
@@ -298,7 +298,7 @@ def test_business_tool_frames_and_citations(client):
     assert tools[1]["summary"] == "检索到 1 条知识"
     assert "content" not in tools[1], "SSE 只发摘要，不发回灌全文"
     assert tools[1]["citations"] == [
-        {"index": 1, "chunk_id": "policy.md:9", "score": None}
+        {"index": 1, "chunk_id": "policy.md:9", "score": 0.88}
     ]
 
     done = events[-1][1]
@@ -721,7 +721,7 @@ def test_agent_faq_refusal_pools_once_and_not_model_insufficient(
 
     values = client.portal.call(_state)
     assert values["insufficient"] is True
-    assert values["messages"][-1].content == GATE_REFUSAL
+    assert values["messages"][-1].content == REFUSAL_TEXT
     assert all(
         "<INSUFFICIENT_KNOWLEDGE>" not in str(message.content)
         for message in values["messages"]

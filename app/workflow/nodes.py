@@ -2,9 +2,16 @@
 
 import logging
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from app.workflow.state import ROUTE_BY_INTENT, TURN_RESET_FIELDS, WorkflowState
+from app.workflow.texts import EVIDENCE_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +31,6 @@ async def begin_turn(state: WorkflowState) -> dict:
         "gate_passed": None,
         "refusal_reason": None,
         "actions": [],
-        "suggestions_sent": False,
         "steps": 0,
         "tokens_used": 0,
         "finish_reason": None,
@@ -39,10 +45,22 @@ async def begin_turn(state: WorkflowState) -> dict:
     # 用断言把两者钉在一起，避免以后加字段只改一处。
     assert set(TURN_RESET_FIELDS) | {"citation_cursor"} == set(reset)
     # 跨轮字段不改值；原样回传只是让节点输出里能读到它们（LangGraph 里是
-    # 覆盖式空操作）。messages 绝不回传：add_messages 会追加造成重复。
+    # 覆盖式空操作）。messages 绝不原样回传：add_messages 会追加造成重复。
     for field in ("awaiting_slot", "pending_intent", "order_id"):
         if field in state:
             reset[field] = state[field]
+    # agent_model 每轮都会注入一条 evidence SystemMessage；不清理的话
+    # checkpoint 会随轮数无界增长。add_messages 的删除语义只能走
+    # RemoveMessage，这里只删上一轮注入的证据消息，对话历史原样保留。
+    evidence_removals = [
+        RemoveMessage(id=message.id)
+        for message in state.get("messages", [])
+        if isinstance(message, SystemMessage)
+        and message.id is not None
+        and str(message.content).startswith(EVIDENCE_PREFIX)
+    ]
+    if evidence_removals:
+        reset["messages"] = evidence_removals
     return reset
 
 

@@ -9,7 +9,7 @@ import re
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +27,15 @@ class TicketRequest(BaseModel):
     session_id: str = Field(..., min_length=1)
     description: str = Field(..., min_length=1, max_length=2000)
     ticket_type: Literal["售后", "投诉", "咨询"]
+
+    @field_validator("description")
+    @classmethod
+    def _reject_blank_description(cls, value: str) -> str:
+        """与 ChatRequest 一致：``min_length=1`` 挡不住纯空白，先 strip 再校验。"""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("description 不能为空")
+        return stripped
 
 
 @router.post("/tickets")

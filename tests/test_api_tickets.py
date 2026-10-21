@@ -140,6 +140,14 @@ def test_post_ticket_unknown_session_404(client):
     assert client.db.commits == 0  # 找不到会话就不该有任何写入
 
 
+def test_post_ticket_rejects_blank_description(client):
+    r = client.post(
+        "/api/tickets",
+        json={"session_id": "x", "description": "   ", "ticket_type": "咨询"},
+    )
+    assert r.status_code == 422
+
+
 def test_post_ticket_rejects_bad_type(client):
     r = client.post(
         "/api/tickets",

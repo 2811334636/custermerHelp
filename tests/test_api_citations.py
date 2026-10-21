@@ -186,7 +186,7 @@ def use_model(model):
 
 
 EXPECTED_CITATIONS = [
-    {"index": 1, "chunk_id": "policy.md:9", "score": None},
+    {"index": 1, "chunk_id": "policy.md:9", "score": 0.88},
 ]
 
 
@@ -203,6 +203,17 @@ def test_tool_end_and_done_frames_carry_citations(client):
     # done 帧的 message_id 必须是最后一条 assistant 行的真实 id（flush 后）。
     assert done["message_id"] == client.store._next_id - 1
     assert isinstance(done["message_id"], int)
+
+
+def test_reranked_turn_done_citations_carry_scores(client):
+    """重排策略下 meta["scores"] 必须回填到 done.citations，不能恒为 null。"""
+    r = client.post("/api/chat", json={"message": "退货政策是什么"})
+    events = parse_sse(r.text)
+
+    done = [data for name, data in events if name == "done"][-1]
+    assert done["citations"]
+    assert all(citation["score"] is not None for citation in done["citations"])
+    assert done["citations"][0]["score"] == pytest.approx(0.88)
 
 
 def test_citations_are_persisted_on_last_assistant_message(client):

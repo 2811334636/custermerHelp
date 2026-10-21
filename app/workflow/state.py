@@ -28,7 +28,6 @@ TURN_RESET_FIELDS: tuple[str, ...] = (
     "gate_passed",
     "refusal_reason",
     "actions",
-    "suggestions_sent",
     "steps",
     "tokens_used",
     "finish_reason",
@@ -64,7 +63,6 @@ class WorkflowState(TypedDict, total=False):
     order_id: str | None
     # 输出控制
     actions: list[dict]  # [{type: handoff|ticket, ...}]
-    suggestions_sent: bool
     # ReAct 控制
     steps: int
     tokens_used: int

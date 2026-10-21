@@ -76,7 +76,6 @@ async def test_begin_turn_keeps_cross_turn_fields_and_state_shape():
         "evidence_coverage": 0.9,
         "gate_passed": True,
         "refusal_reason": "low_evidence",
-        "suggestions_sent": True,
         "pending_intent": "物流",
         "awaiting_slot": "order_id",
         "order_id": "1001",
@@ -88,7 +87,6 @@ async def test_begin_turn_keeps_cross_turn_fields_and_state_shape():
     assert out["intent"] == "" and out["route"] == ""
     assert out["evidence"] == [] and out["evidence_coverage"] is None
     assert out["gate_passed"] is None and out["refusal_reason"] is None
-    assert out["suggestions_sent"] is False
 
 
 async def test_sanitize_removes_orphan_tool_message_but_keeps_new_human():

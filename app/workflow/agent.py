@@ -48,7 +48,12 @@ from app.tools.knowledge import (
 )
 from app.workflow.citations import assign_citations
 from app.workflow.state import WorkflowState
-from app.workflow.texts import GATE_REFUSAL, STEP_LIMIT_TEXT, TOKEN_LIMIT_TEXT
+from app.workflow.texts import (
+    EVIDENCE_PREFIX,
+    REFUSAL_TEXT,
+    STEP_LIMIT_TEXT,
+    TOKEN_LIMIT_TEXT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +84,7 @@ TICKET_TYPE_BY_ROUTE = {
 DEFAULT_TICKET_TYPE = "咨询"
 TICKET_DESCRIPTION_LIMIT = 500
 
-EVIDENCE_HEADER = "以下是检索到的知识，回答须以此为准并标注引用编号："
+EVIDENCE_HEADER = EVIDENCE_PREFIX + "，回答须以此为准并标注引用编号："
 _EVIDENCE_FLAG = "workflow_evidence_context"
 
 # 动作标记的用法在 prompts.SYSTEM_PROMPT 里已有完整说明；这里再补一句
@@ -414,6 +419,24 @@ async def _run_query_faq(
     _, citations, index_map, cursor = assign_citations(
         chunks, citations, index_map, cursor
     )
+    # 重排策略下 meta["scores"] 与 chunks 一一对齐；assign_citations 只负责
+    # 编号，这里把真实分数回填到对应引用（同一 chunk 复用时也更新为最新分数）。
+    scores = (meta or {}).get("scores")
+    if scores is not None:
+        score_by_index = {
+            index_map[chunk.chunk_id]: scores[i]
+            for i, chunk in enumerate(chunks)
+            if i < len(scores) and scores[i] is not None
+        }
+        citations = [
+            {
+                **citation,
+                "score": score_by_index.get(
+                    citation.get("index"), citation.get("score")
+                ),
+            }
+            for citation in citations
+        ]
     blocks = format_hits(chunks)
     if blocks:
         # 编号仍由 assign_citations 分配；正文格式复用工具的 shared helper，
@@ -606,7 +629,7 @@ async def agent_done(state: WorkflowState) -> dict[str, Any]:
     # 标准拒答话术，并用 State 标志通知 API 做入池判定。
     insufficient = INSUFFICIENT_MARKER in clean_text
     if insufficient:
-        clean_text = clean_text.split(INSUFFICIENT_MARKER, 1)[0] + GATE_REFUSAL
+        clean_text = clean_text.split(INSUFFICIENT_MARKER, 1)[0] + REFUSAL_TEXT
     # agent_model 已逐条清过标记并把动作写进 state；这里做最后一次兜底解析，
     # 并与已有动作按首次出现顺序合并（不能把中间轮的动作覆盖成空）。
     action_types = _merge_action_types(

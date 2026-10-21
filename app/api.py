@@ -23,16 +23,12 @@ from app.schemas import AfterSalesTicket, ChatRequest, ExtractRequest
 from app.sessions import MySQLSessionStore, SessionStore
 from app.tools import build_registry
 from app.workflow.graph import workflow_deps
+from app.workflow.texts import REFUSAL_TEXT
 
 logger = logging.getLogger(__name__)
 
 # spec §3.5.2：模型自评知识不足时输出该标记，后端替换为标准拒答话术。
 INSUFFICIENT_MARKER = "<INSUFFICIENT_KNOWLEDGE>"
-REFUSAL_TEXT = (
-    "抱歉，我暂时没有找到相关信息。您可以：\n"
-    "1. 换个说法再问一次\n"
-    '2. 联系人工客服（输入"转人工"）'
-)
 REASON_MODEL_INSUFFICIENT = "model_insufficient"
 
 
@@ -269,7 +265,7 @@ async def chat(
 
             if insufficient and INSUFFICIENT_MARKER in raw_streamed:
                 # 流式过滤器已经（在 flush 时）把标记换成了 REFUSAL_TEXT；
-                # State 里是 agent_done 规范化后的 GATE_REFUSAL，不能再补发。
+                # State 里是 agent_done 规范化后的同一段文本，不能再补发。
                 # 审计采用与浏览器完全一致的那段文本。
                 tail = delta_filter.flush()
                 if tail:
@@ -324,8 +320,7 @@ async def chat(
                 for entry in values.get("evidence") or []
                 if entry.get("score") is not None
             ] + [
-                # 当前 assign_citations 固定写 score=None；保留这一半是为了
-                # 将来工具/检索回填真实分数时 top_score 自动跟上。
+                # 预检索与工具检索都会在 assign_citations 之后回填重排分数。
                 citation.get("score")
                 for citation in citations
                 if citation.get("score") is not None

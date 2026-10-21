@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+)
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.config import Settings
@@ -22,6 +27,7 @@ from app.workflow.graph import build_workflow, workflow_deps
 from app.workflow.texts import (
     CHITCHAT_TEXT,
     COMPLAINT_TEXT,
+    EVIDENCE_PREFIX,
     GATE_REFUSAL,
     SLOT_QUESTION,
 )
@@ -204,6 +210,37 @@ async def test_graph_waits_for_order_id_across_turns(tmp_path):
     # trace 每轮从头开始，不会把第一轮的节点带进第二轮。
     assert second["node_trace"][:2] == ["sanitize_messages", "begin_turn"]
     assert second["node_trace"].count("classify_intent") == 1
+
+
+async def test_evidence_message_is_pruned_between_turns(tmp_path, monkeypatch):
+    """连续两轮知识检索后，State 里只保留当前轮的一条 evidence SystemMessage。"""
+    _patch_retrieval(
+        monkeypatch,
+        [FakeChunk("faq:1", "退货政策是什么", "七天无理由退货，运费由平台承担")],
+    )
+    model = ScriptedModel(
+        "退货退款", replies=[AIMessage(content="按政策可以七天无理由退货。")]
+    )
+    async with build_test_graph(tmp_path, model) as graph:
+        config = _config("t-evidence", model)
+        for i in range(2):
+            await graph.ainvoke(
+                {
+                    "messages": [HumanMessage("退货政策是什么")],
+                    "user_input": "退货政策是什么",
+                },
+                config,
+            )
+        second = await graph.aget_state(config)
+        messages = second.values["messages"]
+
+    evidence_messages = [
+        message
+        for message in messages
+        if isinstance(message, SystemMessage)
+        and str(message.content).startswith(EVIDENCE_PREFIX)
+    ]
+    assert len(evidence_messages) == 1
 
 
 async def test_graph_recovers_from_dangling_tool_call(tmp_path):
