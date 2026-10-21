@@ -26,14 +26,35 @@ def char_bigrams(text: str) -> set[str]:
 
 
 def evidence_coverage(query: str, texts: list[str]) -> float:
-    """查询字符二元组在召回文本中的命中比例；空查询/空文本返回 0.0。"""
+    """查询字符二元组在召回文本中的命中比例；空查询/空文本返回 0.0。
+
+    逐条文本取二元组后再求并集，不能先拼成一个字符串：否则上一块的尾字
+    与下一块的首字会拼出一个现实中不存在的二元组（``["退", "货"]`` 会
+    误命中查询 ``"退货"``）。
+    """
     query_bigrams = char_bigrams(query)
     if not query_bigrams:
         return 0.0
-    evidence_bigrams = char_bigrams("\n".join(texts))
+    evidence_bigrams: set[str] = set().union(
+        *(char_bigrams(text) for text in texts)
+    )
     if not evidence_bigrams:
         return 0.0
     return len(query_bigrams & evidence_bigrams) / len(query_bigrams)
+
+
+def _refusal_payload(
+    reason: str, coverage: float, trace: list[str]
+) -> dict[str, Any]:
+    """统一的拒答输出：闸门是唯一话术所有者（Task 8 失败边直接到 log）。"""
+    return {
+        "gate_passed": False,
+        "refusal_reason": reason,
+        "evidence_coverage": coverage,
+        "messages": [AIMessage(GATE_REFUSAL)],
+        "actions": [{"type": "handoff", "label": "转人工"}],
+        "node_trace": trace,
+    }
 
 
 def _configurable(config: RunnableConfig | None) -> dict[str, Any]:
@@ -124,14 +145,11 @@ async def confidence_gate_node(
     trace = state.get("node_trace", []) + ["confidence_gate"]
 
     if not evidence:
-        # 检索空结果的入池已由 search_with_metadata 完成；这里不重复写，
-        # 也不发话术——由 refuse 节点统一输出固定兜底文案。
-        return {
-            "gate_passed": False,
-            "refusal_reason": prior_reason or REASON_NO_RESULTS,
-            "evidence_coverage": 0.0,
-            "node_trace": trace,
-        }
+        # 检索空结果的入池已由 search_with_metadata 完成，这里不重复写；
+        # 但话术由闸门统一发出，失败边直接到 log（Task 8 无独立 refuse 节点）。
+        return _refusal_payload(
+            prior_reason or REASON_NO_RESULTS, 0.0, trace
+        )
 
     coverage = evidence_coverage(
         query,
@@ -162,16 +180,24 @@ async def confidence_gate_node(
     if prior_reason is None:
         # 入池只写一次：retrieval 已因 no_results/low_score 写过时不重复写。
         session = configurable.get("session")
+        conversation_id = configurable.get("conversation_id")
         if session is None:
             logger.warning(
                 "confidence_gate missing session; low_evidence not pooled question=%r",
+                query,
+            )
+        elif conversation_id is None:
+            # 没有会话 id 时宁可不写：空 session_id 会让问题池失去溯源能力。
+            logger.warning(
+                "confidence_gate missing conversation_id; "
+                "low_evidence not pooled question=%r",
                 query,
             )
         else:
             await lcq_repo.create(
                 session,
                 query,
-                _conversation_session_id(configurable),
+                str(conversation_id),
                 REASON_LOW_EVIDENCE,
             )
             logger.warning(
@@ -180,10 +206,4 @@ async def confidence_gate_node(
                 query,
             )
 
-    return {
-        "gate_passed": False,
-        "refusal_reason": reason,
-        "evidence_coverage": coverage,
-        "messages": [AIMessage(GATE_REFUSAL)],
-        "node_trace": trace,
-    }
+    return _refusal_payload(reason, coverage, trace)

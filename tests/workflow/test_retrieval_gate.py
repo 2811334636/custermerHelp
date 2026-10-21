@@ -47,6 +47,12 @@ def test_evidence_coverage_ignores_whitespace_and_punctuation():
     assert evidence_coverage("退货运费", [""]) == 0.0
 
 
+def test_evidence_coverage_does_not_join_across_text_boundaries():
+    """逐条文本取二元组：不能把上一块尾字与下一块首字拼成一个假二元组。"""
+    assert evidence_coverage("退货", ["退", "货"]) == 0.0
+    assert evidence_coverage("退货", ["退货"]) == 1.0
+
+
 def test_assign_citations_numbers_and_dedupes():
     hits = [FakeChunk("a", "q1", "a1"), FakeChunk("b", "q2", "a2")]
     text, citations, index_map, cursor = assign_citations(hits, [], {}, 1)
@@ -102,7 +108,10 @@ async def test_gate_refuses_and_pools_once():
     )
     assert out["gate_passed"] is False
     assert out["refusal_reason"] == "low_evidence"
+    # 闸门是唯一话术所有者：恰好一条拒答，不重复。
+    assert len(out["messages"]) == 1
     assert out["messages"][0].content == GATE_REFUSAL
+    assert out["actions"] == [{"type": "handoff", "label": "转人工"}]
     assert len(session.added) == 1
     assert session.added[0].question == "火星移民"
     assert session.added[0].session_id == "7"
@@ -130,6 +139,10 @@ async def test_gate_does_not_pool_again_after_retrieval_refused():
     )
     assert out["gate_passed"] is False
     assert out["refusal_reason"] == "no_results"
+    # 即便原因沿用检索的 no_results，闸门仍要发唯一的一条拒答话术。
+    assert len(out["messages"]) == 1
+    assert out["messages"][0].content == GATE_REFUSAL
+    assert out["actions"] == [{"type": "handoff", "label": "转人工"}]
     assert session.added == []
 
 
@@ -141,8 +154,45 @@ async def test_gate_empty_evidence_keeps_no_results_without_extra_pool_row():
     )
     assert out["gate_passed"] is False
     assert out["refusal_reason"] == "no_results"
-    assert "messages" not in out  # 话术由 refuse 节点发
+    # 空证据也由闸门发话术（Task 8 无独立 refuse 节点），且只有一条。
+    assert len(out["messages"]) == 1
+    assert out["messages"][0].content == GATE_REFUSAL
+    assert out["actions"] == [{"type": "handoff", "label": "转人工"}]
+    # 检索已负责 no_results 入池，闸门不再写第二条。
     assert session.added == []
+
+
+async def test_gate_empty_evidence_keeps_low_score_reason():
+    out = await confidence_gate_node(
+        {"resolved_input": "火星移民", "evidence": [], "refusal_reason": "low_score"},
+        {"configurable": {"session": FakeSession(), "conversation_id": 7}},
+    )
+    assert out["gate_passed"] is False
+    assert out["refusal_reason"] == "low_score"
+    assert len(out["messages"]) == 1
+    assert out["messages"][0].content == GATE_REFUSAL
+
+
+async def test_gate_skips_pooling_without_conversation_id():
+    """缺 conversation_id 时不写空 session_id 的池记录，只记警告。"""
+    session = FakeSession()
+    state = {
+        "resolved_input": "火星移民",
+        "evidence": [
+            {
+                "index": 1,
+                "chunk_id": "a",
+                "questions": "退货",
+                "answer": "政策",
+                "score": None,
+            }
+        ],
+        "refusal_reason": None,
+    }
+    out = await confidence_gate_node(state, {"configurable": {"session": session}})
+    assert out["gate_passed"] is False
+    assert session.added == []
+    assert len(out["messages"]) == 1
 
 
 async def test_gate_uses_rerank_score_when_present():
