@@ -10,6 +10,22 @@ from app.knowledge import retrieval
 from app.knowledge.errors import KnowledgeBackendUnavailable
 from app.tools.context import current_context
 
+# 知识库降级与空结果的固定文案：Agent 子图内直接调检索（绕过 ToolRegistry）
+# 时也要产出与工具完全一致的文本，集中在这里避免两处措辞漂移。
+KNOWLEDGE_UNAVAILABLE_TEXT = "知识库暂时不可用，请稍后再试或转人工客服。"
+NO_FAQ_RESULT_TEMPLATE = (
+    "没有找到与「{keyword}」相关的常见问题。可以换个说法，或帮你转人工客服。"
+)
+
+
+def format_hits(hits) -> list[str]:
+    """把召回块格式化成 ``问：…\n答：…`` 列表（问答块格式的唯一真相）。
+
+    Agent 子图给结果加 ``[i]`` 前缀时复用本函数，保证工具路径与图内路径
+    交给模型的正文逐字一致。
+    """
+    return [f"问：{hit.questions}\n答：{hit.answer}" for hit in hits]
+
 
 def _publish_retrieval_meta(
     ctx, hits, meta: dict | None
@@ -84,13 +100,13 @@ async def query_faq(keyword: str) -> str:
         # 不让 ToolRegistry 把它当成工具故障重试/回灌错误码。
         # 本次没有可信召回，清掉可能残留的引用，避免前端张冠李戴。
         _publish_retrieval_meta(ctx, [], None)
-        return "知识库暂时不可用，请稍后再试或转人工客服。"
+        return KNOWLEDGE_UNAVAILABLE_TEXT
 
     _publish_retrieval_meta(ctx, hits, meta)
 
     if not hits:
         # ★ 「查不到」是正常业务结果，不是异常：走成功返回，不触发 registry 的
         # 故障重试。
-        return f"没有找到与「{keyword}」相关的常见问题。可以换个说法，或帮你转人工客服。"
+        return NO_FAQ_RESULT_TEMPLATE.format(keyword=keyword)
 
-    return "\n\n".join(f"问：{h.questions}\n答：{h.answer}" for h in hits)
+    return "\n\n".join(format_hits(hits))

@@ -16,8 +16,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import (
@@ -30,14 +34,23 @@ from langchain_core.messages import (
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 
 from app.config import get_settings
 from app.knowledge import retrieval
 from app.knowledge.errors import KnowledgeBackendUnavailable
+from app.prompts import SYSTEM_PROMPT
 from app.tools import ALL_TOOLS
+from app.tools.knowledge import (
+    KNOWLEDGE_UNAVAILABLE_TEXT,
+    NO_FAQ_RESULT_TEMPLATE,
+    format_hits,
+)
 from app.workflow.citations import assign_citations
 from app.workflow.state import WorkflowState
 from app.workflow.texts import STEP_LIMIT_TEXT, TOKEN_LIMIT_TEXT
+
+logger = logging.getLogger(__name__)
 
 ACTION_HANDOFF = "handoff"
 ACTION_TICKET = "ticket"
@@ -64,9 +77,13 @@ TICKET_DESCRIPTION_LIMIT = 500
 EVIDENCE_HEADER = "以下是检索到的知识，回答须以此为准并标注引用编号："
 _EVIDENCE_FLAG = "workflow_evidence_context"
 
-KNOWLEDGE_FALLBACK = "知识库暂时不可用，请稍后再试或转人工客服。"
-NO_FAQ_RESULT = (
-    "没有找到与「{keyword}」相关的常见问题。可以换个说法，或帮你转人工客服。"
+# 动作标记的用法在 prompts.SYSTEM_PROMPT 里已有完整说明；这里再补一句
+# 面向本子图的短指令，保证即使调用方传入的是别的 system prompt 也能工作。
+ACTION_GUIDANCE = (
+    "\n\n## 动作建议\n"
+    "用户在对话中明确要求转人工时，在回答末尾输出 <SUGGEST_HANDOFF>；"
+    "需要为用户创建工单跟进时，在回答末尾输出 <SUGGEST_TICKET>。"
+    "标记会被系统识别并转成按钮，不要在正文里解释或重复。"
 )
 
 
@@ -151,6 +168,28 @@ def _evidence_message(evidence: list[dict]) -> SystemMessage:
     )
 
 
+def _system_message() -> SystemMessage:
+    """每次模型调用都本地构造 system prompt（不写入 State，避免重复注入）。"""
+    return SystemMessage(content=SYSTEM_PROMPT + ACTION_GUIDANCE)
+
+
+def _action_types(actions: list[dict] | None) -> list[str]:
+    """从 state.actions 里取出动作类型，保持原有顺序。"""
+    return [
+        action["type"]
+        for action in actions or []
+        if isinstance(action, dict) and action.get("type")
+    ]
+
+
+def _merge_action_types(existing: list[str], new: list[str]) -> list[str]:
+    merged = list(existing)
+    for action_type in new:
+        if action_type not in merged:
+            merged.append(action_type)
+    return merged
+
+
 def _configurable(config: RunnableConfig | None) -> dict[str, Any]:
     return (config or {}).get("configurable", {}) or {}
 
@@ -192,11 +231,13 @@ def _usage_tokens(usage: dict | None) -> int:
 
 async def _consume_model(
     bound, messages: list[BaseMessage], writer, stripper: _ActionMarkerStripper
-):
-    """流式消费模型输出：逐 token 发 delta，返回累积后的完整响应。
+) -> tuple[Any, dict | None]:
+    """流式消费模型输出：逐 token 发 delta，返回（累积响应、usage）。
 
-    真实 provider 一定有 ``astream``；脚本化替身可能只实现 ``ainvoke``，
-    这里保留一条兜底路径，避免子图只能被“会流式”的替身驱动。
+    usage 只取**最后一个**带值的 chunk：部分 provider 会在每个 chunk 上重复
+    携带累计用量，若把 chunk 逐个相加会成倍放大 token 数。真实 provider
+    一定有 ``astream``；脚本化替身可能只实现 ``ainvoke``，这里保留一条兜底
+    路径，避免子图只能被“会流式”的替身驱动。
     """
     if not hasattr(bound, "astream"):
         response = await bound.ainvoke(messages)
@@ -208,12 +249,15 @@ async def _consume_model(
         tail = stripper.flush()
         if tail:
             writer({"type": "delta", "text": tail})
-        return response
+        return response, getattr(response, "usage_metadata", None)
 
     accumulated: AIMessageChunk | None = None
+    usage: dict | None = None
     async for raw_chunk in bound.astream(messages):
         chunk = _as_chunk(raw_chunk)
         accumulated = chunk if accumulated is None else accumulated + chunk
+        if getattr(raw_chunk, "usage_metadata", None):
+            usage = dict(raw_chunk.usage_metadata)
         text = getattr(raw_chunk, "text", "") or ""
         if text:
             filtered = stripper.feed(text)
@@ -223,7 +267,7 @@ async def _consume_model(
     tail = stripper.flush()
     if tail:
         writer({"type": "delta", "text": tail})
-    return accumulated
+    return accumulated, usage
 
 
 def _final_message(accumulated: Any) -> AIMessage:
@@ -248,24 +292,32 @@ async def agent_model(
     messages = list(state.get("messages") or [])
     evidence = state.get("evidence") or []
     current_evidence = _evidence_message(evidence) if evidence else None
-    # 旧轮的 evidence 只留在 State 里供审计过滤，绝不带回本轮模型上下文；
-    # 本轮 evidence 永远放在最前面（system 上下文先于对话）。
+    # system prompt 每次本地构造、不落 State；旧轮 evidence 只留在 State 里
+    # 供审计过滤，绝不带回本轮模型上下文。顺序：system → evidence → 对话。
     model_messages: list[BaseMessage] = (
-        ([current_evidence] if current_evidence is not None else [])
+        [_system_message()]
+        + ([current_evidence] if current_evidence is not None else [])
         + [message for message in messages if not _is_evidence_message(message)]
     )
 
     stripper = _ActionMarkerStripper()
-    accumulated = await _consume_model(
+    accumulated, usage = await _consume_model(
         model.bind_tools(ALL_TOOLS), model_messages, writer, stripper
     )
     ai_message = _final_message(accumulated)
+    # 每个中间 assistant 也要剥标记：ReAct 循环里模型可能边调工具边说
+    # “我帮您转人工”，不能让它把标记带进 ToolMessage 回合或审计。
+    clean_text, new_action_types = parse_action_markers(ai_message.text or "")
+    ai_message = ai_message.model_copy(update={"content": clean_text})
 
-    usage = getattr(accumulated, "usage_metadata", None)
+    action_types = _merge_action_types(
+        _action_types(state.get("actions")), new_action_types
+    )
     updates: dict[str, Any] = {
         "steps": (state.get("steps") or 0) + 1,
         "tokens_used": (state.get("tokens_used") or 0) + _usage_tokens(usage),
         "messages": [ai_message],
+        "actions": _build_actions(action_types, state),
     }
     if current_evidence is not None and not any(
         _is_evidence_message(message)
@@ -281,6 +333,17 @@ def _sorted_citations(citations: list[dict]) -> list[dict]:
     return sorted(citations, key=lambda citation: citation.get("index", 0))
 
 
+@dataclass(frozen=True)
+class _FaqOutcome:
+    content: str
+    ok: bool
+    summary: str
+    citations: list[dict]
+    index_map: dict[str, int]
+    cursor: int
+    refusal_reason: str | None = None
+
+
 async def _run_query_faq(
     args: dict,
     *,
@@ -290,47 +353,70 @@ async def _run_query_faq(
     citations: list[dict],
     index_map: dict[str, int],
     cursor: int,
-) -> tuple[str, bool, str, list[dict], dict[str, int], int]:
+) -> _FaqOutcome:
     """Agent 内的 query_faq：检索 + 全局编号，返回 ToolMessage 所需字段。
 
     ``query_faq`` 刻意不走 ``ToolRegistry.execute``：工具原始输出没有引用编号，
     而本图要求模型在**看到内容之前**就拿到全局 ``[i]``（spec §5.7）。
+
+    这里绕过了 registry 的超时/异常边界，所以必须自己补：``wait_for`` 用与
+    业务工具相同的 ``tool_timeout_s``，任何异常都降级成一句工具结果，绝不让
+    知识库故障打断整轮对话。
     """
     keyword = str(args.get("keyword") or "")
     try:
-        chunks, _meta = await retrieval.search_with_metadata(
-            session,
-            keyword,
-            top_k=settings.retrieval_top_k,
-            strategy=settings.retrieval_strategy,
-            session_id=(
-                "" if conversation_id is None else str(conversation_id)
+        chunks, meta = await asyncio.wait_for(
+            retrieval.search_with_metadata(
+                session,
+                keyword,
+                top_k=settings.retrieval_top_k,
+                strategy=settings.retrieval_strategy,
+                session_id=(
+                    "" if conversation_id is None else str(conversation_id)
+                ),
             ),
+            timeout=settings.tool_timeout_s,
         )
-    except KnowledgeBackendUnavailable:
-        # 基础设施故障降级为一句正常工具结果，不让整轮对话中断。
-        return KNOWLEDGE_FALLBACK, False, "知识库不可用", citations, index_map, cursor
+    except KnowledgeBackendUnavailable as exc:
+        # 预期内的基础设施降级：不打完整堆栈，只留一行 warning。
+        logger.warning("query_faq 知识库不可用：%s", exc)
+        return _FaqOutcome(
+            KNOWLEDGE_UNAVAILABLE_TEXT, False, "知识库不可用",
+            citations, index_map, cursor,
+        )
+    except Exception:
+        # 超时、代码 bug、上游协议异常……一律按“查不到”降级；堆栈留日志。
+        logger.exception("query_faq 检索失败，降级为不可用文案")
+        return _FaqOutcome(
+            KNOWLEDGE_UNAVAILABLE_TEXT, False, "知识库不可用",
+            citations, index_map, cursor,
+        )
 
-    numbered, citations, index_map, cursor = assign_citations(
+    refusal_reason = (meta or {}).get("refusal_reason")
+    _, citations, index_map, cursor = assign_citations(
         chunks, citations, index_map, cursor
     )
-    if numbered:
-        return (
-            numbered,
-            True,
-            f"检索到 {len(chunks)} 条知识",
-            citations,
-            index_map,
-            cursor,
+    blocks = format_hits(chunks)
+    if blocks:
+        # 编号仍由 assign_citations 分配；正文格式复用工具的 shared helper，
+        # 保证图内与工具路径交给模型的问答块逐字一致。
+        numbered = "\n\n".join(
+            f"[{index_map[chunk.chunk_id]}] {block}"
+            for chunk, block in zip(chunks, blocks)
+        )
+        return _FaqOutcome(
+            numbered, True, f"检索到 {len(chunks)} 条知识",
+            citations, index_map, cursor, refusal_reason,
         )
     # 「查不到」是正常业务结果，不标记为工具故障。
-    return (
-        NO_FAQ_RESULT.format(keyword=keyword),
+    return _FaqOutcome(
+        NO_FAQ_RESULT_TEMPLATE.format(keyword=keyword),
         True,
         "未找到相关知识",
         citations,
         index_map,
         cursor,
+        refusal_reason,
     )
 
 
@@ -356,6 +442,7 @@ async def agent_tools(
         cursor = 1
 
     tool_messages: list[ToolMessage] = []
+    refusal_reason: str | None = None
     for position, call in enumerate(tool_calls):
         name = call.get("name", "")
         args = call.get("args") or {}
@@ -368,19 +455,14 @@ async def agent_tools(
                 "phase": "start",
                 "call_id": call_id,
                 "name": name,
+                "arguments": args,
                 "ok": None,
             }
         )
 
         if name == "query_faq":
-            (
-                content,
-                ok,
-                summary,
-                citations,
-                index_map,
-                cursor,
-            ) = await _run_query_faq(
+            started = time.perf_counter()
+            faq = await _run_query_faq(
                 args,
                 settings=settings,
                 session=session,
@@ -389,6 +471,17 @@ async def agent_tools(
                 index_map=index_map,
                 cursor=cursor,
             )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            content = faq.content
+            ok = faq.ok
+            summary = faq.summary
+            citations = faq.citations
+            index_map = faq.index_map
+            cursor = faq.cursor
+            if faq.refusal_reason:
+                # 透传给 Task 9：检索层已拒答，模型再吐
+                # <INSUFFICIENT_KNOWLEDGE> 时不能重复入池。
+                refusal_reason = faq.refusal_reason
         else:
             outcome = await registry.execute(
                 name, args, call_id, conversation_id=conversation_id
@@ -396,6 +489,7 @@ async def agent_tools(
             content = outcome.content
             ok = bool(outcome.ok)
             summary = outcome.summary
+            elapsed_ms = outcome.elapsed_ms
 
         writer(
             {
@@ -405,6 +499,7 @@ async def agent_tools(
                 "name": name,
                 "ok": ok,
                 "summary": summary,
+                "elapsed_ms": elapsed_ms,
                 "citations": _sorted_citations(citations),
             }
         )
@@ -416,12 +511,15 @@ async def agent_tools(
             )
         )
 
-    return {
+    updates: dict[str, Any] = {
         "messages": tool_messages,
         "citations": _sorted_citations(citations),
         "citation_index": index_map,
         "citation_cursor": cursor,
     }
+    if refusal_reason is not None:
+        updates["refusal_reason"] = refusal_reason
+    return updates
 
 
 def _build_actions(action_types: list[str], state: WorkflowState) -> list[dict]:
@@ -477,7 +575,12 @@ async def agent_done(state: WorkflowState) -> dict[str, Any]:
             return {"messages": [AIMessage(content=TOKEN_LIMIT_TEXT)]}
         return {}
 
-    clean_text, action_types = parse_action_markers(_message_text(last))
+    clean_text, new_action_types = parse_action_markers(_message_text(last))
+    # agent_model 已逐条清过标记并把动作写进 state；这里做最后一次兜底解析，
+    # 并与已有动作按首次出现顺序合并（不能把中间轮的动作覆盖成空）。
+    action_types = _merge_action_types(
+        _action_types(state.get("actions")), new_action_types
+    )
     updates: dict[str, Any] = {
         "actions": _build_actions(action_types, state),
     }
@@ -488,7 +591,7 @@ async def agent_done(state: WorkflowState) -> dict[str, Any]:
     return updates
 
 
-def build_agent_subgraph():
+def build_agent_subgraph() -> CompiledStateGraph:
     """装配并编译 ReAct 子图；Task 8 把它作为一个节点挂到主图。"""
     graph = StateGraph(WorkflowState)
     graph.add_node("agent_model", agent_model)

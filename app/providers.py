@@ -30,6 +30,10 @@ def get_chat_model(temperature: float | None = None) -> ChatOpenAI:
         temperature=s.llm_temperature if temperature is None else temperature,
         extra_body=extra_body,
         max_retries=2,
+        # ★ 必须显式打开：langchain-openai 只在 base_url 为默认 OpenAI 地址时
+        # 自动启用 streaming usage。本项目连 DeepSeek（自定义 base_url），不传
+        # 这个参数就永远拿不到 usage_metadata，agent_token_budget 形同虚设。
+        stream_usage=True,
     )
 
 

@@ -1,5 +1,6 @@
 """ReAct 子图：收敛、停止条件、全局引用编号、动作标记与流式过滤（Task 7）。"""
 
+import asyncio
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -70,15 +71,20 @@ class FakeChunk:
 
 
 @contextmanager
-def patched_retrieval(hits=None, error=None):
+def patched_retrieval(hits=None, error=None, refusal_reason=None, delay=0):
     """把 agent_tools 内部的 search_with_metadata 换成固定结果。"""
 
     async def fake_search(
         session, query, top_k=None, *, strategy="dense", session_id="", **kwargs
     ):
+        if delay:
+            await asyncio.sleep(delay)
         if error is not None:
             raise error
-        return list(hits or []), {"strategy": strategy, "scores": None}
+        meta = {"strategy": strategy, "scores": None}
+        if refusal_reason is not None:
+            meta["refusal_reason"] = refusal_reason
+        return list(hits or []), meta
 
     with patch.object(agent_module.retrieval, "search_with_metadata", fake_search):
         yield
@@ -91,6 +97,7 @@ async def run_agent(
     *,
     faq_hits=None,
     faq_error=None,
+    faq_refusal_reason=None,
     max_steps=None,
     token_budget=None,
 ):
@@ -109,7 +116,7 @@ async def run_agent(
             "conversation_id": 1,
         }
     }
-    with patched_retrieval(faq_hits, faq_error):
+    with patched_retrieval(faq_hits, faq_error, faq_refusal_reason):
         return await build_agent_subgraph().ainvoke(base, config)
 
 
@@ -319,8 +326,149 @@ async def test_evidence_is_injected_as_system_message_before_model_call():
 
     first_seen = model.seen[0]
     assert isinstance(first_seen[0], SystemMessage)
-    assert "[1] 问：运费" in first_seen[0].content
-    assert "答：满 99 包邮" in first_seen[0].content
-    assert isinstance(first_seen[1], HumanMessage)
+    assert "客服" in first_seen[0].content
+    assert "<SUGGEST_HANDOFF>" in first_seen[0].content
+    assert isinstance(first_seen[1], SystemMessage)
+    assert "[1] 问：运费" in first_seen[1].content
+    assert "答：满 99 包邮" in first_seen[1].content
+    assert isinstance(first_seen[2], HumanMessage)
     # 注入消息留在 State 里，供 Task 9 写审计时按 SystemMessage 过滤。
     assert any(isinstance(m, SystemMessage) for m in out["messages"])
+    # system prompt 只构造给模型，不写进 State（否则每轮会重复堆积）。
+    assert all("客服" not in str(m.content) for m in out["messages"] if isinstance(m, SystemMessage))
+
+
+async def test_tool_events_match_sse_contract():
+    model = ScriptedModel([
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "query_order", "args": {"order_id": "1001"}, "id": "c1"}
+            ],
+        ),
+        AIMessage(content="已发货"),
+    ])
+    config = {
+        "configurable": {
+            "model": model,
+            "registry": FakeRegistry("订单 1001 已发货"),
+            "session": object(),
+            "conversation_id": 1,
+        }
+    }
+    state = {"messages": [HumanMessage("查订单")], "steps": 0, "tokens_used": 0}
+
+    events = []
+    with patched_retrieval():
+        async for event in build_agent_subgraph().astream(
+            state, config, stream_mode="custom"
+        ):
+            events.append(event)
+
+    start = next(
+        e for e in events if e.get("type") == "tool" and e["phase"] == "start"
+    )
+    end = next(
+        e for e in events if e.get("type") == "tool" and e["phase"] == "end"
+    )
+    assert start["arguments"] == {"order_id": "1001"}
+    assert start["call_id"] == "c1" and start["name"] == "query_order"
+    assert end["ok"] is True and end["summary"] == "工具结果"
+    assert end["elapsed_ms"] == 1
+    assert end["citations"] == []
+
+
+async def test_query_faq_times_out_and_degrades(monkeypatch):
+    from app.config import Settings
+
+    settings = Settings(_env_file=None)
+    settings.tool_timeout_s = 0.01
+    monkeypatch.setattr(agent_module, "get_settings", lambda: settings)
+
+    model = ScriptedModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "query_faq", "args": {"keyword": "运费"}, "id": "c1"}],
+        ),
+        AIMessage(content="稍后再试"),
+    ])
+    with patched_retrieval(hits=[FakeChunk("faq:1", "运费", "满 99 包邮")], delay=0.2):
+        out = await build_agent_subgraph().ainvoke(
+            {"messages": [HumanMessage("运费")], "steps": 0, "tokens_used": 0},
+            {
+                "configurable": {
+                    "model": model,
+                    "registry": FakeRegistry(),
+                    "session": object(),
+                    "conversation_id": 1,
+                }
+            },
+        )
+
+    tool_msg = next(m for m in out["messages"] if m.type == "tool")
+    assert tool_msg.content == "知识库暂时不可用，请稍后再试或转人工客服。"
+    assert out["steps"] == 2
+
+
+async def test_query_faq_degrades_on_unexpected_error():
+    model = ScriptedModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "query_faq", "args": {"keyword": "运费"}, "id": "c1"}],
+        ),
+        AIMessage(content="稍后再试"),
+    ])
+    out = await run_agent(
+        model,
+        FakeRegistry(),
+        {"messages": [HumanMessage("运费")]},
+        faq_error=RuntimeError("unexpected"),
+    )
+
+    tool_msg = next(m for m in out["messages"] if m.type == "tool")
+    assert tool_msg.content == "知识库暂时不可用，请稍后再试或转人工客服。"
+    assert out["steps"] == 2
+
+
+async def test_query_faq_refusal_reason_is_recorded():
+    model = ScriptedModel([
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "query_faq", "args": {"keyword": "运费"}, "id": "c1"}],
+        ),
+        AIMessage(content="换个说法试试"),
+    ])
+    out = await run_agent(
+        model,
+        FakeRegistry(),
+        {"messages": [HumanMessage("运费")]},
+        faq_hits=[],
+        faq_refusal_reason="no_results",
+    )
+
+    tool_msg = next(m for m in out["messages"] if m.type == "tool")
+    assert "没有找到" in tool_msg.content
+    assert out["refusal_reason"] == "no_results"
+    assert out["citations"] == []
+
+
+async def test_intermediate_assistant_markers_are_stripped_and_accumulated():
+    model = ScriptedModel([
+        AIMessage(
+            content="我帮您转人工 <SUGGEST_HANDOFF>",
+            tool_calls=[
+                {"name": "query_order", "args": {"order_id": "1001"}, "id": "c1"}
+            ],
+        ),
+        AIMessage(content="已登记"),
+    ])
+    out = await run_agent(
+        model,
+        FakeRegistry("订单 1001 已发货"),
+        {"messages": [HumanMessage("查订单并转人工")]},
+    )
+
+    first_ai = next(m for m in out["messages"] if m.type == "ai")
+    assert first_ai.content == "我帮您转人工 "
+    assert all("<SUGGEST" not in str(m.content) for m in out["messages"])
+    assert out["actions"] == [{"type": "handoff", "label": "转人工"}]

@@ -17,6 +17,17 @@ def test_model_uses_configured_endpoint(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_stream_usage_enabled_for_custom_base_url(monkeypatch):
+    """DeepSeek 是自定义 base_url：不显式开 stream_usage 就拿不到 usage_metadata，
+    agent_token_budget 永远不会触发（spec §5.7）。"""
+    monkeypatch.setenv("APP_LLM_BASE_URL", "https://api.deepseek.com/")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    assert get_chat_model().stream_usage is True
+    get_settings.cache_clear()
+
+
 def test_extra_body_carries_thinking_disabled(monkeypatch):
     """这是本项目的命门：thinking 没关掉，对话会一个字都吐不出来（spec §3.2）。"""
     monkeypatch.setenv("APP_LLM_EXTRA_BODY", '{"thinking":{"type":"disabled"}}')
