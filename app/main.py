@@ -34,8 +34,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="电商智能客服 ch02 · Function Calling 工具链",
-    version="0.2.0",
+    title="电商智能客服 ch05 · LangGraph 工作流",
+    version="0.5.0",
     lifespan=lifespan,
 )
 app.include_router(router)

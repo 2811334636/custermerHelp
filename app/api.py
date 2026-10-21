@@ -4,21 +4,14 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api_chunks import router as chunks_router
 from app.api_feedback import router as feedback_router
-from app.chat import (
-    DeltaEvent,
-    DoneEvent,
-    ErrorEvent,
-    ToolCallEvent,
-    ToolResultEvent,
-    stream_reply_with_tools,
-)
+from app.chat import classify_exception
 from app.config import get_settings
 from app.db.base import get_db
 from app.extract import ExtractionFailed, extract_ticket
@@ -28,6 +21,7 @@ from app.repositories import low_confidence_question as lcq_repo
 from app.schemas import AfterSalesTicket, ChatRequest, ExtractRequest
 from app.sessions import MySQLSessionStore, SessionStore
 from app.tools import build_registry
+from app.workflow.graph import workflow_deps
 
 logger = logging.getLogger(__name__)
 
@@ -107,9 +101,31 @@ def sse_frame(name: str, data: dict) -> str:
     return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _message_text(message: BaseMessage) -> str:
+    """把消息正文归一成字符串（本项目的模型/节点都产出纯文本）。"""
+    content = message.content
+    return content if isinstance(content, str) else str(content)
+
+
+def _normalize_insufficient(message: BaseMessage) -> BaseMessage:
+    """落库前把最后一轮的自评标记替换成标准拒答话术。
+
+    与 SSE 过滤器共用同一条规则：标记之前的正文保留，标记之后的内容
+    （按噪声处理）丢弃。只改副本，不碰 checkpointer 里的 State。
+    """
+    if not isinstance(message, AIMessage):
+        return message
+    text = _message_text(message)
+    if INSUFFICIENT_MARKER not in text:
+        return message
+    cleaned = text.split(INSUFFICIENT_MARKER, 1)[0] + REFUSAL_TEXT
+    return message.model_copy(update={"content": cleaned})
+
+
 @router.post("/chat")
 async def chat(
     req: ChatRequest,
+    request: Request,
     store: SessionStore = Depends(get_store),
     model=Depends(get_default_chat_model),
     db: AsyncSession = Depends(get_db),
@@ -120,9 +136,8 @@ async def chat(
     session_id = req.session_id or str(uuid.uuid4())
     is_new_session = req.session_id != session_id
     settings = get_settings()
-
-    # 先读出历史（不含当前消息），剪裁由 stream_reply_with_tools 内部完成
-    history = await store.get(session_id)
+    # lifespan 里编译一次的图；checkpointer 才是模型上下文的唯一来源。
+    workflow = request.app.state.workflow
 
     # 会话行在这里就建出来：create_ticket 要拿 conversation_id 当外键，
     # 工具执行时它必须已经存在（flush 出 id 即可，提交与否见 finally）。
@@ -133,169 +148,79 @@ async def chat(
     # 工具全部报错。
     registry = build_registry(session=db)
 
+    # 请求级依赖只放 configurable，绝不进 State（见 app/workflow/graph.py）。
+    config = {
+        "configurable": {
+            "thread_id": session_id,
+            **workflow_deps(model, registry, db, conv.id),
+        }
+    }
+    initial = {
+        "messages": [HumanMessage(req.message)],
+        "user_input": req.message,
+        "max_steps": settings.agent_max_steps,
+        "token_budget": settings.agent_token_budget,
+    }
+
     async def event_stream() -> AsyncIterator[str]:
         if is_new_session:
             yield sse_frame("meta", {"session_id": session_id})
 
-        # 落库用的累积器（spec §7.1 步骤 ⑧）
-        # 工具轮之前的正文 → preamble；工具轮之后的正文 → final_answer。
-        # 分开放是因为它们分属两条 assistant 消息：带 tool_calls 的那条，
-        # 和最终回答那条。混成一条会让历史回放失真。
-        preamble: list[str] = []
-        final_answer: list[str] = []
-        tool_calls_seen: list[dict] = []
-        tool_messages: list[ToolMessage] = []
-        in_tool_round = False
-        completed = False
-        done_event: DoneEvent | None = None
-        # 请求级可变容器：query_faq 原地写入 citations，registry 把同一个
-        # dict 挂到 ToolOutcome.metadata，工具帧与最终落库都从这里取。
-        retrieval_meta: dict = {}
-        citations: list[dict] = []
         # 浏览器只看 delta，不读落库正文：标记必须在流里就被替换，否则用户
         # 会看到 "<INSUFFICIENT_KNOWLEDGE>"。工具调用会开启新的 assistant
         # 消息段，届时 flush + 重建过滤器。
         delta_filter = _MarkerStreamFilter(INSUFFICIENT_MARKER, REFUSAL_TEXT)
+        # 最后一次工具边界之后是否已经转发过正文。非 Agent 出口（投诉/闲聊/
+        # 槽位追问/闸门拒答）不经过模型流，没有 custom delta 事件，需要在这里
+        # 补一帧，让浏览器与落库内容一致。
+        streamed_since_tool = False
 
         try:
-            async for event in stream_reply_with_tools(
-                req.message,
-                history,
-                model=model,
-                registry=registry,
-                token_budget=settings.history_token_budget,
-                conversation_id=conv.id,
-                retrieval_meta=retrieval_meta,
+            # 审计切片用 **id 差集**，不能用 prior_len 下标：sanitize_messages
+            # 会在本轮开头删掉上一轮悬空的 tool_calls 组，最终列表长度与
+            # 请求前不再对齐；按下标切会截掉本轮消息或把旧消息算进来。
+            prior = await workflow.aget_state(config)
+            prior_ids = {
+                message.id
+                for message in (prior.values or {}).get("messages", [])
+                if message.id
+            }
+
+            async for _namespace, payload in workflow.astream(
+                initial,
+                config,
+                stream_mode="custom",
+                subgraphs=True,
             ):
-                if isinstance(event, ToolCallEvent):
-                    # 前一段正文到此结束：把过滤器扣留的尾巴放出去，再为新
-                    # 的最终回答段建一个干净的状态。
-                    tail = delta_filter.flush()
-                    if tail:
-                        yield sse_frame("delta", {"text": tail})
-                    delta_filter = _MarkerStreamFilter(
-                        INSUFFICIENT_MARKER, REFUSAL_TEXT
-                    )
-                    in_tool_round = True
-                    tool_calls_seen.append({
-                        "id": event.call_id, "name": event.name,
-                        "args": event.arguments, "type": "tool_call",
-                    })
-                    yield sse_frame("tool", {
-                        "phase": "start", "call_id": event.call_id,
-                        "name": event.name, "arguments": event.arguments,
-                    })
-                elif isinstance(event, ToolResultEvent):
-                    # ★ 两个文本字段各走各的路：帧里只放给前端看的摘要，
-                    # 库里存回灌给模型的全文（存摘要 = 下一轮模型只看到截断结果）。
-                    tool_messages.append(
-                        ToolMessage(content=event.content, tool_call_id=event.call_id)
-                    )
-                    if event.metadata is not None and "citations" in event.metadata:
-                        citations = list(event.metadata.get("citations") or [])
-                    # 前端没有 message-fetch 接口：citations 只能搭在工具帧
-                    # 与 done 帧上送到浏览器（spec §3.5.1）。
-                    yield sse_frame("tool", {
-                        "phase": "end", "call_id": event.call_id,
-                        "ok": event.ok, "summary": event.summary,
-                        "elapsed_ms": event.elapsed_ms,
-                        "citations": citations,
-                    })
-                elif isinstance(event, DeltaEvent):
-                    # 累积原始文本用于落库；SSE 只发过滤后的文本。两者最终
-                    # 都走同一条「标记 → 标准拒答」规则，保持一致。
-                    (final_answer if in_tool_round else preamble).append(event.text)
-                    filtered = delta_filter.feed(event.text)
+                # subgraphs=True 时每项是 (namespace_tuple, payload)；主图与
+                # 子图事件统一在这里翻译，namespace 本身不参与语义。
+                if not isinstance(payload, dict):
+                    continue
+                kind = payload.get("type")
+                if kind == "delta":
+                    text = payload.get("text") or ""
+                    if not text:
+                        continue
+                    streamed_since_tool = True
+                    filtered = delta_filter.feed(text)
                     if filtered:
                         yield sse_frame("delta", {"text": filtered})
-                elif isinstance(event, DoneEvent):
-                    completed = True
-                    # 放行残留尾巴；若标记出现过，这里会补发 REFUSAL_TEXT，
-                    # 使流里拼出来的正文与落库正文完全一致。
-                    tail = delta_filter.flush()
-                    if tail:
-                        yield sse_frame("delta", {"text": tail})
-                    # 先不 yield done：done 帧要带 message_id，而 id 只有在
-                    # 落库 flush 之后才存在。持久化放到循环外统一做。
-                    done_event = event
-                elif isinstance(event, ErrorEvent):
-                    yield sse_frame("error", {"code": event.code, "message": event.message})
-
-            # ★ 持久化必须在 done 帧之前完成：message_id 是前端反馈
-            # （POST /api/feedback）的唯一凭据，只能在 flush 后拿到。
-            if completed and done_event is not None:
-                answer_parts = final_answer if tool_calls_seen else preamble
-                answer = "".join(answer_parts)
-                insufficient = INSUFFICIENT_MARKER in answer
-                if insufficient:
-                    # spec §3.5.2：模型自评不足 → 替换为标准拒答话术 + 入池。
-                    # 只保留标记之前的正文、丢弃标记后的噪声，与 SSE 过滤器
-                    # 的行为严格一致。
-                    answer = (
-                        answer.split(INSUFFICIENT_MARKER, 1)[0] + REFUSAL_TEXT
-                    )
-                    if tool_calls_seen:
-                        final_answer = [answer]
-                    else:
-                        preamble = [answer]
-
-                # 工具轮前言里若也出现标记（罕见），同样规范化，保持落库
-                # 文本与浏览器看到的流式文本一致。
-                if tool_calls_seen:
-                    preamble_text = "".join(preamble)
-                    if INSUFFICIENT_MARKER in preamble_text:
-                        preamble = [
-                            preamble_text.split(INSUFFICIENT_MARKER, 1)[0]
-                            + REFUSAL_TEXT
-                        ]
-
-                # ★ 完整序列：user → assistant(带 tool_calls) → tool 结果* → 最终 assistant
-                # 只存 user + 最终 assistant 会让下一轮回放历史时 tool_call_id
-                # 指向一条不存在的申请单，上游会直接报错——而且只在**第二轮**
-                # 才现形，单轮用例看不出来（见 tests/test_api_tools.py）。
-                to_store: list[BaseMessage] = [HumanMessage(req.message)]
-                if tool_calls_seen:
-                    to_store.append(AIMessage(
-                        content="".join(preamble), tool_calls=tool_calls_seen
-                    ))
-                    to_store.extend(tool_messages)
-                    to_store.append(AIMessage("".join(final_answer)))
-                else:
-                    to_store.append(AIMessage("".join(preamble)))
-
-                # ★ 入池与落库放进同一个 SAVEPOINT：append 可能已经 flush 了
-                # user 行之后才抛错（或被取消）。若直接让 finally 提交，半截
-                # 一轮会落库；回滚到保存点则只丢弃本轮业务写入，先前建好的
-                # 会话行仍然保留。
-                async with db.begin_nested():
-                    # ★ 检索层已经拒答（no_results / low_score）时，同一问题
-                    # 已经入过池；模型随后再吐 <INSUFFICIENT_KNOWLEDGE> 不能
-                    # 再写一条 model_insufficient，否则同一轮出现两行。
-                    if insufficient and not retrieval_meta.get("refusal_reason"):
-                        await lcq_repo.create(
-                            db,
-                            req.message,
-                            str(conv.id),
-                            REASON_MODEL_INSUFFICIENT,
+                elif kind == "tool":
+                    if payload.get("phase") == "start":
+                        # 前一段正文到此结束：放行过滤器扣留的尾巴，再为新的
+                        # 最终回答段建一个干净的状态。
+                        tail = delta_filter.flush()
+                        if tail:
+                            yield sse_frame("delta", {"text": tail})
+                        delta_filter = _MarkerStreamFilter(
+                            INSUFFICIENT_MARKER, REFUSAL_TEXT
                         )
-                    ids = await store.append(
-                        session_id,
-                        *to_store,
-                        metadata=retrieval_meta or None,
+                        streamed_since_tool = False
+                    # 帧里保留 worker 发出的全部字段（去掉仅内部使用的 type）。
+                    yield sse_frame(
+                        "tool",
+                        {key: value for key, value in payload.items() if key != "type"},
                     )
-                    citations = list(retrieval_meta.get("citations") or [])
-                assistant_message_id = ids[-1] if ids else None
-
-                # message_id 必须在客户端收到 done 时已经持久化（反馈接口
-                # 的唯一凭据）。finally 的 commit 保留为无害的 no-op。
-                await db.commit()
-
-                yield sse_frame("done", {
-                    "finish_reason": done_event.finish_reason,
-                    "usage": done_event.usage,
-                    "message_id": assistant_message_id,
-                    "citations": citations,
-                })
         except (GeneratorExit, asyncio.CancelledError):
             # 客户端中途断开（spec §9）：半截回复不写入历史，但要留痕，
             # 否则"回复莫名少了半截"在服务端完全不可见。
@@ -309,10 +234,95 @@ async def chat(
                 "chat client disconnected mid-stream: session_id=%s", session_id
             )
             raise
+        except Exception as exc:  # noqa: BLE001 — 流已开始，只能补 error 帧
+            # spec §11.3：出错必须补一个 error 帧；此时不写审计（半截一轮）。
+            logger.exception("chat workflow failed: session_id=%s", session_id)
+            yield sse_frame(
+                "error",
+                {"code": classify_exception(exc), "message": str(exc)[:500]},
+            )
+        else:
+            final = await workflow.aget_state(config)
+            values = final.values or {}
+            new_messages = [
+                message
+                for message in values.get("messages", [])
+                if message.id not in prior_ids
+            ]
+            # evidence 注入是临时 SystemMessage，不属于对话历史（Task 7 约定）。
+            audit_messages: list[BaseMessage] = [
+                _normalize_insufficient(message)
+                for message in new_messages
+                if not isinstance(message, SystemMessage)
+            ]
+            final_ai = next(
+                (
+                    message
+                    for message in reversed(new_messages)
+                    if isinstance(message, AIMessage)
+                ),
+                None,
+            )
+
+            # 非 Agent 出口没有流式增量：把最终回答补发成 delta 帧。
+            if not streamed_since_tool and final_ai is not None:
+                filtered = delta_filter.feed(_message_text(final_ai))
+                if filtered:
+                    yield sse_frame("delta", {"text": filtered})
+            tail = delta_filter.flush()
+            if tail:
+                yield sse_frame("delta", {"text": tail})
+
+            citations = list(values.get("citations") or [])
+            actions = list(values.get("actions") or [])
+            # spec §3.5.2：模型自评知识不足 → 入池。闸门已拒答的轮次
+            # （refusal_reason 非空）已由检索/闸门入过池，不能再写第二条。
+            insufficient = (
+                final_ai is not None
+                and INSUFFICIENT_MARKER in _message_text(final_ai)
+            )
+            metadata = {
+                "citations": citations,
+                "actions": actions,
+                "retrieval_strategy": settings.retrieval_strategy,
+            }
+
+            assistant_message_id: int | None = None
+            if audit_messages:
+                # ★ 入池与落库放进同一个 SAVEPOINT：append 可能已经 flush 了
+                # user 行之后才抛错。若直接让 finally 提交，半截一轮会落库；
+                # 回滚到保存点则只丢弃本轮业务写入，会话行仍然保留。
+                async with db.begin_nested():
+                    if insufficient and not values.get("refusal_reason"):
+                        await lcq_repo.create(
+                            db,
+                            req.message,
+                            str(conv.id),
+                            REASON_MODEL_INSUFFICIENT,
+                        )
+                    ids = await store.append(
+                        session_id,
+                        *audit_messages,
+                        metadata=metadata,
+                    )
+                    assistant_message_id = ids[-1] if ids else None
+
+                # message_id 必须在客户端收到 done 时已经持久化（反馈接口
+                # 的唯一凭据）。finally 的 commit 保留为无害的 no-op。
+                await db.commit()
+
+            tokens_used = values.get("tokens_used") or 0
+            yield sse_frame("done", {
+                "finish_reason": "stop",
+                "usage": {"total_tokens": tokens_used} if tokens_used else None,
+                "message_id": assistant_message_id,
+                "citations": citations,
+                "actions": actions,
+            })
         finally:
             # ★ 只提交、不再在 finally 里写消息：持久化已经挪到 done 帧
             # 之前（message_id 需要 flush 后的 id）。客户端断开或上游出错时
-            # completed=False，上面的落库分支根本不会执行，历史仍然零痕迹。
+            # 不会执行上面 else 里的落库分支，历史仍然零痕迹。
             # 无条件提交是另一件事：get_or_create 产生的**会话行**即使这一轮
             # 失败也要保留（否则下次请求又要重建，工具的外键还得先有）。
             # get_db 是 `async with` 形式，不提交则未提交的写入在退出时被回滚。

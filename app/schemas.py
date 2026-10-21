@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ChatRequest(BaseModel):
@@ -8,6 +8,19 @@ class ChatRequest(BaseModel):
         description="会话 id；省略则服务端生成并经由 meta 事件返回",
     )
     message: str = Field(..., min_length=1, max_length=4000)
+
+    @field_validator("message")
+    @classmethod
+    def _reject_blank_message(cls, value: str) -> str:
+        """去掉首尾空白后为空的消息一律 422。
+
+        ``min_length=1`` 只挡得住空串，挡不住 "   "；空白输入进入工作流会
+        产生一轮没有意义（且会被审计落库）的对话。
+        """
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("message 不能为空")
+        return stripped
 
 
 class ExtractRequest(BaseModel):

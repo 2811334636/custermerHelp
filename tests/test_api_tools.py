@@ -1,24 +1,25 @@
+"""工具轮在 `/api/chat` 工作流适配层上的契约（工具帧、回灌全文、错误边界、回放）。
+
+ch05 起模型回合由 LangGraph 驱动：`agent_model` 每次都绑全部工具，收敛靠
+“没有新 tool_calls”或步数/预算触顶；适配层只负责把 custom 事件翻译成 SSE、
+把最终 State 落审计。这里锁住这些行为，避免迁走旧单轮循环时丢掉覆盖。
+"""
+
 import json
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
-from app.main import app
-from app.providers import get_default_chat_model
-from app.sessions import SessionStore
 from app.api import get_store
 from app.db.base import get_db
+from app.main import app
+from app.providers import get_default_chat_model
 
 
 @pytest.fixture(autouse=True)
 def _stub_faq_retrieval(monkeypatch):
-    """路由测试不碰外部 embedding/Milvus。
-
-    这些用例测的是 SSE 帧、落库与历史回放，不是检索本身；真检索会让整条
-    链路依赖 SiliconFlow 与已建好的知识库。检索行为由 tests/test_retrieval.py
-    和 tests/test_tools.py 单独覆盖。
-    """
+    """路由测试不碰外部 embedding/Milvus。"""
     from app.db.models import KnowledgeChunk
     from app.knowledge import retrieval
 
@@ -40,12 +41,10 @@ def _stub_faq_retrieval(monkeypatch):
                     content_hash="x",
                 )
             ],
-            {"strategy": "dense", "scores": None, "top_score": None},
+            {"strategy": "dense", "scores": [0.88], "top_score": 0.88},
         )
 
-    monkeypatch.setattr(
-        retrieval, "search_with_metadata", fake_search_with_metadata
-    )
+    monkeypatch.setattr(retrieval, "search_with_metadata", fake_search_with_metadata)
 
 
 class FakeStore:
@@ -60,8 +59,8 @@ class FakeStore:
     async def append(self, session_id, *messages, metadata=None):
         msgs = self._data.setdefault(session_id, [])
         ids = []
-        for m in messages:
-            msgs.append(m)
+        for message in messages:
+            msgs.append(message)
             ids.append(self._next_id)
             self._next_id += 1
         if metadata is not None and messages:
@@ -72,35 +71,58 @@ class FakeStore:
         return session_id in self._data
 
 
-class ToolCallingModel:
-    def __init__(self):
-        self._bound = []
+class GraphModel:
+    """按调用次序作答的模型桩；意图分类走 `ainvoke`。"""
+
+    def __init__(self, intent: str, replies):
+        self.intent = intent
+        self.replies = list(replies)
+        self.agent_calls: list[list] = []
+
+    async def ainvoke(self, messages):
+        return AIMessage(
+            content=json.dumps(
+                {"intent": self.intent, "confidence": 0.9}, ensure_ascii=False
+            )
+        )
 
     def bind_tools(self, tools):
-        self._bound = list(tools)
         return self
 
     async def astream(self, messages):
-        if len(self._bound) > 0:
-            yield AIMessageChunk(
-                content="",
-                tool_call_chunks=[{
-                    "name": "query_faq", "args": '{"keyword": "退货"}',
-                    "id": "call_x", "index": 0, "type": "tool_call_chunk",
-                }],
-            )
-        else:
-            yield AIMessageChunk(content="退货政策是七天无理由。")
+        self.agent_calls.append(list(messages))
+        reply = self.replies[min(len(self.agent_calls) - 1, len(self.replies) - 1)]
+        for chunk in reply if isinstance(reply, list) else [reply]:
+            if isinstance(chunk, BaseException):
+                raise chunk
+            if isinstance(chunk, AIMessageChunk):
+                yield chunk
+            else:
+                yield AIMessageChunk(
+                    content=chunk.content or "",
+                    tool_calls=list(chunk.tool_calls or []),
+                    usage_metadata=chunk.usage_metadata,
+                )
+
+
+def tool_call(name: str, args: dict, call_id: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": name, "args": args, "id": call_id}],
+    )
+
+
+FAQ_TOOL = tool_call("query_faq", {"keyword": "退货"}, "call_x")
 
 
 @pytest.fixture
 def client(db_session):
-    """★ 必须注入真实的 db session：路由要用它做 get_or_create 与 build_registry。
-    覆盖成 None 会让 get_or_create(None, ...) 直接崩。
-    """
+    """★ 必须注入真实的 db session：路由要用它做 get_or_create。"""
     store = FakeStore()
     app.dependency_overrides[get_store] = lambda: store
-    app.dependency_overrides[get_default_chat_model] = lambda: ToolCallingModel()
+    app.dependency_overrides[get_default_chat_model] = lambda: GraphModel(
+        "物流", [AIMessage(content="您好，有什么可以帮您？")]
+    )
     app.dependency_overrides[get_db] = lambda: db_session
     with TestClient(app) as c:
         c.store = store
@@ -123,10 +145,19 @@ def parse_sse(raw: str):
     return out
 
 
+def use_model(model):
+    app.dependency_overrides[get_default_chat_model] = lambda: model
+
+
 def test_tool_events_appear_before_deltas(client):
+    model = GraphModel(
+        "退货退款", [FAQ_TOOL, [AIMessageChunk(content="退货政策是七天无理由。")]]
+    )
+    use_model(model)
+
     r = client.post("/api/chat", json={"message": "退货政策是什么"})
-    events = parse_sse(r.text)
-    names = [n for n, _ in events]
+    names = [name for name, _ in parse_sse(r.text)]
+
     assert names[0] == "meta"
     assert "tool" in names
     assert names.index("tool") < names.index("delta")
@@ -134,24 +165,41 @@ def test_tool_events_appear_before_deltas(client):
 
 
 def test_tool_start_and_end_frames(client):
-    r = client.post("/api/chat", json={"message": "退货政策是什么"})
-    tools = [d for n, d in parse_sse(r.text) if n == "tool"]
+    model = GraphModel(
+        "退货退款", [FAQ_TOOL, [AIMessageChunk(content="退货政策是七天无理由。")]]
+    )
+    use_model(model)
+
+    tools = [
+        data
+        for name, data in parse_sse(
+            client.post("/api/chat", json={"message": "退货政策是什么"}).text
+        )
+        if name == "tool"
+    ]
+
     assert tools[0]["phase"] == "start"
     assert tools[0]["name"] == "query_faq"
     assert tools[0]["arguments"] == {"keyword": "退货"}
     assert tools[1]["phase"] == "end"
     assert tools[1]["call_id"] == tools[0]["call_id"]
-    assert "ok" in tools[1]
+    assert tools[1]["name"] == "query_faq"
+    assert tools[1]["ok"] is True
     assert "summary" in tools[1]
+    assert "elapsed_ms" in tools[1]
     assert "content" not in tools[1], "SSE 帧只发 summary，不发回灌全文"
 
 
 def test_full_message_sequence_is_stored(client):
-    """★ 落库必须是**完整序列**：user → assistant(带 tool_calls) → tool → 最终 assistant。
+    """★ 审计必须是完整序列：user → assistant(带 tool_calls) → tool → 最终 assistant。
 
-    只存 user + 最终 assistant 的话，下一轮回放历史时 tool_call_id 会指向
-    一条不存在的申请单，上游会直接报错。
+    checkpointer 用同一份完整序列，下一轮才不会有悬空 tool_call_id。
     """
+    model = GraphModel(
+        "退货退款", [FAQ_TOOL, [AIMessageChunk(content="退货政策是七天无理由。")]]
+    )
+    use_model(model)
+
     r = client.post("/api/chat", json={"message": "退货政策是什么"})
     sid = parse_sse(r.text)[0][1]["session_id"]
 
@@ -167,16 +215,14 @@ def test_full_message_sequence_is_stored(client):
 
 def test_no_tool_turn_stores_two_messages(client):
     """不需要工具的轮次：只存 user + assistant，没有 tool 消息。"""
+    model = GraphModel(
+        "物流", [AIMessage(content="您好，有什么可以帮您？")]
+    )
+    use_model(model)
 
-    class PlainModel:
-        def bind_tools(self, tools):
-            return self
-
-        async def astream(self, messages):
-            yield AIMessageChunk(content="您好，有什么可以帮您？")
-
-    app.dependency_overrides[get_default_chat_model] = lambda: PlainModel()
-    r = client.post("/api/chat", json={"message": "你好"})
+    r = client.post(
+        "/api/chat", json={"message": "订单 1001 的物流到哪了"}
+    )
     sid = parse_sse(r.text)[0][1]["session_id"]
 
     msgs = client.store._data[sid]
@@ -185,25 +231,20 @@ def test_no_tool_turn_stores_two_messages(client):
     assert msgs[1].tool_calls == []
 
 
-# ---------------------------------------------------------------------------
-# 以下是 Task 10 的三条控制项各自的钉子测试（brief 之外）——brief 的用例
-# 只覆盖"一轮长什么样"，覆盖不到下面这三件事。
-# ---------------------------------------------------------------------------
-
-
 def test_stored_tool_message_holds_full_content_not_the_badge_summary(client):
-    """控制项 (1)：两个文本字段各走各的路。
+    """两个文本字段各走各的路：summary 给前端，content 回灌模型并落库。"""
+    model = GraphModel(
+        "退货退款", [FAQ_TOOL, [AIMessageChunk(content="退货政策是七天无理由。")]]
+    )
+    use_model(model)
 
-    `summary` 是截断到 60 字的一句话（前端徽章用），`content` 是回灌给模型的
-    全文。库里必须存**全文**：存成摘要等于把截断过的工具结果喂给下一轮的模型。
-    """
     r = client.post("/api/chat", json={"message": "退货政策是什么"})
     sid = parse_sse(r.text)[0][1]["session_id"]
-    tools = [d for n, d in parse_sse(r.text) if n == "tool"]
+    tools = [data for name, data in parse_sse(r.text) if name == "tool"]
 
-    # 帧里只有 summary
     assert "content" not in tools[1]
-    assert tools[1]["summary"].endswith("…"), "summary 应是截断过的一行摘要"
+    # 工作流里的 query_faq 事件给的是“检索到 N 条知识”的事实摘要。
+    assert tools[1]["summary"] == "检索到 1 条知识"
 
     stored = client.store._data[sid][2]
     assert type(stored).__name__ == "ToolMessage"
@@ -212,97 +253,58 @@ def test_stored_tool_message_holds_full_content_not_the_badge_summary(client):
     assert "退货" in stored.content, "存的应是 FAQ 工具的真实返回全文"
 
 
-class MetadataModel:
-    """第一次调用申请工具，第二次作答 —— 两次都带真实的 response_metadata / usage。
-
-    第一次的 finish_reason 是真实上游会给的 "tool_calls"，第二次是 "length"
-    （模拟被上游截断）。裸 chunk 的打桩模型看不到这两个值，这个桩就是来锁
-    DoneEvent 不再写死 "stop" 的。
-
-    ★ 分支判据必须是**调用次序**（共享的 rec），不能是"有没有绑工具"：
-    改造前的路由压根不调 bind_tools（那时走的是 stream_reply），按绑定状态
-    分支会直接落到作答那一支、报出 "length" —— 断言就成了假绿，抓不到任何
-    东西。这个坑是 review 指出来的（原版按 `len(self._bound)` 分支，在改造前
-    的路由下也通过）。
-    """
-
+class MetadataModel(GraphModel):
     USAGE = {"input_tokens": 31, "output_tokens": 7, "total_tokens": 38}
 
-    def __init__(self, rec):
-        self._rec = rec
-        self._bound = []
-
-    def bind_tools(self, tools):
-        self._bound = list(tools)
-        return self
-
-    async def astream(self, messages):
-        self._rec.append(1)
-        if len(self._rec) == 1:
-            yield AIMessageChunk(
-                content="",
-                tool_call_chunks=[{
-                    "name": "query_faq", "args": '{"keyword": "退货"}',
-                    "id": "call_m", "index": 0, "type": "tool_call_chunk",
-                }],
-                response_metadata={"finish_reason": "tool_calls"},
-            )
-        else:
-            yield AIMessageChunk(
-                content="退货政策是七天无理由。",
-                response_metadata={"finish_reason": "length"},
-                usage_metadata=MetadataModel.USAGE,
-            )
-
-
-def test_done_frame_carries_real_finish_reason_and_usage(client):
-    """控制项 (3)：被上游截断的一轮不得被报成干净的 "stop"。
-
-    旧实现两处都写死 `DoneEvent(finish_reason="stop", usage=None)`，于是
-    finish_reason="length"（截断）与 usage 对客户端完全不可见。这条是**端到端**
-    的钉子；细粒度判据在 tests/test_chat_tools.py 的三条元数据用例。
-    """
-    rec: list[int] = []
-    app.dependency_overrides[get_default_chat_model] = lambda: MetadataModel(rec)
-    r = client.post("/api/chat", json={"message": "退货政策是什么"})
-    done = [d for n, d in parse_sse(r.text) if n == "done"]
-
-    assert len(rec) == 2, "工具轮：带工具的请求 + 最终回答的请求"
-    assert done[-1]["finish_reason"] == "length", "截断必须如实上报，不能是 stop"
-    assert done[-1]["usage"] == MetadataModel.USAGE
-
-
-class FailsOnSecondCallModel:
-    """第一次正常申请工具，第二次（最终回答那次）上游炸了。
-
-    这是 ch01 错误边界在工具轮上的分支：已经开始流式（tool 帧都发了）之后
-    才失败，仍然只许是 event: error，而且整轮不许落库。
-    """
-
     def __init__(self):
-        self._bound = []
+        super().__init__(
+            "退货退款",
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "query_faq", "args": {"keyword": "退货"}, "id": "call_m"}
+                    ],
+                ),
+                AIMessage(
+                    content="退货政策是七天无理由。",
+                    usage_metadata=self.USAGE,
+                ),
+            ],
+        )
 
-    def bind_tools(self, tools):
-        self._bound = list(tools)
-        return self
 
-    async def astream(self, messages):
-        if len(self._bound) > 0:
-            yield AIMessageChunk(
-                content="",
-                tool_call_chunks=[{
-                    "name": "query_faq", "args": '{"keyword": "退货"}',
-                    "id": "call_f", "index": 0, "type": "tool_call_chunk",
-                }],
-            )
-        else:
-            raise RuntimeError("上游炸了")
+def test_done_frame_carries_usage_from_final_state(client):
+    """done.usage 来自工作流累加的 tokens_used（不再是写死的 None）。"""
+    use_model(MetadataModel())
+
+    done = [
+        data
+        for name, data in parse_sse(
+            client.post("/api/chat", json={"message": "退货政策是什么"}).text
+        )
+        if name == "done"
+    ][-1]
+
+    assert done["finish_reason"] == "stop"
+    assert done["usage"] == {"total_tokens": MetadataModel.USAGE["total_tokens"]}
+
+
+class FailsOnSecondCallModel(GraphModel):
+    def __init__(self):
+        super().__init__(
+            "退货退款",
+            [
+                FAQ_TOOL,
+                RuntimeError("上游炸了"),
+            ],
+        )
 
 
 def test_tool_round_failure_is_error_not_done_and_persists_nothing(client):
-    app.dependency_overrides[get_default_chat_model] = lambda: FailsOnSecondCallModel()
+    use_model(FailsOnSecondCallModel())
     r = client.post("/api/chat", json={"message": "退货政策是什么"})
-    names = [n for n, _ in parse_sse(r.text)]
+    names = [name for name, _ in parse_sse(r.text)]
 
     assert names[-1] == "error", "工具轮中途失败仍是 event: error"
     assert "done" not in names, "error 与 done 互斥"
@@ -310,90 +312,70 @@ def test_tool_round_failure_is_error_not_done_and_persists_nothing(client):
     assert client.store._data == {}, "半截的一轮一句都不许落库"
 
 
-class RecordingModel:
-    """把每次 astream 收到的消息记进共享列表 rec（跨请求共享——override 的
-    lambda 每个请求都会新建实例，实例内部的计数器跨不过请求）。
-
-    只有**第一次**调用申请工具，之后再问都直接作答：这样第二轮的第一条
-    消息就干净地反映"服务端回放了什么历史"。
-    """
-
-    def __init__(self, rec):
-        self._rec = rec
-        self._bound = []
-
-    def bind_tools(self, tools):
-        self._bound = list(tools)
-        return self
-
-    async def astream(self, messages):
-        self._rec.append(list(messages))
-        if len(self._rec) == 1:
-            yield AIMessageChunk(
-                content="",
-                tool_call_chunks=[{
-                    "name": "query_faq", "args": '{"keyword": "退货"}',
-                    "id": "call_r1", "index": 0, "type": "tool_call_chunk",
-                }],
-            )
-        else:
-            yield AIMessageChunk(content="退货政策是七天无理由。")
-
-
 def test_second_turn_replays_the_first_turns_tool_round(client):
-    """★ 本任务最有价值的用例：历史回放。
+    """★ 历史回放：第二轮模型消息里必须有第一轮完整的工具回合。
 
-    "只存 user + 最终 assistant" 的实现，第一轮看着完全正常——帧对了、回复
-    也对了。它只在**第二轮**才现形：回放出来的历史里没有 AIMessage(tool_calls)
-    也没有 ToolMessage，模型看到一条凭空出现的 tool 结果（或 tool_call_id
-    指向一张从没申请过的单子），上游直接报错。
-
-    这里断言第二轮发给模型的 messages 逐条对得上第一轮的真实回合。
+    上下文归 checkpointer；审计归 MySQL/FakeStore。这条用例锁住“删掉
+    `store.get()` 之后模型上下文没有断”。
     """
-    rec: list[list] = []
-    app.dependency_overrides[get_default_chat_model] = lambda: RecordingModel(rec)
+    model = GraphModel(
+        "退货退款",
+        [
+            FAQ_TOOL,
+            [AIMessageChunk(content="退货政策是七天无理由。")],
+            [AIMessageChunk(content="退款一般三个工作日到账。")],
+        ],
+    )
+    use_model(model)
 
     r1 = client.post("/api/chat", json={"message": "退货政策是什么"})
     sid = parse_sse(r1.text)[0][1]["session_id"]
     client.post("/api/chat", json={"session_id": sid, "message": "那退了多久能退款"})
 
-    assert len(rec) == 3, "第一轮两次调用 + 第二轮一次调用"
-    seen = rec[2]  # 第二轮唯一的模型调用
+    assert len(model.agent_calls) == 3, "第一轮两次调用 + 第二轮一次调用"
+    seen = model.agent_calls[2]
     assert [type(m).__name__ for m in seen] == [
-        "SystemMessage", "HumanMessage", "AIMessage", "ToolMessage",
-        "AIMessage", "HumanMessage",
+        "SystemMessage", "SystemMessage", "HumanMessage", "AIMessage",
+        "ToolMessage", "AIMessage", "HumanMessage",
     ]
-    assert seen[1].content == "退货政策是什么"
-    assert seen[2].tool_calls and seen[2].tool_calls[0]["name"] == "query_faq"
-    assert seen[3].tool_call_id == seen[2].tool_calls[0]["id"], "tool_call_id 必须对得上"
-    assert seen[4].content == "退货政策是七天无理由。", "最终回答也要在历史里"
-    assert seen[5].content == "那退了多久能退款"
+    assert seen[2].content == "退货政策是什么"
+    assert seen[3].tool_calls and seen[3].tool_calls[0]["name"] == "query_faq"
+    assert seen[4].tool_call_id == seen[3].tool_calls[0]["id"], "tool_call_id 必须对得上"
+    assert seen[5].content == "退货政策是七天无理由。", "最终回答也要在历史里"
+    assert seen[6].content == "那退了多久能退款"
 
 
 def test_second_turn_replays_tool_round_from_mysql(client, db_session):
-    """同上，但走**真实** MySQLSessionStore：锁住 tool_calls / tool_call_id
-    在 messages 表里能原样往返。
+    """审计侧的 MySQL 往返：tool_calls / tool_call_id / 全文都能原样读回。"""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    回放链路上还有一段 brief 的用例看不见的路：LangChain 消息 → to_rows →
-    MySQL JSON 列 → from_rows。这段丢了 tool_calls 的话，FakeStore 版本
-    依然全绿，线上第二轮却会炸。
-    """
+    from app.config import get_settings
     from app.sessions import MySQLSessionStore
 
-    rec: list[list] = []
-    app.dependency_overrides[get_default_chat_model] = lambda: RecordingModel(rec)
+    model = GraphModel(
+        "退货退款",
+        [FAQ_TOOL, [AIMessageChunk(content="退货政策是七天无理由。")]],
+    )
+    use_model(model)
     app.dependency_overrides[get_store] = lambda: MySQLSessionStore(session=db_session)
 
     r1 = client.post("/api/chat", json={"message": "退货政策是什么"})
     sid = parse_sse(r1.text)[0][1]["session_id"]
-    client.post("/api/chat", json={"session_id": sid, "message": "那退了多久能退款"})
 
-    seen = rec[2]
-    assert [type(m).__name__ for m in seen] == [
-        "SystemMessage", "HumanMessage", "AIMessage", "ToolMessage",
-        "AIMessage", "HumanMessage",
+    async def _read():
+        # 另起引擎：只读已提交的行，也避免把 db_session 的事务带出 portal 循环。
+        engine = create_async_engine(get_settings().db_url)
+        try:
+            async with async_sessionmaker(engine)() as other:
+                return await MySQLSessionStore(session=other).get(sid)
+        finally:
+            await engine.dispose()
+
+    stored = client.portal.call(_read)
+    assert [type(m).__name__ for m in stored] == [
+        "HumanMessage", "AIMessage", "ToolMessage", "AIMessage",
     ]
-    assert seen[2].tool_calls[0]["name"] == "query_faq"
-    assert seen[3].tool_call_id == seen[2].tool_calls[0]["id"]
-    assert seen[3].content.startswith("问："), "往返后仍是 query_faq 的全文"
-    assert len(seen[3].content) > 60, "库里存的不是 60 字摘要，而是回灌给模型的全文"
+    assert stored[1].tool_calls[0]["name"] == "query_faq"
+    assert stored[2].tool_call_id == stored[1].tool_calls[0]["id"]
+    assert stored[2].content.startswith("[1] 问：")
+    assert len(stored[2].content) > 60, "库里存的不是 60 字摘要，而是回灌给模型的全文"

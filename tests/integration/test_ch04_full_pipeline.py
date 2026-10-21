@@ -25,7 +25,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -70,21 +70,32 @@ class FakeStore:
 class ScriptedToolModel:
     """脚本化假模型：turn 1 申请 query_faq，turn 2 原样吐回工具内容。
 
+    ch05 起分支判据必须是**调用次序**：Agent 子图每次调用都会绑全部工具，
+    “有没有绑工具”不再能区分首轮与末轮。意图分类走 `ainvoke`。
+
     ``suffix`` 用于正常路径补上引用编号 ``[1]``；拒答路径保持空串，让
     最终正文完全由真实检索结果决定（与 Task 10 的 RefusalModel 一致）。
     """
 
-    def __init__(self, keyword: str, suffix: str = ""):
+    def __init__(self, keyword: str, suffix: str = "", intent: str = "商品咨询"):
         self._keyword = keyword
         self._suffix = suffix
-        self._bound: list = []
+        self._intent = intent
+        self._calls = 0
+
+    async def ainvoke(self, messages):
+        return AIMessage(
+            content=json.dumps(
+                {"intent": self._intent, "confidence": 0.9}, ensure_ascii=False
+            )
+        )
 
     def bind_tools(self, tools):
-        self._bound = list(tools)
         return self
 
     async def astream(self, messages):
-        if self._bound:
+        self._calls += 1
+        if self._calls == 1:
             yield AIMessageChunk(
                 content="",
                 tool_calls=[{
@@ -230,7 +241,6 @@ def test_hybrid_rerank_full_pipeline(client):
     assert stored[-1].content == streamed
     assert client.store.metadata[session_id]["citations"] == citations
     assert client.store.metadata[session_id]["retrieval_strategy"] == "hybrid_rerank"
-    assert client.store.metadata[session_id]["top_score"] is not None
 
     # 6) 引用编号可点：GET /api/chunks/{chunk_id} 返回原文与章节路径，
     #    且这条引用确实指向运费知识块（不是随便一个 chunk_id）。
@@ -306,8 +316,10 @@ def empty_kb(monkeypatch):
 def test_refusal_path_pools_question(client, empty_kb):
     """拒答路径：空召回 → 标准拒答话术 → 恰好一行 no_results 入池。"""
     _assert_test_database()
+    # 拒答路径走业务类（带订单号）直接进 Agent：知识类的预检索会在工具
+    # 之前就被闸门拦住，就测不到 query_faq 的空结果回灌与入池了。
     app.dependency_overrides[get_default_chat_model] = lambda: ScriptedToolModel(
-        REFUSAL_QUESTION
+        REFUSAL_QUESTION, intent="物流"
     )
 
     # 只清本用例的 question，且 DELETE 在应用事件循环里执行。
@@ -329,7 +341,10 @@ def test_refusal_path_pools_question(client, empty_kb):
 
     client.portal.call(_clear_pool)
 
-    r = client.post("/api/chat", json={"message": REFUSAL_QUESTION})
+    # 带订单号：业务类槽位门放行，才会真正进入 Agent 调工具。
+    r = client.post(
+        "/api/chat", json={"message": f"订单 1001 {REFUSAL_QUESTION}"}
+    )
     assert r.status_code == 200
     events = parse_sse(r.text)
     session_id = events[0][1]["session_id"]

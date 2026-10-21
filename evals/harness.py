@@ -1,12 +1,10 @@
 """两个评估集共用的底座：生产回合驱动器 + 真实测试库会话 + 确定性转述判据。
 
-★ 为什么直接驱动 app/chat.py 的 stream_reply_with_tools（修复轮 · Important 4）
-评估里曾有一份"自己拼的回合"（evals/turn.py）：第一次 astream 累积 → 执行工具 →
-第二次 ainvoke。它和 Task 9 落地的生产代码**已经分叉**——那份副本调的是"没绑工具
-的 model"，生产调的是 `model.bind_tools([])`；而"第二次不绑工具"正是本章单轮收敛
-的结构性保证。一份复刻品迟早会与真身走散，而评估的全部价值就在于它测的是真身。
-现在这里只做一件事：喂事件流、把事件翻译成可断言的数据。回合逻辑本身——先转发
-后决断、工具执行、第二次不绑工具——只有 app/chat.py 一份实现。
+★ 为什么直接驱动生产工作流（ch05）
+评估的价值在于测"真身"。ch05 起回合由 ``app/workflow`` 的 LangGraph 图驱动，
+本文件不再复刻"先转发后决断 / 工具执行 / 收敛"的循环，而是把同一张图
+（``build_workflow``）跑一遍，只做事件翻译。checkpointer 用进程内
+``InMemorySaver``：评估是一问一答，不需要跨轮持久化。
 
 ★ 为什么连真库（修复轮 · Important 3）
 session=None 时 query_faq / create_ticket 一律回"暂时不可用"，5 条 faq/工单用例
@@ -28,17 +26,13 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.chat import (
-    DeltaEvent,
-    ErrorEvent,
-    ToolCallEvent,
-    ToolResultEvent,
-    stream_reply_with_tools,
-)
 from app.config import get_settings
 from app.repositories import conversation as conv_repo
+from app.workflow.graph import build_workflow, workflow_deps
 
 # ---------------------------------------------------------------- 回合驱动器
 
@@ -75,52 +69,88 @@ async def run_production_turn(
     conversation_id: int = 0,
     history: list | None = None,
     token_budget: int | None = None,
+    session=None,
 ) -> Turn:
-    """喂给生产函数一句话，把事件流翻译成 Turn。
+    """喂给生产工作流一句话，把 custom 事件流翻译成 Turn。
 
-    事件时序（app/chat.py:133-146）：首轮 DeltaEvent → ToolCallEvent → ToolResultEvent
-    → 末轮 DeltaEvent → DoneEvent。于是首轮正文 = 第一次 ToolCallEvent 之前的增量，
-    末轮正文 = ToolResultEvent 之后的增量；没工具时全部增量就是整条回复。
+    事件契约（``stream_mode="custom"``）：``{"type": "delta", "text": ...}`` 与
+    ``{"type": "tool", "phase": "start|end", ...}``。首轮正文 = 第一次 tool end
+    之前的增量，末轮正文 = tool end 之后的增量；没工具时全部增量就是整条回复。
 
-    上游报错**直接抛**，不降级：ErrorEvent 被咽掉的话，一次网络故障会伪装成
-    "模型没调工具"，评估转绿而实际什么都没测到。
+    工具回灌全文不在 custom 事件里（帧里只有摘要），所以从最终 State 的
+    ``ToolMessage`` 取——评估的转述判据必须看模型真正拿到的内容。
+
+    上游报错**直接抛**，不降级：否则一次网络故障会伪装成"模型没调工具"，
+    评估转绿而实际什么都没测到。
     """
-    budget = (
-        token_budget if token_budget is not None else get_settings().history_token_budget
-    )
+    settings = get_settings()
+    budget = token_budget if token_budget is not None else settings.agent_token_budget
+    graph = build_workflow(InMemorySaver())
+    config = {
+        "configurable": {
+            "thread_id": f"eval-{uuid.uuid4()}",
+            **workflow_deps(model, registry, session, conversation_id),
+        }
+    }
+    initial = {
+        "messages": [*(history or []), HumanMessage(message)],
+        "user_input": message,
+        "max_steps": settings.agent_max_steps,
+        "token_budget": budget,
+    }
+
     calls: list[dict] = []
-    outputs: list[str] = []
     oks: list[bool] = []
     round1: list[str] = []
     round2: list[str] = []
-    errors: list[str] = []
     seen_result = False
 
-    async for ev in stream_reply_with_tools(
-        message,
-        history or [],
-        model=model,
-        registry=registry,
-        token_budget=budget,
-        conversation_id=conversation_id,
-    ):
-        if isinstance(ev, DeltaEvent):
-            (round2 if seen_result else round1).append(ev.text)
-        elif isinstance(ev, ToolCallEvent):
-            calls.append({"name": ev.name, "args": ev.arguments, "id": ev.call_id})
-        elif isinstance(ev, ToolResultEvent):
-            outputs.append(ev.content)
-            oks.append(ev.ok)
-            seen_result = True
-        elif isinstance(ev, ErrorEvent):
-            errors.append(f"{ev.code}: {ev.message}")
+    try:
+        async for _namespace, payload in graph.astream(
+            initial, config, stream_mode="custom", subgraphs=True
+        ):
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("type") == "delta":
+                (round2 if seen_result else round1).append(payload.get("text") or "")
+            elif payload.get("type") == "tool":
+                if payload.get("phase") == "start":
+                    calls.append(
+                        {
+                            "name": payload.get("name"),
+                            "args": payload.get("arguments") or {},
+                            "id": payload.get("call_id"),
+                        }
+                    )
+                elif payload.get("phase") == "end":
+                    oks.append(bool(payload.get("ok")))
+                    seen_result = True
+        state = await graph.aget_state(config)
+    except Exception as exc:  # noqa: BLE001 — 评估里必须响亮失败
+        raise RuntimeError(f"生产回合报错：{exc}") from exc
 
-    if errors:
-        raise RuntimeError("生产回合报错：" + "；".join(errors))
+    messages = list((state.values or {}).get("messages") or [])
+    tool_outputs = [
+        message.content
+        for message in messages
+        if isinstance(message, ToolMessage)
+    ]
+    last_ai = next(
+        (m for m in reversed(messages) if isinstance(m, AIMessage)), None
+    )
+    fallback_text = (last_ai.text or "") if last_ai is not None else ""
+
     if calls:
-        return Turn(calls, "\n\n".join(outputs), oks, "".join(round1), "".join(round2))
-    # 没调工具：首轮增量就是用户看到的全部正文，不是"前言"
-    return Turn([], "", [], "", "".join(round1))
+        return Turn(
+            calls,
+            "\n\n".join(tool_outputs),
+            oks,
+            "".join(round1),
+            "".join(round2) or fallback_text,
+        )
+    # 没调工具：首轮增量就是用户看到的全部正文；固定话术出口没有流式增量，
+    # 用最终 State 里的 AI 消息补上（与 API 适配层一致）。
+    return Turn([], "", [], "", "".join(round1) or fallback_text)
 
 
 # ------------------------------------------------------------ 负对照开关
@@ -143,10 +173,14 @@ def apply_prompt_override() -> str | None:
     if not path:
         return None
     import app.prompts as prompts
+    import app.workflow.agent as agent
 
     ns: dict = {}
     exec(Path(path).read_text(encoding="utf-8"), ns)  # noqa: S102 — 输入由调用者指定的负对照工具
     prompts.SYSTEM_PROMPT = ns["SYSTEM_PROMPT"]
+    # Agent 子图在模块导入时 `from app.prompts import SYSTEM_PROMPT`，名字已
+    # 绑定；负对照必须同时改这份引用，否则接旧 Prompt 的评估会是假绿。
+    agent.SYSTEM_PROMPT = ns["SYSTEM_PROMPT"]
     return path
 
 

@@ -21,8 +21,8 @@ evals.run_evals` 把修复前的 Prompt 接进来，它**必须**拿不到 15/15
 System Prompt 后 5 条用例稳定失败——失败的是"该明说查不到"这个已不存在的
 期望，不是模型变差（spec §6.6）。抽取仍走未绑工具的模型。
 
-★ 修复轮起另有两点：回合**直接驱动 app/chat.py 的 stream_reply_with_tools**，
-不再自己复刻（Important 4）；工具接**真库** customer_service_test（Important 3）。
+★ 修复轮起另有两点：回合**直接驱动生产工作流** `app/workflow`，不再自己复刻
+（Important 4）；工具接**真库** customer_service_test（Important 3）。
 
 为什么必须用 `-m`：`python evals/run_evals.py` 会把 sys.path[0] 设成
 `evals/` 目录，导致 `from app.extract import ...` 报 ModuleNotFoundError。
@@ -73,16 +73,19 @@ JUDGE_TEMPLATE = """你在给一个电商客服机器人的回复打分。
 
 
 async def run_prompt_case(
-    case: dict, model, judge_model, registry, conversation_id: int
+    case: dict, model, judge_model, registry, conversation_id: int, session=None
 ) -> dict:
-    # 走**生产函数**（app/chat.py:stream_reply_with_tools），不自己拼回合：
-    # 绑工具、先转发后决断、第二次不绑工具都只有那一份实现（Important 4）。
+    # 走**生产工作流**（app/workflow），不自己拼回合：
+    # 绑工具、先转发后决断、收敛都只有那一份实现（Important 4）。
     # 评估若复刻一遍，迟早与生产走散——而评估的全部价值就是测真身。
     #
-    # model 是**未绑工具**的：绑工具是生产函数内部自己的事（app/chat.py:154）。
     # judge_model 另起一个实例，判断"是/否"时不该带着工具。
     turn = await run_production_turn(
-        case["input"], model=model, registry=registry, conversation_id=conversation_id
+        case["input"],
+        model=model,
+        registry=registry,
+        conversation_id=conversation_id,
+        session=session,
     )
     visible = turn.visible_text  # 用户实际看到的全部文本（工具轮是两段）
     reply = turn.final_text      # judge 与事实核对只看末轮回答
@@ -205,7 +208,9 @@ async def main() -> int:
     async with open_test_db() as (session, conversation_id):
         registry = build_registry(session=session)
         prompt_results = [
-            await run_prompt_case(c, model, judge_model, registry, conversation_id)
+            await run_prompt_case(
+                c, model, judge_model, registry, conversation_id, session=session
+            )
             for c in prompt_cases
         ]
 

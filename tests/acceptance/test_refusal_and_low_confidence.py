@@ -23,7 +23,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -71,17 +71,27 @@ class RefusalModel:
     第一次流：申请 query_faq，keyword 就是用户原问题；
     第二次流：把工具回灌的 ToolMessage 内容**原样**吐回。这样最终答案
     完全由真实的检索结果决定，模型不会自己编话术。
+
+    ch05 起分支判据是**调用次序**：Agent 子图每次调用都会绑全部工具；
+    意图分类走 `ainvoke`，固定为业务类「物流」（用户消息里带订单号）。
     """
 
     def __init__(self):
-        self._bound: list = []
+        self._calls = 0
+
+    async def ainvoke(self, messages):
+        return AIMessage(
+            content=json.dumps(
+                {"intent": "物流", "confidence": 0.9}, ensure_ascii=False
+            )
+        )
 
     def bind_tools(self, tools):
-        self._bound = list(tools)
         return self
 
     async def astream(self, messages):
-        if self._bound:
+        self._calls += 1
+        if self._calls == 1:
             yield AIMessageChunk(
                 content="",
                 tool_call_chunks=[{
@@ -244,7 +254,8 @@ async def test_refusal_and_low_confidence_pool(client, db_session, empty_kb):
 
     client.portal.call(_clear_pool)
 
-    r = client.post("/api/chat", json={"message": QUESTION})
+    # 业务类需要订单号才会进入 Agent；query_faq 的关键词仍是 QUESTION。
+    r = client.post("/api/chat", json={"message": f"订单 1001 {QUESTION}"})
     assert r.status_code == 200
     events = parse_sse(r.text)
     session_id = events[0][1]["session_id"]

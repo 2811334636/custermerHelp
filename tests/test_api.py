@@ -1,9 +1,10 @@
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -12,30 +13,44 @@ from app.config import get_settings
 from app.db.base import get_db
 from app.main import app
 from app.providers import get_default_chat_model
+from app.workflow.texts import CHITCHAT_TEXT
 
 
 class FakeModel:
-    def __init__(self, script=None, raises=None):
-        self._script = script or ["您", "好"]
-        self._raises = raises
+    """API 层通用桩：意图分类走 `ainvoke`，Agent 走 `bind_tools().astream`。"""
+
+    def __init__(self, intent: str = "闲聊", replies=None):
+        self.intent = intent
+        self.replies = list(replies or [])
+        self.agent_calls = 0
+
+    async def ainvoke(self, messages):
+        return AIMessage(
+            content=json.dumps(
+                {"intent": self.intent, "confidence": 0.9}, ensure_ascii=False
+            )
+        )
 
     def bind_tools(self, tools):
-        """ch02 起 /api/chat 走工具轮，模型必须先能绑工具。
-        这个桩一个工具都不申请，所以绑上就等于不用。"""
         return self
 
     async def astream(self, messages):
-        if self._raises:
-            raise self._raises
-        for t in self._script:
-            yield AIMessageChunk(content=t)
+        self.agent_calls += 1
+        reply = self.replies[min(self.agent_calls - 1, len(self.replies) - 1)]
+        for chunk in reply:
+            if isinstance(chunk, BaseException):
+                raise chunk
+            yield chunk
 
     def with_structured_output(self, schema, method=None, **kwargs):
         raise AssertionError("extract 测试请覆盖 get_chat_model 为专用桩")
 
 
 class FakeStore:
-    """测试用的内存桩，接口与 SessionStore 一致但全是 async。"""
+    """测试用的内存桩，接口与 SessionStore 一致但全是 async。
+
+    ch05 起它只承载**审计**写入；模型上下文由 checkpointer 提供。
+    """
 
     def __init__(self):
         self._data: dict[str, list] = {}
@@ -48,8 +63,8 @@ class FakeStore:
     async def append(self, session_id: str, *messages, metadata=None):
         msgs = self._data.setdefault(session_id, [])
         ids = []
-        for m in messages:
-            msgs.append(m)
+        for message in messages:
+            msgs.append(message)
             ids.append(self._next_id)
             self._next_id += 1
         if metadata is not None and messages:
@@ -62,13 +77,7 @@ class FakeStore:
 
 
 class SessionSpy:
-    """包住真实 db session，只为了数 commit 次数。
-
-    ch02 起路由不能再用"只会 commit 的裸桩"：它要 `conv_repo.get_or_create`
-    （execute/add/flush）和 `build_registry(session=db)`（工具要真查库），
-    所以依赖注入的必须是一个能用的 session。除了计数，其余调用一律透传，
-    用例跑的就是生产那条路径。
-    """
+    """包住真实 db session，只为了数 commit 次数；其余调用一律透传。"""
 
     def __init__(self, inner):
         self._inner = inner
@@ -85,17 +94,15 @@ class SessionSpy:
 @pytest.fixture
 def client(monkeypatch, db_session):
     monkeypatch.setenv("APP_LLM_API_KEY", "test-key")
-    from app.config import get_settings
-
     get_settings.cache_clear()
     store = FakeStore()
     spy = SessionSpy(db_session)
     app.dependency_overrides[get_store] = lambda: store
-    # db 不是"只为 commit 而存在"的依赖：路由要用它建会话行、给工具执行。
     app.dependency_overrides[get_db] = lambda: spy
     app.dependency_overrides[get_default_chat_model] = lambda: FakeModel()
     with TestClient(app) as c:
         c.db = spy
+        c.store = store
         yield c
     app.dependency_overrides.clear()
     get_settings.cache_clear()
@@ -122,43 +129,56 @@ def test_healthz(client):
 
 
 def test_chat_emits_meta_then_deltas_then_done(client):
+    """新会话：meta → delta → done；问答走固定话术出口（不调模型）。"""
     r = client.post("/api/chat", json={"message": "你好"})
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
     events = parse_sse(r.text)
-    names = [n for n, _ in events]
+    names = [name for name, _ in events]
     assert names[0] == "meta"
     assert names[-1] == "done"
-    assert names.count("delta") == 2
-    assert "".join(d["text"] for n, d in events if n == "delta") == "您好"
+    assert "".join(d["text"] for name, d in events if name == "delta") == CHITCHAT_TEXT
     assert uuid.UUID(events[0][1]["session_id"])  # 是合法 uuid
-    # 完成的一轮提交两次：SAVEPOINT 成功后先 commit（保证客户端收到 done
-    # 时 message_id 已持久化），finally 再提交一次作为无害的 no-op。
-    # get_db 退出时会回滚未提交的写入，任何一次都不能省。
+    # 完成的一轮提交两次：落库后先 commit（保证客户端收到 done 时 message_id
+    # 已持久化），finally 再提交一次作为无害的 no-op。
     assert client.db.commits == 2
 
 
 async def test_chat_reuses_given_session_and_keeps_context(client):
-    """会话复用（服务端侧）：带 session_id 的第二轮不再发 meta，且历史被累积。
+    """带 session_id 的第二轮不再发 meta，且两轮都留在审计历史里。
 
-    注意断言边界：打桩模型不看 messages，所以本用例**不**验证模型真的"看到"
-    了第一轮内容（那是 evals/ 与 smoke.sh 验收 2 的职责）。它验证的是服务端行为：
-    同一 session_id 下的历史确实被写入并保留。
+    ★ 上下文本身由 checkpointer 提供（见 tests/test_api_workflow.py 的
+    第二轮模型消息断言）；这里验证的是审计写入与 meta 契约。
     """
     r1 = client.post("/api/chat", json={"message": "我叫张三"})
     sid = parse_sse(r1.text)[0][1]["session_id"]
 
     r2 = client.post("/api/chat", json={"session_id": sid, "message": "我叫什么"})
-    names = [n for n, _ in parse_sse(r2.text)]
+    names = [name for name, _ in parse_sse(r2.text)]
     assert names[0] == "delta"  # 自带 session_id 时不再发 meta
 
     history = await client.app.dependency_overrides[get_store]().get(sid)
-    assert [m.content for m in history] == ["我叫张三", "您好", "我叫什么", "您好"]
+    assert [m.content for m in history] == [
+        "我叫张三", CHITCHAT_TEXT, "我叫什么", CHITCHAT_TEXT,
+    ]
 
 
 def test_chat_rejects_empty_message(client):
     """流开始前的错误走 HTTP 状态码（spec §9）。"""
     assert client.post("/api/chat", json={"message": ""}).status_code == 422
+
+
+def test_chat_rejects_whitespace_only_message(client):
+    """Ruling 7：解析层 strip 后为空 → 422，而不是一轮空白对话。"""
+    assert client.post("/api/chat", json={"message": "   "}).status_code == 422
+    assert client.post("/api/chat", json={"message": "\n\t "}).status_code == 422
+
+
+def test_chat_strips_surrounding_whitespace(client):
+    """合法消息的首尾空白在进入工作流前被去掉（审计里是干净文本）。"""
+    r = client.post("/api/chat", json={"message": "  你好  "})
+    sid = parse_sse(r.text)[0][1]["session_id"]
+    assert client.store._data[sid][0].content == "你好"
 
 
 def test_chat_unknown_session_id_is_not_an_error(client):
@@ -167,31 +187,40 @@ def test_chat_unknown_session_id_is_not_an_error(client):
 
 
 def test_chat_empty_session_id_is_rejected(client):
-    """I1 回归（schema 层）：空串 session_id 现在被 422 挡下。
-
-    修复前它是 200 —— 服务端生成了 id 却不发 meta，会话被静默孤立（spec §5.1）。
-    """
+    """I1 回归（schema 层）：空串 session_id 现在被 422 挡下。"""
     r = client.post("/api/chat", json={"session_id": "", "message": "你好"})
     assert r.status_code == 422
 
 
-async def test_chat_emits_meta_when_session_id_is_empty_string(db_session):
+def test_chat_emits_meta_when_session_id_is_empty_string(client):
     """I1 回归（推导层）：即便空串绕过 pydantic 校验，chat() 也必须回发 meta。
 
     直接驱动路由函数（model_construct 跳过校验），锁住 api.py 里的不变量：
     只要服务端替客户端生成了 id，就一定会通过 meta 告诉客户端。
-    旧实现（is_new_session = session_id is None）在此会静默不发 meta。
     """
     from app.api import chat
     from app.schemas import ChatRequest
 
     req = ChatRequest.model_construct(session_id="", message="你好")
-    store = FakeStore()
-    # 直接调用没有依赖注入，db 得自己给：路由无条件 `await db.commit()`，
-    # 而且要拿它建会话行（get_or_create）+ 给工具执行，所以给真 session。
-    resp = await chat(req, store=store, db=db_session, model=FakeModel())
 
-    raw = "".join([chunk async for chunk in resp.body_iterator])
+    async def _drive():
+        # 路由在 TestClient 的 portal 循环里跑，db 必须属于同一个循环。
+        engine = create_async_engine(get_settings().db_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as db:
+                response = await chat(
+                    req,
+                    request=SimpleNamespace(app=app),
+                    store=FakeStore(),
+                    model=FakeModel(),
+                    db=db,
+                )
+                return "".join([chunk async for chunk in response.body_iterator])
+        finally:
+            await engine.dispose()
+
+    raw = client.portal.call(_drive)
     events = parse_sse(raw)
     assert events[0][0] == "meta"
     assert events[0][1]["session_id"]  # 非空，且客户端学得到
@@ -206,8 +235,14 @@ def test_chat_upstream_error_becomes_error_event(client):
         response=httpx.Response(429, request=httpx.Request("POST", "https://x/")),
         body=None,
     )
-    app.dependency_overrides[get_default_chat_model] = lambda: FakeModel(raises=err)
-    r = client.post("/api/chat", json={"message": "你好"})
+    model = FakeModel(
+        intent="物流",
+        replies=[[err]],
+    )
+    app.dependency_overrides[get_default_chat_model] = lambda: model
+    r = client.post(
+        "/api/chat", json={"message": "订单 1001 的物流到哪了"}
+    )
     assert r.status_code == 200  # 流已开始，状态码改不了
     events = parse_sse(r.text)
     assert events[-1][0] == "error"
@@ -217,13 +252,9 @@ def test_chat_upstream_error_becomes_error_event(client):
 async def test_failed_turn_leaves_session_store_untouched(client):
     """I4.3：失败的一轮不得在会话存储里留下任何痕迹（spec §7.2.1）。
 
-    ch02 起"不写消息"和"不提交"是两件事：会话行由 get_or_create 在请求一
-    开始就建出来（工具的外键需要它），它**即使本轮失败也要提交**，否则下次
-    请求又得重建。所以这里断言的是消息零痕迹 + 恰好一次提交（会话行）。
-
-    session_id 用随机 uuid，不用固定的 "失败会话"：路由会把这一行**真提交**，
-    固定 id 就会在库里留下一条跨越用例（和跨越 run，只是 run 之间会被
-    clean_test_db 清掉）的记录，撞上后面用同一个 id 的用例就是 UNIQUE 冲突。
+    会话行由 get_or_create 在请求一开始就建出来（工具的外键需要它），它
+    **即使本轮失败也要提交**，否则下次请求又得重建。所以这里断言的是消息
+    零痕迹 + 恰好一次提交（会话行）。
     """
     import openai
     import httpx
@@ -236,10 +267,14 @@ async def test_failed_turn_leaves_session_store_untouched(client):
         response=httpx.Response(401, request=httpx.Request("POST", "https://x/")),
         body=None,
     )
-    app.dependency_overrides[get_default_chat_model] = lambda: FakeModel(raises=err)
+    app.dependency_overrides[get_default_chat_model] = lambda: FakeModel(
+        intent="物流", replies=[[err]]
+    )
 
     sid = str(uuid.uuid4())
-    r = client.post("/api/chat", json={"session_id": sid, "message": "你好"})
+    r = client.post(
+        "/api/chat", json={"session_id": sid, "message": "订单 1001 的物流到哪了"}
+    )
     assert parse_sse(r.text)[-1][0] == "error"
     # 消息存储零痕迹：半截的一轮一句都不许写。
     assert not await store.exists(sid)
@@ -250,9 +285,7 @@ async def test_failed_turn_leaves_session_store_untouched(client):
     async def _session_row_exists() -> bool:
         # ★ 另起一个引擎来查，而不是复用 client.db：那个 session 的连接建立在
         # TestClient 的 portal 循环里，在外层测试循环里 await 它会撞上
-        # "got Future attached to a different loop"；就算借着 portal 去查，
-        # 也会留下一笔未了结的事务把 teardown 搅坏。新连接顺带把"真的提交了"
-        # 验证得更硬——只有已提交的行才对别的连接可见。
+        # "got Future attached to a different loop"。
         engine = create_async_engine(get_settings().db_url)
         try:
             async with async_sessionmaker(engine)() as other:
@@ -269,11 +302,7 @@ async def test_failed_turn_leaves_session_store_untouched(client):
 
 
 def test_temperature_is_not_an_endpoint_parameter():
-    """I2 回归：get_chat_model 的 temperature 不得泄漏成 query 参数。
-
-    一旦有人在 Depends() 里直接依赖带签名的工厂，FastAPI 会把 temperature
-    变成 /api/chat 与 /api/extract 的 query 参数，未鉴权调用者即可改采样。
-    """
+    """I2 回归：get_chat_model 的 temperature 不得泄漏成 query 参数。"""
     schema = app.openapi()
     for path in ("/api/chat", "/api/extract"):
         params = [

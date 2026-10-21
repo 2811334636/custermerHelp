@@ -60,6 +60,34 @@ def _clear_test_tables() -> None:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def isolated_checkpoint_db(tmp_path_factory):
+    """把 LangGraph checkpointer 指到本次测试会话独占的临时目录。
+
+    没有它，每个 ``with TestClient(app)`` 都会在仓库里留下
+    ``./data/langgraph_checkpoints.sqlite``，而且不同用例会共用同一个
+    checkpoint 文件（同一个 thread_id 可能读到别的用例留下的状态）。
+    每个用例仍应使用独立的 session_id；这里只保证文件不落进仓库、不跨 run
+    复用。
+    """
+    import os
+
+    from app.config import get_settings
+
+    path = tmp_path_factory.mktemp("langgraph-checkpoints") / "checkpoints.sqlite"
+    previous = os.environ.get("APP_CHECKPOINT_DB")
+    os.environ["APP_CHECKPOINT_DB"] = str(path)
+    get_settings.cache_clear()
+    try:
+        yield path
+    finally:
+        if previous is None:
+            os.environ.pop("APP_CHECKPOINT_DB", None)
+        else:
+            os.environ["APP_CHECKPOINT_DB"] = previous
+        get_settings.cache_clear()
+
+
+@pytest.fixture(scope="session", autouse=True)
 def clean_test_db():
     """整个测试会话开始前清一次库：messages / tickets / conversations /
     low_confidence_questions。

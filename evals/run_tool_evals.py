@@ -18,8 +18,8 @@
   而不是把生产向量静默 join 到测试库的行上。检索质量仍以
   `evals.run_kb_evals` 为准。
 
-★ 2026-09-20 修复轮起有两处结构性改动（详见 evals/harness.py 顶部注释）：
-  · 回合**直接驱动 app/chat.py 的 stream_reply_with_tools**，不再自己复刻一遍；
+★ 两处结构性改动（详见 evals/harness.py 顶部注释）：
+  · 回合**直接驱动生产工作流** `app/workflow`，不再自己复刻一遍；
   · 工具接**真库**（spec §5.6 的 customer_service_test），faq/工单不再一律回
     "暂时不可用"——否则那 5 条用例全落在弱分支上，一条什么都没转述的回复也能过。
 """
@@ -184,7 +184,7 @@ async def main() -> int:
         for c in cases:
             turn = await run_production_turn(
                 c["input"], model=model, registry=registry,
-                conversation_id=conversation_id,
+                conversation_id=conversation_id, session=session,
             )
             called = [tc["name"] for tc in turn.tool_calls]
 
