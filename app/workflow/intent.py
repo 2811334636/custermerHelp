@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import re
 from typing import Any
 
@@ -42,34 +43,46 @@ INTENT_PROMPT = """你是电商客服的意图分类器。把用户这句话分�
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
+def _fallback(reason: str, text: Any) -> tuple[str, None]:
+    """统一记录 warning 后返回兜底意图（spec §5.2：解析失败要记 warning）。"""
+    logger.warning("intent_parse_fallback reason=%s raw=%r", reason, text)
+    return FALLBACK_INTENT, None
+
+
 def parse_intent_json(text: str) -> tuple[str, float | None]:
     """解析模型输出，任何异常都退回 ("售后", None)，绝不抛给调用方。
 
     - 合法 JSON + 已知标签 + confidence 合法 → (label, confidence)
-    - 合法 JSON + 已知标签 + 缺/坏 confidence → (label, None)
-    - 未知标签、非对象、坏 JSON → ("售后", None)
+    - 合法 JSON + 已知标签 + 缺/坏 confidence → (label, None)（记 warning）
+    - 未知标签、非对象、坏 JSON → ("售后", None)（记 warning）
     """
     if not isinstance(text, str):
-        return FALLBACK_INTENT, None
+        return _fallback("not_text", text)
     match = _FENCE_RE.search(text)
     if match:
         text = match.group(1)
     try:
         payload: Any = json.loads(text.strip())
     except (json.JSONDecodeError, ValueError):
-        return FALLBACK_INTENT, None
+        return _fallback("bad_json", text)
     if not isinstance(payload, dict):
-        return FALLBACK_INTENT, None
+        return _fallback("not_object", text)
 
     intent = payload.get("intent")
     if not isinstance(intent, str) or intent not in INTENTS:
-        return FALLBACK_INTENT, None
+        return _fallback("unknown_label", intent)
 
     confidence = payload.get("confidence")
     # bool 是 int 子类，必须显式排除：{"confidence": true} 不是合法置信度。
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        logger.warning("intent_confidence_invalid intent=%r confidence=%r", intent, confidence)
         return intent, None
-    return intent, float(confidence)
+    value = float(confidence)
+    # NaN/Infinity 能通过 json.loads（Python 默认接受），但绝不能当置信度。
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        logger.warning("intent_confidence_out_of_range intent=%r confidence=%r", intent, confidence)
+        return intent, None
+    return intent, value
 
 
 def _content_text(content: Any) -> str:
@@ -87,10 +100,18 @@ def _content_text(content: Any) -> str:
 
 
 async def classify_text(text: str, *, model) -> tuple[str, float | None]:
-    """用给定模型分类一句用户输入；评估脚本复用这条路径。"""
-    response = await model.ainvoke(
-        [SystemMessage(INTENT_PROMPT), HumanMessage(text)]
-    )
+    """用给定模型分类一句用户输入；评估脚本复用这条路径。
+
+    意图模型只是分流的第一跳，超时/HTTP/provider 异常都不能让整轮失败：
+    记 warning 后落到兜底意图，后续 Agent 仍可兜住。
+    """
+    try:
+        response = await model.ainvoke(
+            [SystemMessage(INTENT_PROMPT), HumanMessage(text)]
+        )
+    except Exception as exc:  # noqa: BLE001 - 外部服务不可控，必须兜住
+        logger.warning("intent_model_failed input=%r error=%s", text, exc, exc_info=True)
+        return FALLBACK_INTENT, None
     return parse_intent_json(_content_text(response.content))
 
 

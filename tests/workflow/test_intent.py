@@ -23,6 +23,13 @@ class FakeIntentModel:
         return AIMessage(content=self._content)
 
 
+class FailingModel:
+    """模拟上游超时/HTTP 异常：意图模型抖动不能让整轮失败。"""
+
+    async def ainvoke(self, *args, **kwargs):
+        raise RuntimeError("upstream timeout")
+
+
 def test_parse_intent_json_valid():
     from app.workflow.intent import parse_intent_json
 
@@ -35,6 +42,28 @@ def test_parse_intent_json_unknown_or_broken_falls_back():
     assert parse_intent_json('{"intent": "退款", "confidence": 0.9}') == ("售后", None)
     assert parse_intent_json("not json") == ("售后", None)
     assert parse_intent_json('{"intent": "投诉"}') == ("投诉", None)
+
+
+def test_parse_intent_json_rejects_non_finite_or_out_of_range_confidence():
+    from app.workflow.intent import parse_intent_json
+
+    # Python 的 json.loads 默认接受 NaN/Infinity，但置信度只接受 [0,1] 内的有限数。
+    assert parse_intent_json('{"intent": "物流", "confidence": NaN}') == ("物流", None)
+    assert parse_intent_json('{"intent": "物流", "confidence": Infinity}') == ("物流", None)
+    assert parse_intent_json('{"intent": "物流", "confidence": 1.5}') == ("物流", None)
+    assert parse_intent_json('{"intent": "物流", "confidence": -0.1}') == ("物流", None)
+    assert parse_intent_json('{"intent": "物流", "confidence": "0.9"}') == ("物流", None)
+
+
+async def test_classify_falls_back_when_model_raises():
+    from app.workflow.intent import classify_intent_node, classify_text
+
+    assert await classify_text("帮我查物流", model=FailingModel()) == ("售后", None)
+    out = await classify_intent_node(
+        {"user_input": "帮我查物流", "awaiting_slot": None},
+        {"configurable": {"model": FailingModel()}},
+    )
+    assert out["intent"] == "售后" and out["route"] == "business"
 
 
 async def test_classify_reuses_pending_intent_only_when_order_id_present():
