@@ -91,6 +91,20 @@ async def log_node(state: WorkflowState, config: RunnableConfig) -> dict[str, An
     configurable = _configurable(config)
     trace = list(state.get("node_trace") or []) + ["log"]
     if get_settings().workflow_log_enabled:
+        citations = state.get("citations") or []
+        # citations 覆盖预检索与 Agent 内 query_faq 的并集，按 chunk_id 去重；
+        # 没有任何引用时退回 evidence 条数（防御性兜底）。
+        retrieval_chunks = (
+            len(
+                {
+                    citation["chunk_id"]
+                    for citation in citations
+                    if citation.get("chunk_id") is not None
+                }
+            )
+            if citations
+            else len(state.get("evidence") or [])
+        )
         payload = {
             # thread_id 即 conversations.session_uuid（spec §8）；缺省时退回库内 id。
             "session_id": configurable.get(
@@ -102,10 +116,25 @@ async def log_node(state: WorkflowState, config: RunnableConfig) -> dict[str, An
             "steps": state.get("steps") or 0,
             "tokens_used": state.get("tokens_used") or 0,
             "actions": state.get("actions") or [],
-            "retrieval_chunks": len(state.get("evidence") or []),
+            "retrieval_chunks": retrieval_chunks,
         }
         logger.info("workflow_turn %s", json.dumps(payload, ensure_ascii=False))
     return {"node_trace": trace}
+
+
+async def _sanitize_with_trace(state: WorkflowState) -> dict[str, Any]:
+    """sanitize 是每轮第一个节点：从空 trace 开始，不带上一轮的节点。"""
+    result = await sanitize_messages(state)
+    return {**result, "node_trace": ["sanitize_messages"]}
+
+
+async def _begin_turn_with_trace(state: WorkflowState) -> dict[str, Any]:
+    """begin_turn 重置 turn 级字段（含 node_trace）；只保留 sanitize 这一跳。"""
+    result = await begin_turn(state)
+    return {
+        **result,
+        "node_trace": list(state.get("node_trace") or []) + ["begin_turn"],
+    }
 
 
 def _traced(name: str, node: Callable[..., Any]) -> Callable[..., Any]:
@@ -156,8 +185,8 @@ def build_workflow(
     """装配并编译主图；FastAPI lifespan 启动时调用一次。"""
     graph = StateGraph(WorkflowState)
 
-    graph.add_node("sanitize_messages", sanitize_messages)
-    graph.add_node("begin_turn", begin_turn)
+    graph.add_node("sanitize_messages", _sanitize_with_trace)
+    graph.add_node("begin_turn", _begin_turn_with_trace)
     graph.add_node(
         "resolve_reference", _traced("resolve_reference", resolve_reference)
     )

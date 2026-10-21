@@ -192,10 +192,18 @@ async def test_graph_waits_for_order_id_across_turns(tmp_path):
             {"messages": [HumanMessage("1001")], "user_input": "1001"},
             config,
         )
+        # 补号轮不再重新分类：沿用 pending_intent（模型只被调用过一次）。
+        assert model.intent_calls == 1
 
     assert second["order_id"] == "1001"
     assert second["awaiting_slot"] is None
+    assert second["pending_intent"] is None
     assert second["messages"][-1].content == "订单 1001 正在运输中。"
+    # 同一 thread 里保留了第一轮历史：Human + 追问 AI + Human + 回答 AI。
+    assert len(second["messages"]) == 4
+    # trace 每轮从头开始，不会把第一轮的节点带进第二轮。
+    assert second["node_trace"][:2] == ["sanitize_messages", "begin_turn"]
+    assert second["node_trace"].count("classify_intent") == 1
 
 
 async def test_graph_recovers_from_dangling_tool_call(tmp_path):
@@ -361,11 +369,56 @@ async def test_log_node_emits_structured_turn_record(tmp_path, caplog, monkeypat
     assert payload["session_id"] == "t-log"
     assert payload["intent"] == "退货退款"
     assert payload["route"] == "knowledge"
+    assert payload["node_trace"][:2] == ["sanitize_messages", "begin_turn"]
     assert payload["node_trace"][-1] == "log"
     assert "retrieve" in payload["node_trace"]
     assert payload["steps"] == 1
     assert payload["tokens_used"] == 0
     assert payload["actions"] == []
+    assert payload["retrieval_chunks"] == 1
+
+
+async def test_log_counts_chunks_fetched_inside_agent(
+    tmp_path, caplog, monkeypatch
+):
+    """业务类 Agent 内 query_faq 召回的块也要计入 retrieval_chunks（来自 citations）。"""
+    _patch_retrieval(
+        monkeypatch, [FakeChunk("faq:9", "运费怎么算", "满 99 包邮")]
+    )
+    model = ScriptedModel(
+        "物流",
+        replies=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "query_faq",
+                        "args": {"keyword": "运费"},
+                        "id": "c1",
+                    }
+                ],
+            ),
+            AIMessage(content="满 99 包邮。"),
+        ],
+    )
+    with caplog.at_level(logging.INFO, logger="app.workflow.graph"):
+        async with build_test_graph(tmp_path, model) as graph:
+            out = await graph.ainvoke(
+                {
+                    "messages": [HumanMessage("订单 1001 运费怎么算")],
+                    "user_input": "订单 1001 运费怎么算",
+                },
+                _config("t-log-agent", model),
+            )
+
+    assert out["evidence"] == []  # 业务类不做预检索
+    assert [citation["chunk_id"] for citation in out["citations"]] == ["faq:9"]
+    records = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("workflow_turn ")
+    ]
+    payload = json.loads(records[0].removeprefix("workflow_turn "))
     assert payload["retrieval_chunks"] == 1
 
 
