@@ -1,16 +1,43 @@
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.api import router
+from app.config import get_settings
+from app.workflow.graph import build_workflow
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="电商智能客服 ch02 · Function Calling 工具链", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """进程生命周期内保持 checkpointer 连接，并只编译一次工作流。
+
+    ``AsyncSqliteSaver.from_conn_string`` 是异步上下文管理器；退出 lifespan
+    时关闭连接，避免进程挂住。checkpoint 目录不存在时先建出来（首次部署
+    ``./data`` 通常还没有）。
+    """
+    settings = get_settings()
+    Path(settings.checkpoint_db).parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(
+        settings.checkpoint_db
+    ) as checkpointer:
+        app.state.checkpointer = checkpointer
+        app.state.workflow = build_workflow(checkpointer)
+        yield
+
+
+app = FastAPI(
+    title="电商智能客服 ch02 · Function Calling 工具链",
+    version="0.2.0",
+    lifespan=lifespan,
+)
 app.include_router(router)
 
 # 聊天页：单文件原生 JS，零构建。挂载在 /chat，与 /api 前缀不冲突。
