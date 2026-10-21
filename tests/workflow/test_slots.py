@@ -20,6 +20,7 @@ async def test_slot_gate_passes_with_order_id():
         }
     )
     assert out["order_id"] == "1001" and out["awaiting_slot"] is None
+    assert out["pending_intent"] is None
     assert "messages" not in out
 
 
@@ -50,3 +51,19 @@ async def test_slot_gate_uses_existing_order_id_from_state():
         }
     )
     assert out["order_id"] == "1001"
+
+
+async def test_slot_gate_prefers_new_order_id_over_stored():
+    from app.workflow.slots import slot_gate_node
+
+    out = await slot_gate_node(
+        {
+            "user_input": "订单 1002 的物流",
+            "intent": "物流",
+            "order_id": "1001",
+            "awaiting_slot": "order_id",
+            "pending_intent": "物流",
+        }
+    )
+    assert out["order_id"] == "1002"
+    assert out["awaiting_slot"] is None and out["pending_intent"] is None

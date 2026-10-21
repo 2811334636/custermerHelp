@@ -9,7 +9,8 @@ from app.workflow.texts import SLOT_QUESTION
 
 # 带标签的写法优先（订单/订单号/单号），允许中英文冒号和空白。
 ORDER_ID_RE = re.compile(r"(?:订单号?|单号)\s*[:：]?\s*([A-Za-z0-9-]{4,20})")
-# 裸数字兜底：启发式，可能把年份/金额误当订单号；误判只会查无此单。
+# 裸数字兜底：启发式，年份/金额（如“2026 年发货吗”→2026）会被误当订单号；
+# 误判只会查无此单，不会写坏数据（本章接受的取舍）。
 BARE_ORDER_ID_RE = re.compile(r"\b(\d{4,20})\b")
 
 
@@ -25,8 +26,8 @@ def extract_order_id(text: str) -> str | None:
 
 
 async def slot_gate_node(state: WorkflowState) -> dict:
-    """已有订单号或本轮能提取到就放行；否则追问并把原意图挂起。"""
-    order_id = state.get("order_id") or extract_order_id(state.get("user_input", ""))
+    """本轮提取到订单号就用新的，否则复用已有订单号；都没有才追问。"""
+    order_id = extract_order_id(state.get("user_input", "")) or state.get("order_id")
     if order_id:
         return {"order_id": order_id, "awaiting_slot": None, "pending_intent": None}
     return {
