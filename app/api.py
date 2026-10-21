@@ -170,10 +170,11 @@ async def chat(
         # 会看到 "<INSUFFICIENT_KNOWLEDGE>"。工具调用会开启新的 assistant
         # 消息段，届时 flush + 重建过滤器。
         delta_filter = _MarkerStreamFilter(INSUFFICIENT_MARKER, REFUSAL_TEXT)
-        # 最后一次工具边界之后是否已经转发过正文。非 Agent 出口（投诉/闲聊/
-        # 槽位追问/闸门拒答）不经过模型流，没有 custom delta 事件，需要在这里
-        # 补一帧，让浏览器与落库内容一致。
-        streamed_since_tool = False
+        # 当前 assistant 消息段**过滤前**的原始增量。收敛节点可能在流之后
+        # 追加/替换最终回答（步数/预算触顶的固定话术、非 Agent 出口的固定
+        # 文案），也可能是模型自评标记被 State 规范化；结束时拿它与最终
+        # State 对比，决定是否补发。
+        segment_raw: list[str] = []
 
         try:
             # 审计切片用 **id 差集**，不能用 prior_len 下标：sanitize_messages
@@ -201,7 +202,7 @@ async def chat(
                     text = payload.get("text") or ""
                     if not text:
                         continue
-                    streamed_since_tool = True
+                    segment_raw.append(text)
                     filtered = delta_filter.feed(text)
                     if filtered:
                         yield sse_frame("delta", {"text": filtered})
@@ -215,7 +216,7 @@ async def chat(
                         delta_filter = _MarkerStreamFilter(
                             INSUFFICIENT_MARKER, REFUSAL_TEXT
                         )
-                        streamed_since_tool = False
+                        segment_raw = []
                     # 帧里保留 worker 发出的全部字段（去掉仅内部使用的 type）。
                     yield sse_frame(
                         "tool",
@@ -249,12 +250,6 @@ async def chat(
                 for message in values.get("messages", [])
                 if message.id not in prior_ids
             ]
-            # evidence 注入是临时 SystemMessage，不属于对话历史（Task 7 约定）。
-            audit_messages: list[BaseMessage] = [
-                _normalize_insufficient(message)
-                for message in new_messages
-                if not isinstance(message, SystemMessage)
-            ]
             final_ai = next(
                 (
                     message
@@ -263,28 +258,79 @@ async def chat(
                 ),
                 None,
             )
+            final_text = _message_text(final_ai) if final_ai is not None else ""
+            raw_streamed = "".join(segment_raw)
+            # State 里的标志是“最终回答来自模型自评不足”；API 仍负责把标记
+            # 换成面向用户的 REFUSAL_TEXT，并据此入池。
+            insufficient = bool(values.get("insufficient"))
+            audit_final_text: str | None = None
 
-            # 非 Agent 出口没有流式增量：把最终回答补发成 delta 帧。
-            if not streamed_since_tool and final_ai is not None:
-                filtered = delta_filter.feed(_message_text(final_ai))
-                if filtered:
-                    yield sse_frame("delta", {"text": filtered})
-            tail = delta_filter.flush()
-            if tail:
-                yield sse_frame("delta", {"text": tail})
+            if insufficient and INSUFFICIENT_MARKER in raw_streamed:
+                # 流式过滤器已经（在 flush 时）把标记换成了 REFUSAL_TEXT；
+                # State 里是 agent_done 规范化后的 GATE_REFUSAL，不能再补发。
+                # 审计采用与浏览器完全一致的那段文本。
+                tail = delta_filter.flush()
+                if tail:
+                    yield sse_frame("delta", {"text": tail})
+                audit_final_text = (
+                    raw_streamed.split(INSUFFICIENT_MARKER, 1)[0] + REFUSAL_TEXT
+                )
+            elif final_text != raw_streamed:
+                # 最终回答不是当前段流出来的：非 Agent 出口的固定文案，或
+                # agent_done 在流之后追加/替换的触顶话术（例如 max_steps=1
+                # 时前言已流出、最终答案却是 STEP_LIMIT_TEXT）。
+                # 先收尾上一段，再为新段重建过滤器后补发。
+                tail = delta_filter.flush()
+                if tail:
+                    yield sse_frame("delta", {"text": tail})
+                delta_filter = _MarkerStreamFilter(
+                    INSUFFICIENT_MARKER, REFUSAL_TEXT
+                )
+                if final_text:
+                    filtered = delta_filter.feed(final_text)
+                    if filtered:
+                        yield sse_frame("delta", {"text": filtered})
+                tail = delta_filter.flush()
+                if tail:
+                    yield sse_frame("delta", {"text": tail})
+            else:
+                tail = delta_filter.flush()
+                if tail:
+                    yield sse_frame("delta", {"text": tail})
+
+            # evidence 注入是临时 SystemMessage，不属于对话历史（Task 7 约定）。
+            audit_messages: list[BaseMessage] = [
+                _normalize_insufficient(message)
+                for message in new_messages
+                if not isinstance(message, SystemMessage)
+            ]
+            if audit_final_text is not None and final_ai is not None:
+                # 用浏览器实际看到的文本覆盖 State 里规范化后的拒答话术，
+                # 保证“流式拼接 == 落库正文”。
+                audit_messages = [
+                    message.model_copy(update={"content": audit_final_text})
+                    if message.id == final_ai.id
+                    else message
+                    for message in audit_messages
+                ]
 
             citations = list(values.get("citations") or [])
             actions = list(values.get("actions") or [])
-            # spec §3.5.2：模型自评知识不足 → 入池。闸门已拒答的轮次
-            # （refusal_reason 非空）已由检索/闸门入过池，不能再写第二条。
-            insufficient = (
-                final_ai is not None
-                and INSUFFICIENT_MARKER in _message_text(final_ai)
-            )
+            # top_score 取预检索 evidence 与工具 citations 里非空分数的最大值。
+            scores = [
+                entry.get("score")
+                for entry in values.get("evidence") or []
+                if entry.get("score") is not None
+            ] + [
+                citation.get("score")
+                for citation in citations
+                if citation.get("score") is not None
+            ]
             metadata = {
                 "citations": citations,
                 "actions": actions,
                 "retrieval_strategy": settings.retrieval_strategy,
+                "top_score": max(scores) if scores else None,
             }
 
             assistant_message_id: int | None = None
@@ -293,6 +339,8 @@ async def chat(
                 # user 行之后才抛错。若直接让 finally 提交，半截一轮会落库；
                 # 回滚到保存点则只丢弃本轮业务写入，会话行仍然保留。
                 async with db.begin_nested():
+                    # spec §3.5.2：闸门/检索已拒答（refusal_reason 非空）时
+                    # 同一问题已经入过池，不能再写第二条 model_insufficient。
                     if insufficient and not values.get("refusal_reason"):
                         await lcq_repo.create(
                             db,
@@ -311,10 +359,11 @@ async def chat(
                 # 的唯一凭据）。finally 的 commit 保留为无害的 no-op。
                 await db.commit()
 
-            tokens_used = values.get("tokens_used") or 0
             yield sse_frame("done", {
-                "finish_reason": "stop",
-                "usage": {"total_tokens": tokens_used} if tokens_used else None,
+                # 真实终局由 agent_model 从上游 response_metadata 写入 State；
+                # 固定话术出口没有上游元数据，回退为干净的 stop / None。
+                "finish_reason": values.get("finish_reason") or "stop",
+                "usage": values.get("usage"),
                 "message_id": assistant_message_id,
                 "citations": citations,
                 "actions": actions,

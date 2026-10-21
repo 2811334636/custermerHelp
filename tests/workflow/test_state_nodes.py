@@ -18,6 +18,9 @@ async def test_begin_turn_resets_turn_fields_and_sets_cursor():
     state = {
         "steps": 5,
         "tokens_used": 9000,
+        "finish_reason": "length",
+        "usage": {"total_tokens": 9000},
+        "insufficient": True,
         "actions": [{"type": "handoff"}],
         "citations": [{"index": 1}],
         "node_trace": ["retrieve"],
@@ -28,6 +31,8 @@ async def test_begin_turn_resets_turn_fields_and_sets_cursor():
     out = await begin_turn(state)
     assert out["steps"] == 0 and out["tokens_used"] == 0
     assert out["actions"] == [] and out["citations"] == [] and out["node_trace"] == []
+    assert out["finish_reason"] is None and out["usage"] is None
+    assert out["insufficient"] is False
     assert out["citation_cursor"] == 1 and out["citation_index"] == {}
     assert out["awaiting_slot"] == "order_id" and out["order_id"] == "1001"  # 跨轮保留
 

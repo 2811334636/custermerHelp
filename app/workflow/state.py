@@ -31,6 +31,9 @@ TURN_RESET_FIELDS: tuple[str, ...] = (
     "suggestions_sent",
     "steps",
     "tokens_used",
+    "finish_reason",
+    "usage",
+    "insufficient",
     "node_trace",
     "citations",
     "citation_index",
@@ -67,6 +70,11 @@ class WorkflowState(TypedDict, total=False):
     tokens_used: int
     max_steps: int
     token_budget: int
+    # 上游终局元数据（最后一次模型调用的实际值，Task 9 的 done 帧使用）
+    finish_reason: str | None
+    usage: dict | None
+    # 最终回答是否由模型的自评标记转化为拒答（Task 9 据此入池）
+    insufficient: bool
     # 观测：覆盖式列表，节点返回 state["node_trace"] + ["node"]
     node_trace: list[str]
     turn_started_at: float

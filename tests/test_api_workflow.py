@@ -7,23 +7,30 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.api import get_store
+from app.api import REFUSAL_TEXT, get_store
 from app.config import get_settings
 from app.db.base import get_db
+from app.db.models import Conversation, LowConfidenceQuestion
 from app.main import app
 from app.providers import get_default_chat_model
+from app.repositories import low_confidence_question as lcq_repo
 from app.workflow.graph import workflow_deps
-from app.workflow.texts import CHITCHAT_TEXT, COMPLAINT_TEXT, GATE_REFUSAL
+from app.workflow.texts import (
+    CHITCHAT_TEXT,
+    COMPLAINT_TEXT,
+    GATE_REFUSAL,
+    STEP_LIMIT_TEXT,
+)
 
 
 # ------------------------------------------------------------------ 测试替身
@@ -94,6 +101,7 @@ class GraphModel:
                     content=step.content or "",
                     tool_calls=list(step.tool_calls or []),
                     usage_metadata=step.usage_metadata,
+                    response_metadata=step.response_metadata,
                 )
 
 
@@ -210,6 +218,7 @@ def test_knowledge_turn_has_no_tool_and_audits_user_plus_answer(client):
     assert metadata["citations"] == done["citations"]
     assert metadata["actions"] == []
     assert metadata["retrieval_strategy"] == get_settings().retrieval_strategy
+    assert metadata["top_score"] == 0.88, "top_score 取预检索 evidence 的最高分"
 
 
 def test_second_turn_uses_checkpoint_history_not_mysql(client):
@@ -230,6 +239,16 @@ def test_second_turn_uses_checkpoint_history_not_mysql(client):
     first = "订单 1001 的物流到哪了"
     second = "订单 1002 的物流到哪了"
     client.post("/api/chat", json={"session_id": sid, "message": first})
+
+    # ★ 证明上下文真的来自 checkpointer：清空审计存储并让 get() 直接爆炸。
+    # 若实现暗地里回退到 `store.get()`，第二轮会立即失败。
+    client.store._data.pop(sid, None)
+
+    async def _forbidden(_sid):
+        raise AssertionError("store 不能作为模型上下文来源")
+
+    client.store.get = _forbidden
+
     client.post("/api/chat", json={"session_id": sid, "message": second})
 
     second_turn_messages = model.agent_calls[1]
@@ -237,10 +256,8 @@ def test_second_turn_uses_checkpoint_history_not_mysql(client):
     assert first in contents
     assert "第一次回答" in contents
     assert contents[-1] == second
-    # 审计里两轮都在（user + assistant × 2）。
+    # 第二轮审计只有第二轮的两条（第一轮已被手动清掉）。
     assert [m.content for m in client.store._data[sid]] == [
-        first,
-        "第一次回答",
         second,
         "第二次回答",
     ]
@@ -548,3 +565,258 @@ def test_gate_refusal_streams_once_and_does_not_call_agent(client, monkeypatch):
     assert "".join(deltas) == GATE_REFUSAL
     assert events[-1][1]["actions"] == [{"type": "handoff", "label": "转人工"}]
     assert model.agent_calls == [], "闸门失败不进 Agent"
+
+
+# ------------------------------------------------- 9. 触顶收敛话术必须到达浏览器
+
+
+def test_step_limit_text_after_preamble_is_streamed_and_persisted(
+    client, monkeypatch
+):
+    """Important 1：max_steps=1 时前言已流出，最终答案是 STEP_LIMIT_TEXT。
+
+    适配层不能因为“本段有过 delta”就认为最终回答已经发完；必须对比原始
+    流式文本与最终 State，把触顶话术补发出去，且与落库正文一致。
+    """
+    monkeypatch.setattr(get_settings(), "agent_max_steps", 1)
+    model = GraphModel(
+        "物流",
+        [
+            [
+                AIMessageChunk(content="我先帮您查一下"),
+                AIMessageChunk(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "query_order",
+                            "args": {"order_id": "1001"},
+                            "id": "call_step",
+                        }
+                    ],
+                ),
+            ]
+        ],
+    )
+    use_model(model)
+
+    events = parse_sse(
+        client.post(
+            "/api/chat", json={"message": "订单 1001 的物流到哪了"}
+        ).text
+    )
+    names = [name for name, _ in events]
+    streamed = "".join(
+        data["text"] for name, data in events if name == "delta"
+    )
+    sid = events[0][1]["session_id"]
+
+    assert "tool" not in names, "max_steps=1 时工具还没执行就收敛了"
+    assert streamed == "我先帮您查一下" + STEP_LIMIT_TEXT
+
+    # 前言属于带 tool_calls 的 assistant，触顶话术是最后一条 assistant；
+    # 浏览器看到的拼接正文必须等于这一轮所有 assistant 正文的拼接。
+    persisted = "".join(
+        message.content
+        for message in client.store._data[sid]
+        if isinstance(message, AIMessage)
+    )
+    assert persisted == streamed, "浏览器文本与落库 assistant 序列必须一致"
+    assert events[-1][1]["finish_reason"] == "stop"
+
+
+# ------------------------------------------------- 10. Agent 内拒答的重复入池防护
+
+
+def test_agent_faq_refusal_pools_once_and_not_model_insufficient(
+    client, monkeypatch
+):
+    """Important 2：业务类进入 Agent，query_faq 已 no_results 入池，模型再吐
+    自评标记时只能保留一条 no_results，且浏览器只看到一次 REFUSAL_TEXT。"""
+    from app.knowledge import retrieval
+
+    question = "火星天气怎么样（agent 内拒答）"
+
+    async def refusing_search(session, query, top_k=None, **kwargs):
+        # 生产 search_with_metadata 在空结果时会入池，这里如实模拟。
+        await lcq_repo.create(
+            session, query, kwargs.get("session_id", ""), "no_results"
+        )
+        return [], {
+            "strategy": "dense",
+            "scores": None,
+            "refusal_reason": "no_results",
+        }
+
+    monkeypatch.setattr(retrieval, "search_with_metadata", refusing_search)
+    model = GraphModel(
+        "物流",
+        [
+            tool_call("query_faq", {"keyword": question}, "call_refuse"),
+            [AIMessageChunk(content="<INSUFFICIENT_KNOWLEDGE>")],
+        ],
+    )
+    use_model(model)
+    sid = str(uuid.uuid4())
+
+    events = parse_sse(
+        client.post(
+            "/api/chat",
+            json={"session_id": sid, "message": f"订单 1001 {question}"},
+        ).text
+    )
+    deltas = [data["text"] for name, data in events if name == "delta"]
+    streamed = "".join(deltas)
+
+    assert streamed == REFUSAL_TEXT
+    assert streamed.count(REFUSAL_TEXT) == 1, "拒答话术只能出现一次"
+    assert "<INSUFFICIENT_KNOWLEDGE>" not in streamed
+    assert client.store._data[sid][-1].content == REFUSAL_TEXT, (
+        "落库正文必须与浏览器看到的文本一致"
+    )
+
+    async def _fetch_pool():
+        engine = create_async_engine(get_settings().db_url)
+        try:
+            async with async_sessionmaker(engine)() as other:
+                conv = (
+                    await other.execute(
+                        select(Conversation).where(Conversation.session_uuid == sid)
+                    )
+                ).scalar_one()
+                rows = list(
+                    (
+                        await other.execute(
+                            select(LowConfidenceQuestion).where(
+                                LowConfidenceQuestion.question == question
+                            )
+                        )
+                    ).scalars()
+                )
+                return conv.id, [(row.reason, row.session_id) for row in rows]
+        finally:
+            await engine.dispose()
+
+    conv_id, pooled = client.portal.call(_fetch_pool)
+    assert pooled == [("no_results", str(conv_id))]
+    assert "model_insufficient" not in [reason for reason, _ in pooled]
+
+    # Minor 3：标记不能留在 checkpoint 里（否则下一轮会被自己的拒答标记污染）。
+    async def _state():
+        config = {
+            "configurable": {
+                "thread_id": sid,
+                **workflow_deps(None, None, None, 0),
+            }
+        }
+        snapshot = await app.state.workflow.aget_state(config)
+        return snapshot.values
+
+    values = client.portal.call(_state)
+    assert values["insufficient"] is True
+    assert values["messages"][-1].content == GATE_REFUSAL
+    assert all(
+        "<INSUFFICIENT_KNOWLEDGE>" not in str(message.content)
+        for message in values["messages"]
+    )
+
+
+# ------------------------------------------------- 11. 工具失败与错误边界
+
+
+def test_business_tool_failure_is_fed_back_not_raised(client):
+    """非 query_faq 工具 ok=False：ToolMessage 回灌，模型继续作答，无 error 帧。"""
+    model = GraphModel(
+        "物流",
+        [
+            tool_call("query_order", {}, "call_bad"),
+            [AIMessageChunk(content="我暂时查不到这个订单。")],
+        ],
+    )
+    use_model(model)
+
+    events = parse_sse(
+        client.post(
+            "/api/chat", json={"message": "订单 1001 的物流到哪了"}
+        ).text
+    )
+    names = [name for name, _ in events]
+    tools = [data for name, data in events if name == "tool"]
+    sid = events[0][1]["session_id"]
+
+    assert "error" not in names
+    assert names[-1] == "done"
+    assert tools[0]["phase"] == "start"
+    assert tools[1]["phase"] == "end"
+    assert tools[1]["ok"] is False
+
+    stored = client.store._data[sid]
+    assert [type(m).__name__ for m in stored] == [
+        "HumanMessage", "AIMessage", "ToolMessage", "AIMessage",
+    ]
+    assert "参数不合法" in stored[2].content
+    assert stored[-1].content == "我暂时查不到这个订单。"
+
+
+class BoomRegistry:
+    """registry.execute 意外抛异常的桩。"""
+
+    async def as_langchain_tools(self):
+        return []
+
+    async def execute(self, name, args, call_id, *, conversation_id=None):
+        raise RuntimeError("registry 意外炸了")
+
+
+def test_registry_crash_ends_with_single_error_and_no_audit(
+    client, monkeypatch
+):
+    """工具执行里的意外异常：恰好一个 error 帧，无 done，不写审计。"""
+    monkeypatch.setattr(
+        "app.api.build_registry", lambda session=None: BoomRegistry()
+    )
+    model = GraphModel(
+        "物流",
+        [
+            tool_call("query_order", {"order_id": "1001"}, "call_boom"),
+            [AIMessageChunk(content="不应到达")],
+        ],
+    )
+    use_model(model)
+
+    events = parse_sse(
+        client.post(
+            "/api/chat", json={"message": "订单 1001 的物流到哪了"}
+        ).text
+    )
+    names = [name for name, _ in events]
+
+    assert names.count("error") == 1
+    assert names[-1] == "error"
+    assert "done" not in names
+    assert events[-1][1]["code"] == "internal_error"
+    assert client.store._data == {}
+
+
+def test_error_after_partial_deltas_is_terminal(client):
+    """已经流出一段正文后再失败：delta 之后仍必须以 error 收尾，不写审计。"""
+    model = GraphModel(
+        "物流",
+        [[AIMessageChunk(content="部分回答"), RuntimeError("上游炸了")]],
+    )
+    use_model(model)
+    sid = str(uuid.uuid4())
+
+    events = parse_sse(
+        client.post(
+            "/api/chat", json={"session_id": sid, "message": "订单 1001 的物流到哪了"}
+        ).text
+    )
+    names = [name for name, _ in events]
+
+    assert names[0] == "delta"
+    assert names[-1] == "error"
+    assert "done" not in names
+    assert "".join(
+        data["text"] for name, data in events if name == "delta"
+    ) == "部分回答"
+    assert client.store._data == {}

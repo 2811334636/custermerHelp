@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     llm_max_output_tokens: int = Field(default=1024, gt=0)
     # 温度为 0 是合法且常用的（evals 就固定用 0），故这里是 ge=0 而非 gt=0
     llm_temperature: float = Field(default=0.3, ge=0)
-    history_token_budget: int = Field(default=4096, gt=0)
     # token_chars_per_token 是 app/context.py::_count_tokens 的除数，
     # 0 会在每次请求时 ZeroDivisionError，必须在启动时就挡掉
     token_chars_per_token: float = Field(default=1.5, gt=0)

@@ -48,12 +48,17 @@ from app.tools.knowledge import (
 )
 from app.workflow.citations import assign_citations
 from app.workflow.state import WorkflowState
-from app.workflow.texts import STEP_LIMIT_TEXT, TOKEN_LIMIT_TEXT
+from app.workflow.texts import GATE_REFUSAL, STEP_LIMIT_TEXT, TOKEN_LIMIT_TEXT
 
 logger = logging.getLogger(__name__)
 
 ACTION_HANDOFF = "handoff"
 ACTION_TICKET = "ticket"
+
+# spec §3.5.2：模型自评知识不足时输出该标记。与 app/api.py 的流式过滤器同字面量；
+# 图这边负责在**收敛时**把它从 State 里替换掉，避免标记进入 checkpoint 后
+# 下一轮继续作为模型上下文。
+INSUFFICIENT_MARKER = "<INSUFFICIENT_KNOWLEDGE>"
 
 # 标记大小写敏感、全大写（spec §6.2），降低正文误伤。
 ACTION_MARKERS: tuple[tuple[str, str], ...] = (
@@ -231,13 +236,14 @@ def _usage_tokens(usage: dict | None) -> int:
 
 async def _consume_model(
     bound, messages: list[BaseMessage], writer, stripper: _ActionMarkerStripper
-) -> tuple[Any, dict | None]:
-    """流式消费模型输出：逐 token 发 delta，返回（累积响应、usage）。
+) -> tuple[Any, dict | None, str | None]:
+    """流式消费模型输出：逐 token 发 delta，返回（累积响应、usage、finish_reason）。
 
     usage 只取**最后一个**带值的 chunk：部分 provider 会在每个 chunk 上重复
-    携带累计用量，若把 chunk 逐个相加会成倍放大 token 数。真实 provider
-    一定有 ``astream``；脚本化替身可能只实现 ``ainvoke``，这里保留一条兜底
-    路径，避免子图只能被“会流式”的替身驱动。
+    携带累计用量，若把 chunk 逐个相加会成倍放大 token 数。finish_reason 同理，
+    最后一个有值的 chunk 即本次调用的终局（``stop`` / ``length`` /
+    ``tool_calls`` ...）。真实 provider 一定有 ``astream``；脚本化替身可能只
+    实现 ``ainvoke``，这里保留一条兜底路径，避免子图只能被“会流式”的替身驱动。
     """
     if not hasattr(bound, "astream"):
         response = await bound.ainvoke(messages)
@@ -249,15 +255,24 @@ async def _consume_model(
         tail = stripper.flush()
         if tail:
             writer({"type": "delta", "text": tail})
-        return response, getattr(response, "usage_metadata", None)
+        meta = getattr(response, "response_metadata", None) or {}
+        return (
+            response,
+            getattr(response, "usage_metadata", None),
+            meta.get("finish_reason"),
+        )
 
     accumulated: AIMessageChunk | None = None
     usage: dict | None = None
+    finish_reason: str | None = None
     async for raw_chunk in bound.astream(messages):
         chunk = _as_chunk(raw_chunk)
         accumulated = chunk if accumulated is None else accumulated + chunk
         if getattr(raw_chunk, "usage_metadata", None):
             usage = dict(raw_chunk.usage_metadata)
+        meta = getattr(raw_chunk, "response_metadata", None) or {}
+        if meta.get("finish_reason"):
+            finish_reason = meta["finish_reason"]
         text = getattr(raw_chunk, "text", "") or ""
         if text:
             filtered = stripper.feed(text)
@@ -267,7 +282,7 @@ async def _consume_model(
     tail = stripper.flush()
     if tail:
         writer({"type": "delta", "text": tail})
-    return accumulated, usage
+    return accumulated, usage, finish_reason
 
 
 def _final_message(accumulated: Any) -> AIMessage:
@@ -301,7 +316,7 @@ async def agent_model(
     )
 
     stripper = _ActionMarkerStripper()
-    accumulated, usage = await _consume_model(
+    accumulated, usage, finish_reason = await _consume_model(
         model.bind_tools(ALL_TOOLS), model_messages, writer, stripper
     )
     ai_message = _final_message(accumulated)
@@ -318,6 +333,9 @@ async def agent_model(
         "tokens_used": (state.get("tokens_used") or 0) + _usage_tokens(usage),
         "messages": [ai_message],
         "actions": _build_actions(action_types, state),
+        # 最后一次模型调用的真实终局元数据（多步 ReAct 时后一次覆盖前一次）。
+        "finish_reason": finish_reason,
+        "usage": usage,
     }
     if current_evidence is not None and not any(
         _is_evidence_message(message)
@@ -569,13 +587,26 @@ async def agent_done(state: WorkflowState) -> dict[str, Any]:
     if last.tool_calls:
         # 走到这里说明条件边判定触顶；工具结果还没执行，直接给收敛话术，
         # 不能把“我还想调工具”的半截 assistant 当成最终回答。
+        # 收敛话术由系统生成，终局就是干净的 stop。
         if (state.get("steps") or 0) >= max_steps:
-            return {"messages": [AIMessage(content=STEP_LIMIT_TEXT)]}
+            return {
+                "messages": [AIMessage(content=STEP_LIMIT_TEXT)],
+                "finish_reason": "stop",
+            }
         if (state.get("tokens_used") or 0) >= token_budget:
-            return {"messages": [AIMessage(content=TOKEN_LIMIT_TEXT)]}
+            return {
+                "messages": [AIMessage(content=TOKEN_LIMIT_TEXT)],
+                "finish_reason": "stop",
+            }
         return {}
 
     clean_text, new_action_types = parse_action_markers(_message_text(last))
+    # spec §3.5.2：自评标记不得进入 checkpoint——否则下一轮模型上下文里会
+    # 出现一个“我不想回答”的标记，诱发后续轮次继续拒答。这里把它替换成
+    # 标准拒答话术，并用 State 标志通知 API 做入池判定。
+    insufficient = INSUFFICIENT_MARKER in clean_text
+    if insufficient:
+        clean_text = clean_text.split(INSUFFICIENT_MARKER, 1)[0] + GATE_REFUSAL
     # agent_model 已逐条清过标记并把动作写进 state；这里做最后一次兜底解析，
     # 并与已有动作按首次出现顺序合并（不能把中间轮的动作覆盖成空）。
     action_types = _merge_action_types(
@@ -583,6 +614,7 @@ async def agent_done(state: WorkflowState) -> dict[str, Any]:
     )
     updates: dict[str, Any] = {
         "actions": _build_actions(action_types, state),
+        "insufficient": insufficient,
     }
     if clean_text != last.content:
         # 用同一个 id 覆盖原消息（add_messages 对同 id 是替换而非追加），

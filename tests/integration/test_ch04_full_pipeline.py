@@ -241,6 +241,7 @@ def test_hybrid_rerank_full_pipeline(client):
     assert stored[-1].content == streamed
     assert client.store.metadata[session_id]["citations"] == citations
     assert client.store.metadata[session_id]["retrieval_strategy"] == "hybrid_rerank"
+    assert client.store.metadata[session_id]["top_score"] is not None
 
     # 6) 引用编号可点：GET /api/chunks/{chunk_id} 返回原文与章节路径，
     #    且这条引用确实指向运费知识块（不是随便一个 chunk_id）。

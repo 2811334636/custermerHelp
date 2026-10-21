@@ -9,7 +9,7 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 from app.api import get_store
 from app.db.base import get_db
@@ -102,6 +102,7 @@ class GraphModel:
                     content=chunk.content or "",
                     tool_calls=list(chunk.tool_calls or []),
                     usage_metadata=chunk.usage_metadata,
+                    response_metadata=chunk.response_metadata,
                 )
 
 
@@ -269,13 +270,14 @@ class MetadataModel(GraphModel):
                 AIMessage(
                     content="退货政策是七天无理由。",
                     usage_metadata=self.USAGE,
+                    response_metadata={"finish_reason": "length"},
                 ),
             ],
         )
 
 
-def test_done_frame_carries_usage_from_final_state(client):
-    """done.usage 来自工作流累加的 tokens_used（不再是写死的 None）。"""
+def test_done_frame_surfaces_real_finish_reason_and_usage(client):
+    """上游截断（finish_reason="length"）与完整 usage 必须如实到达客户端。"""
     use_model(MetadataModel())
 
     done = [
@@ -286,8 +288,8 @@ def test_done_frame_carries_usage_from_final_state(client):
         if name == "done"
     ][-1]
 
-    assert done["finish_reason"] == "stop"
-    assert done["usage"] == {"total_tokens": MetadataModel.USAGE["total_tokens"]}
+    assert done["finish_reason"] == "length", "截断不能伪装成 stop"
+    assert done["usage"] == MetadataModel.USAGE, "usage 应保留完整三项"
 
 
 class FailsOnSecondCallModel(GraphModel):

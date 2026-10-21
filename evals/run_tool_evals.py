@@ -182,6 +182,18 @@ async def main() -> int:
 
         registry = build_registry(session=session)
         for c in cases:
+            route = c.get("expect_route")
+            if route and route != "business":
+                # ch05 工作流在 Agent 之前就接管了 knowledge/complaint/chitchat
+                # （预检索 / 固定出口），这些输入不再以“选哪个工具”为判据。
+                # 显式跳过并计入统计，避免静默误报失败或虚增通过率。
+                print(
+                    f"  [SKIP] {c['id']:<14} 路由 {route}："
+                    "工作流在 Agent 前接管，不做工具选择判据"
+                )
+                results.append((c["id"], None, [], None))
+                continue
+
             turn = await run_production_turn(
                 c["input"], model=model, registry=registry,
                 conversation_id=conversation_id, session=session,
@@ -248,11 +260,16 @@ async def main() -> int:
                 print(f"         ↳ 转述 [{rmark}] {relay_why}{judge_note}")
 
     ok = sum(1 for _, p, _, _ in results if p)
+    scored = [r for r in results if r[1] is not None]
+    skipped = len(results) - len(scored)
     relay_tested = [r for r in results if r[3] is not None]
     relay_ok = sum(1 for r in relay_tested if r[3])
-    print(f"\n工具选择通过率：{ok}/{len(results)}")
+    print(
+        f"\n工具选择通过率：{ok}/{len(scored)}"
+        f"（跳过 {skipped} 条非 business 路由）"
+    )
     print(f"结果转述通过率：{relay_ok}/{len(relay_tested)}（只统计真调了工具的用例）")
-    return 0 if ok == len(results) and relay_ok == len(relay_tested) else 1
+    return 0 if ok == len(scored) and relay_ok == len(relay_tested) else 1
 
 
 if __name__ == "__main__":

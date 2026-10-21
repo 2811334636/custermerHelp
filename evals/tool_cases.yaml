@@ -1,24 +1,33 @@
-# ch02 工具选择评估集
+# 工具选择评估集（ch02 起）
 # 判据是「模型选了哪些工具 + 传给工具的参数」，不是最终回复的措辞——
 # 后者由 evals/cases.yaml（ch01）管，两套不重叠。
+#
+# ★ ch05 起工作流在 Agent 之前先做意图路由：
+#   knowledge → 预检索（可能不调工具）；complaint/chitchat → 固定出口；
+#   business → 槽位门（缺订单号先追问）。因此只有 business 路由的用例还适用
+#   “工具选择”判据；其余用例标记 expect_route，runner 会显式 SKIP（不静默
+#   算失败，也不虚增通过率）。FAQ 内容质量由 evals.run_kb_evals 覆盖。
 - id: logistics-1
   input: 订单 1001 的物流到哪了
+  expect_route: business
   expect_tools: [query_logistics]
   expect_args_contain: {query_logistics: "1001"}
 - id: order-1
   input: 1001 这个订单买的什么
+  expect_route: business
   expect_tools: [query_order]
   expect_args_contain: {query_order: "1001"}
-# ch03 起 query_faq 是语义检索：FAQ 用例的内容判据改为
-# expect_faq_contains —— 该片段必须存在于 knowledge_chunks 中、出现在
-# query_faq 的工具输出里，并被模型如实转述（见 run_tool_evals.check_faq_content）。
+# ch03 起 query_faq 是语义检索：FAQ 用例的内容判据见 expect_faq_contains
+# （ch05 起这些输入走 knowledge 预检索，工具选择断言跳过）。
 - id: faq-hit-1
   input: 退货政策是什么
+  expect_route: knowledge
   expect_tools: [query_faq]
   expect_args_contain: {query_faq: "退货"}
   expect_faq_contains: "签收后 7 天内可无理由退货"
 - id: faq-hit-2
   input: 怎么开发票
+  expect_route: knowledge
   expect_tools: [query_faq]
   expect_args_contain: {query_faq: "发票"}
   expect_faq_contains: "电子发票会在 3 个工作日内"
@@ -26,21 +35,29 @@
 # 「运费说明」——同义说法正是这一章要验证的能力。
 - id: faq-synonym-1
   input: 邮费政策是什么
+  expect_route: knowledge
   expect_tools: [query_faq]
   expect_args_contain: {query_faq: "邮费"}
   expect_faq_contains: "往返运费由平台承担"
 - id: chitchat-1
   input: 你好
+  expect_route: chitchat
   expect_tools: []
 - id: chitchat-2
   input: 谢谢
+  expect_route: chitchat
   expect_tools: []
 - id: chitchat-3
   input: 帮我写个 Python 脚本
+  expect_route: chitchat
   expect_tools: []
 - id: ticket-1
   input: 我要投诉，帮我转人工
+  expect_route: complaint
   expect_tools: [create_ticket]
+# ch05：业务类缺订单号会先被槽位门追问，不会调 create_ticket；
+# 转人工/建单改由固定出口的 actions 提供（见 /api/chat 的 done.actions）。
 - id: ticket-2
   input: 这个问题解决不了，转人工客服
-  expect_tools: [create_ticket]
+  expect_route: business
+  expect_tools: []
