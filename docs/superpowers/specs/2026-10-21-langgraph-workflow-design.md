@@ -75,8 +75,12 @@ class WorkflowState(TypedDict, total=False):
     intent_confidence: float | None
     route: str                       # knowledge|business|complaint|chitchat
     # 知识类
-    evidence: list[dict]             # [{chunk_id, questions, answer, score}]
+    evidence: list[dict]             # [{index, chunk_id, questions, answer, score}]
     evidence_coverage: float | None
+    # 引用（全局唯一编号，跨预检索与工具检索）
+    citations: list[dict]            # [{index, chunk_id, score}]，按 index 排序
+    citation_index: dict[str, int]   # chunk_id -> index，重复召回复用同一编号
+    citation_cursor: int             # 下一个可用编号（从 1 开始）
     gate_passed: bool | None
     refusal_reason: str | None       # low_evidence | no_results | ...
     # 业务数据类插槽
@@ -100,7 +104,7 @@ class WorkflowState(TypedDict, total=False):
 
 - **只有可序列化数据进 State**。ORM 行、AsyncSession、registry 不进 State，通过 LangGraph `config["configurable"]` 传入运行时依赖（不参与 checkpointer 序列化）。
 - `messages` 用 `add_messages` 合并；每轮用户输入由 API 以 `{"messages":[HumanMessage(user_input)], ...}` 注入。
-- **turn 级字段每轮重置**：图入口第一个节点 `begin_turn` 清空 `intent/route/evidence/evidence_coverage/gate_passed/refusal_reason/actions/suggestions_sent/steps/tokens_used/node_trace`。跨轮只保留 `messages`、`awaiting_slot`、`pending_intent`、`order_id`。
+- **turn 级字段每轮重置**：图入口第一个节点 `begin_turn` 清空 `intent/route/evidence/evidence_coverage/gate_passed/refusal_reason/actions/suggestions_sent/steps/tokens_used/node_trace/citations/citation_index`，并把 `citation_cursor` 置 1。跨轮只保留 `messages`、`awaiting_slot`、`pending_intent`、`order_id`。
 - `node_trace` 用普通 `list[str]`（覆盖式），节点返回 `state["node_trace"] + ["node"]`；不用 `operator.add`，否则 `begin_turn` 无法清空，验收 1 会看到上一轮的节点。
 - **失败轮的悬空工具调用**：checkpointer 每个 super-step 都落盘，若流在 `agent_model` 产出 tool_calls 之后、`agent_tools` 写回 ToolMessage 之前中断，线程里会留下没有结果的 assistant tool_calls，下一轮上游会拒绝该消息序列。图入口先跑 `sanitize_messages`：若末尾 assistant 消息的 tool_calls 没有一一对应的 ToolMessage，丢弃这组未完成的消息（及其后的孤立 ToolMessage），再注入本轮 HumanMessage。
 
@@ -180,9 +184,16 @@ agent_model ──(有 tool_calls 且在预算内)──> agent_tools ──> ag
   - `steps >= settings.agent_max_steps`（默认 6）→ 发一条“我需要更多信息/请稍后再试”的收敛话术；
   - `tokens_used >= settings.agent_token_budget`（默认 6000）→ 同样收敛。
 - 知识类：进 Agent 前把 `evidence` 作为一条上下文消息插入（标注“以下是检索到的知识，回答须以此为准并标注引用编号”，编号用 `evidence.index`）。
-- **工具集按路由裁剪，避免两套引用编号打架**：
-  - 知识类：`query_order`、`query_logistics`、`query_product`、`create_ticket`（**不含 `query_faq`**，检索已强制完成）。`done.citations` / 消息 metadata 的引用来自 `evidence`。
-  - 业务数据类：五个工具全给（含 `query_faq`）。引用来自最后一次 `query_faq` 工具结果（沿用 ch04 行为）。
+- **工具集：所有路由都给五个工具（含 `query_faq`）**。引用用全局唯一编号，预检索与工具检索共用同一套编号。
+- **全局重编号（在模型看到内容之前完成，不做事后修正）**：
+  - `retrieve` 节点把召回块依次分配 `1..N`，写入 `citations`、`citation_index`（`chunk_id → index`）、`citation_cursor = N+1`。
+  - Agent 调用 `query_faq` 时，由 `agent_tools` 特殊处理：不直接透传工具原文，而是调用 `retrieval.search_with_metadata` 拿 `(chunks, meta)`，对每块：
+    - `chunk_id` 已存在于 `citation_index` → 复用原编号；
+    - 否则分配 `citation_cursor`，追加到 `citations`，游标 +1。
+  - 构造给模型看的 `ToolMessage`：每块前缀 `[i]`，形如 `[3] 问：…\n答：…`。模型引用时看到的就是全局编号，因此无需任何输出后处理。
+  - `query_faq` 的格式化文本与拒答/入池逻辑抽成共享 helper（`app/tools/knowledge.py` 暴露 `format_hits(hits)`），避免图内复制一份。
+  - 其余四个工具照常走 `ToolRegistry.execute`，不产生引用。
+- `done.citations` = `citations` 按 `index` 排序；`messages.metadata.citations` 同源。工具 end 帧也带当前累计 `citations`（前端可在流中提前渲染）。
 - `<INSUFFICIENT_KNOWLEDGE>` 行为保留：仍由 API 流式适配层过滤、替换为标准拒答话术、写 `low_confidence_questions(reason="model_insufficient")`。知识类已过闸，正常不会触发；业务类 Agent 调 `query_faq` 后仍可能触发。
 - 缺信息追问：模型可直接输出追问文本（无工具调用即收敛），不强制走插槽门。
 - **动作建议**：模型输出中的 `<SUGGEST_HANDOFF>` / `<SUGGEST_TICKET>` 标记由后端流式过滤器剥离，并转成 `actions`；不新增工具、不让模型直接执行动作。
@@ -302,7 +313,7 @@ Agent 的文本里可能出现 `<SUGGEST_HANDOFF>` / `<SUGGEST_TICKET>`。沿用
 - **可单测代码照常 TDD**：路由表、插槽提取、覆盖率计算、动作解析、状态机（等待订单号跨轮）、停止条件。
 - **Prompt/分类类任务**（意图识别、安抚话术、固定闲聊话术）：用标注样例跑一遍（≥20 条覆盖 7 类），准确率写进报告；不要求 100%。
 - **图级测试**：用 fake model + 真 State/checkpointer（临时 sqlite 文件）验证分支、跨轮等待态、checkpointer 恢复。
-- **边界测试**（对应 §4/§5 裁定）：`sanitize_messages` 丢弃悬空 tool_calls；`begin_turn` 重置 turn 字段（第二轮不会继承上一轮 step/token）；等待态收到非订单号消息时重新分类；检索已入池时闸门不重复写；知识类不挂 `query_faq` 工具。
+- **边界测试**（对应 §4/§5 裁定）：`sanitize_messages` 丢弃悬空 tool_calls；`begin_turn` 重置 turn 字段（第二轮不会继承上一轮 step/token）；等待态收到非订单号消息时重新分类；检索已入池时闸门不重复写；全局重编号（预检索占 1..N、工具续号、重复 chunk 复用原号、ToolMessage 前缀编号、`done.citations` 与模型看到的编号一致）。
 - **API/SSE**：沿用 `tests/test_api*.py` 的 TestClient 模式，断言事件序列与 actions。
 - **验收测试**（`tests/acceptance/`）：
   1. 政策类问题 → `node_trace`/日志包含 `retrieve`；
@@ -350,7 +361,7 @@ Agent 的文本里可能出现 `<SUGGEST_HANDOFF>` / `<SUGGEST_TICKET>`。沿用
 | 3 | State 字段跨轮残留 | `begin_turn` 每轮重置 turn 级字段；`node_trace` 改覆盖式列表；跨轮只留 `messages/awaiting_slot/pending_intent/order_id` |
 | 4 | ch04 `<INSUFFICIENT_KNOWLEDGE>` 是否保留 | 保留，仍在 API 流式适配层过滤/替换/入池 `model_insufficient` |
 | 5 | retrieve 参数与入池归属 | 显式传 `strategy` 与 `session_id`；闸门在已有 `refusal_reason` 时不再重复入池 |
-| 6 | 预检索证据与 query_faq 引用编号冲突 | 知识类工具集移除 `query_faq`，引用只用 `evidence.index`；业务类保留五工具，沿用 ch04 引用 |
+| 6 | 预检索证据与 query_faq 引用编号冲突 | **用户裁定：保留 `query_faq`，全局重编号**。编号在内容交给模型前分配（预检索先占 1..N，工具召回的块续号，重复 chunk 复用原号），模型看到的 `ToolMessage` 自带 `[i]` 前缀，因此无需事后修正；`done.citations` 与工具帧都用同一份全局列表 |
 | 7 | 审计写入什么 | 完整 ReAct 序列 + 最终 assistant（metadata 带 citations/actions）；固定话术轮只写一问一答；evidence 注入消息不落库 |
 | 8 | 动作传输与工单类型 | 动作只在 `done.actions`；工单类型按路由映射（知识→咨询/业务→售后/投诉→投诉），描述用用户原话（≤500 字） |
 
