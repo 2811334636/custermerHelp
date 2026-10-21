@@ -1,6 +1,82 @@
-# 电商智能客服 · ch01 纯对话 → ch02 Function Calling → ch03 知识库与向量检索 → ch04 混合检索与重排
+# 电商智能客服 · ch01 纯对话 → ch02 Function Calling → ch03 知识库与向量检索 → ch04 混合检索与重排 → ch05 Workflow 编排
 
-## ch04 · 混合检索与重排（当前章节）
+## ch05 · Workflow 确定性编排 + 主力 Agent（当前章节）
+
+控制流从模型手里收回：LangGraph 固定图做骨架，主力 Agent 只是图里的一个 ReAct 节点。
+
+```
+sanitize → begin_turn → 指代消解(透传) → 意图识别(7 类 JSON)
+   ├─ 商品咨询/退货退款 → 强制检索 → 置信度闸 → Agent（证据够才进）
+   ├─ 物流/订单/售后   → 订单号插槽门 → Agent
+   ├─ 投诉            → 安抚话术 + 转人工/建工单动作
+   └─ 闲聊            → 固定话术
+所有出口 → log（结构化日志）
+```
+
+### 新增依赖与配置
+
+- `langgraph==1.2.16`、`langgraph-checkpoint-sqlite==3.1.2`（已写入 `pyproject.toml`）
+- `.env` 新增（完整见 `.env.example`）：
+  `APP_CHECKPOINT_DB`、`APP_CONFIDENCE_MIN_COVERAGE`、`APP_AGENT_MAX_STEPS`、
+  `APP_AGENT_TOKEN_BUDGET`、`APP_INTENT_MODEL_TEMPERATURE`
+
+### 会话状态
+
+- 图状态（含对话消息、意图、等待订单号、检索证据、引用编号）由 LangGraph
+  官方 `AsyncSqliteSaver` 持久化，`thread_id = 会话 UUID`。
+- **模型上下文只来自 checkpointer**；MySQL `messages` 继续写入，仅作可 SQL
+  查询的审计流水（字段 `metadata` 含 citations/actions/top_score）。
+- 从旧版本升级时执行一次：
+  ```bash
+  docker exec -i custermerhelp-mysql mysql -uapp -papppw customer_service < scripts/alter_ch04.sql
+  ```
+
+### 启动
+
+```bash
+docker compose up -d
+uv run python -m jobs.build_knowledge --rebuild   # 首次或 schema 变更后
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+### 演示与验收
+
+1. **强制检索节点**：问「退货政策是什么」，日志出现
+   `node=retrieve chunks=... strategy=hybrid_rerank`。
+2. **Agent 自己调工具**：问「订单 1001 的物流到哪了」，SSE 出现
+   `tool` start/end（`query_logistics`），回答基于工具结果。
+3. **投诉双按钮**：输入「我要投诉」→ `done.actions` 同时含转人工与建工单；
+   前端两个按钮互不绑定。「转人工」纯前端模拟（“已转接人工客服”+ 客服小猫
+   问候）；「建工单」调 `POST /api/tickets` 写 `tickets` 表。
+4. **闲聊固定话术**：输入「今天心情不错，随便聊聊」→ 固定文案。
+5. **多步 ReAct**：问「订单 1001 的物流到哪了，先确认订单再查物流」→
+   `query_order` → `query_logistics`，日志 `steps >= 2`。
+
+验证低置信度池：
+
+```sql
+SELECT question, reason, created_at FROM customer_service.low_confidence_questions ORDER BY id DESC LIMIT 5;
+```
+
+### 本章已知限制
+
+- 意图识别与指代消解是最简版（单 prompt / 原样透传），正式版留给后续章节。
+- 置信度闸用词面二元组覆盖率（默认 0.30）作为过渡判据；正式版留给可观测章节。
+- checkpointer 是 SQLite，按单 worker 部署；多 worker 需换 Postgres saver。
+- `POST /api/feedback` 仍为预留接口（不落库）。
+- 动作按钮的浏览器点击流程需人工目视验收（无自动化浏览器测试）。
+
+### 测试与评估
+
+```bash
+uv run pytest -q                     # 412 passed
+uv run python -m evals.run_intent_eval   # 20 条标注集，准确率 100%
+uv run python -m evals.run_hybrid_evals  # ch04 四策略回归
+```
+
+---
+
+## ch04 · 混合检索与重排
 
 检索从纯向量升级为「稠密 + BM25 → RRF 融合 → 重排」，并补上引用溯源、
 拒答与低置信度问题池。
@@ -55,13 +131,14 @@ uv run python -m evals.run_hybrid_evals   # dense / bm25 / hybrid / hybrid_reran
 
 报告输出 Recall@3 / Recall@10 / MRR（总体 + 按 query_type 分桶）。若未配置
 `APP_RERANKER_API_KEY`，`hybrid_rerank` 行实际退化为 `hybrid`（脚本会打印
-`hybrid_rerank 实际启用重排：0/20 条`）——这一行**不代表**重排效果。
+`hybrid_rerank 实际启用重排：0/20 条`）——这一行**不代表**重排效果。配置 key
+后应显示 `20/20`。SiliconFlow 的模型名必须带前缀：`BAAI/bge-reranker-v2-m3`。
 
 ### 验收结果
 
 | # | 标准 | 结果 / 证据 |
 |---|---|---|
-| 1 | 四策略对比报告能跑出数字 | ✅ `evals.run_hybrid_evals`（n=20）：dense R@3 .975 / R@10 1.000 / MRR .850；bm25 .850 / .950 / .787；hybrid 与 hybrid_rerank 均为 .925 / 1.000 / .796（未配 reranker key，后者=hybrid） |
+| 1 | 四策略对比报告能跑出数字 | ✅ `evals.run_hybrid_evals`（n=20）：dense R@3 .975 / R@10 1.000 / MRR .850；bm25 .850 / .950 / .787；hybrid .925 / 1.000 / .796；hybrid_rerank .825 / 1.000 / .841（真实重排 20/20；R@3 受首尾排列影响，MRR 高于 hybrid） |
 | 2 | 问「型号 ABC-123」，BM25 命中含该字符串的 chunk | ✅ 手工演示：重建知识库后使用 `knowledge/商品型号.md`（ABC-123 / XYZ-789）；自动化验收：`tests/acceptance/test_bm25_literal_match.py` 使用临时 collection 中的内联 chunk，不依赖该文件入库 |
 | 3 | 回答中的 `[1]` 可点击，能看到来源原文与章节路径 | ✅ 前端引用弹窗 + `GET /api/chunks/{chunk_id}`；完整链路见 `tests/integration/test_ch04_full_pipeline.py` |
 | 4 | 问知识库没有的内容得到明确拒答，并进入低置信度池 | ✅ `tests/acceptance/test_refusal_and_low_confidence.py`（`reason=no_results`） |
