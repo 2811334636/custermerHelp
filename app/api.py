@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api_chunks import router as chunks_router
 from app.api_feedback import router as feedback_router
+from app.api_tickets import router as tickets_router
 from app.chat import classify_exception
 from app.config import get_settings
 from app.db.base import get_db
@@ -89,6 +90,7 @@ class _MarkerStreamFilter:
 router = APIRouter(prefix="/api")
 router.include_router(chunks_router)
 router.include_router(feedback_router)
+router.include_router(tickets_router)
 
 
 def get_store(db: AsyncSession = Depends(get_db)) -> SessionStore:
